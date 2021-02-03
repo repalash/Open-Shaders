@@ -1,0 +1,25 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#define SCREEN_PASS_STRUCT_MEMBER(StructName, MemberType, MemberName) MemberType StructName##_##MemberName;
+
+#define SCREEN_PASS_TEXTURE_VIEWPORT(StructName) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, Extent) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, ExtentInverse) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, ScreenPosToViewportScale) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, ScreenPosToViewportBias) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, uint2, ViewportMin) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, uint2, ViewportMax) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, ViewportSize) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, ViewportSizeInverse) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportMin) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportMax) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportSize) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportSizeInverse) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportBilinearMin) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, UVViewportBilinearMax)
+
+#define SCREEN_PASS_TEXTURE_VIEWPORT_TRANSFORM(StructName) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, Scale) \
+	SCREEN_PASS_STRUCT_MEMBER(StructName, float2, Bias)

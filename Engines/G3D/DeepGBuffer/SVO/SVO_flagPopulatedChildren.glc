@@ -1,0 +1,68 @@
+#version 420 or 430 // -*- c++ -*-
+/**
+  Requires BUFFER_WIDTH = width, BUFFER_WIDTH_MASK = width - 1 and BUFFER_WIDTH_SHIFT = log_2(width) to be
+  passed, where width is a power of 2.
+
+  Requires WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y
+*/
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+/** The top part of the tree is used for traversal.  The leaves are then flagged
+    with 0xFFFFFFFF if they have any child
+  */
+layout(r32ui) uniform uimageBuffer   childIndexBuffer;
+
+layout(r32ui) uniform uimageBuffer   fragmentCount;
+
+/** RGBA32F world-space positions */
+uniform sampler2D                    SVO_POSITION_buffer;
+
+/** Pointers *to* this level are being written. */
+uniform int                          level;
+
+const uint                           POPULATED = 0xFFFFFFFF;
+const int                            ROOT_LOCATION = 8;
+
+void main() {
+    // Coordinate in the buffer to read properties of this fragment
+    ivec2 coord = ivec2(WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y) * ivec2(gl_WorkGroupID.xy) + ivec2(gl_LocalInvocationID.xy);
+
+    if (coord.x + coord.y * BUFFER_WIDTH >= imageLoad(fragmentCount, 0).r) {
+        // Off the end of the fragment list
+        return;
+    }
+
+    // Normalized oct tree-space position on [0, 1]
+    vec3 S = texelFetch(SVO_POSITION_buffer, coord, 0).xyz;
+
+    int resolutionAtLevel = 1 << level;
+
+    ivec3 voxelPosAtLevel = ivec3(S * float(resolutionAtLevel));
+
+    // Traverse the tree to level - 1
+    int nodeIndex = ROOT_LOCATION;
+    int offset = 0;
+
+#if 1
+    for (int curLevel = 1; curLevel <= level; ++curLevel) {
+        // Find the scalar offset within the node of the appropriate child 
+        // Wind through child pointers from (-x, -y, -z) to (+x, +y, +z)
+        ivec3 offsetInNode = (voxelPosAtLevel >> (level - curLevel)) & 1;
+        offset = (offsetInNode.z << 2) + (offsetInNode.y << 1) + offsetInNode.x;
+ 
+        if (curLevel < level ) {
+            // Advance into the child
+            nodeIndex = int(imageLoad(childIndexBuffer, offset + nodeIndex).r);
+
+			if(nodeIndex==0 || nodeIndex==0xFFFFFFFFU)
+				return;
+        }
+    }
+#endif
+    // Flag the final node
+    imageStore(childIndexBuffer, offset + nodeIndex, ivec4(POPULATED));
+}

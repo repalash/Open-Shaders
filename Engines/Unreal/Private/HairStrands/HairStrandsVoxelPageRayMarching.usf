@@ -1,0 +1,658 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../CommonViewUniformBuffer.ush"
+#include "../SceneTextureParameters.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShaderDrawDebug.ush"
+#include "../ShaderPrintCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairStrandsVoxelPageCommon.ush"
+#include "HairStrandsDebugCommon.ush"  
+
+#define VOXEL_TRAVERSAL_DEBUG_PAGEOCCUPANCY 0
+#define VOXEL_TRAVERSAL_DEBUG 0
+#define VOXEL_TRAVERSAL_FORCE_MIP_ENABLE 1
+#if PERMUTATION_TRAVERSAL == 1
+	#define VOXEL_TRAVERSAL_TYPE VOXEL_TRAVERSAL_LINEAR_MIPMAP
+#else
+	#define VOXEL_TRAVERSAL_TYPE VOXEL_TRAVERSAL_LINEAR
+#endif
+#include "HairStrandsVoxelPageTraversal.ush"
+
+float2 OutputResolution; 
+uint bDrawPage;
+int ForcedMipLevel;
+uint MacroGroupId;
+uint MacroGroupCount;
+uint MaxTotalPageIndexCount;
+
+RWTexture2D<float4> OutputTexture;
+Buffer<uint> TotalValidPageCounter;
+
+float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
+{
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), View.ScreenToWorld);
+	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+
+	return WorldPosition;
+}
+
+#define VOXEL_BLOCK 0 
+#define VOXEL_SMOOTH 1
+#define VOXEL_FILTERING VOXEL_BLOCK
+
+uint GetVoxelPageIndex(uint3 InPageIndexCoord, uint3 InPageIndexResolution, uint InLinearPageIndexOffset)
+{
+	const uint LinearPageIndexCoord = CoordToIndex(InPageIndexCoord, InPageIndexResolution, InLinearPageIndexOffset);
+	return VirtualVoxel.PageIndexBuffer.Load(LinearPageIndexCoord);
+}
+
+uint2 GetVoxelPageIndexOccupancy(uint3 InPageIndexCoord, uint3 InPageIndexResolution, uint InLinearPageIndexOffset)
+{
+	const uint LinearPageIndexCoord = CoordToIndex(InPageIndexCoord, InPageIndexResolution, InLinearPageIndexOffset);
+	return VirtualVoxel.PageIndexOccupancyBuffer.Load(LinearPageIndexCoord);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const float2 PixelCoord = DispatchThreadId.xy + 0.5f;
+	const float2 UV = PixelCoord / float2(OutputResolution);
+
+
+	float  WorldDepth = 0;
+	float  ClipDepth = 0;
+
+	const FPackedVirtualVoxelNodeDesc PackedNode = VirtualVoxel.NodeDescBuffer[MacroGroupId];
+	const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(PackedNode, VirtualVoxel.PageResolution);
+
+	// Draw macro group AABB & debug infos
+	if (uint(PixelCoord.x) == 0 && uint(PixelCoord.y) == 0)
+	{
+		const uint TotalPageIndexCount = MaxTotalPageIndexCount;
+		const uint TotalPageCount = VirtualVoxel.PageCountResolution.x * VirtualVoxel.PageCountResolution.y * VirtualVoxel.PageCountResolution.z;
+		const uint TotalAllocatedValidPageCount = TotalValidPageCounter.Load(0);
+		uint TotalAllocatedPageCount = 0;
+		for (uint MacroGroupIt = 0; MacroGroupIt < MacroGroupCount; ++MacroGroupIt)
+		{
+			const FPackedVirtualVoxelNodeDesc LocalPackedNode = VirtualVoxel.NodeDescBuffer[MacroGroupIt];
+			const FVirtualVoxelNodeDesc LocalNodeDesc = UnpackVoxelNode(LocalPackedNode, VirtualVoxel.PageResolution);
+			TotalAllocatedPageCount += LocalNodeDesc.PageIndexResolution.x * LocalNodeDesc.PageIndexResolution.y * LocalNodeDesc.PageIndexResolution.z;
+		}
+
+		AddAABB(NodeDesc.MinAABB, NodeDesc.MaxAABB, float4(1, 0.5f, 0, 1));
+
+		// General information
+		// General
+		//  Voxel World size        : 
+		//  Page Resolution         :
+		//  Page Count Resolution   :
+		//  Page Texture Resolution :
+		//
+		//  Total Allocatled Page Index   :
+		//  Total Page Index              :
+		//  Total Page Index Occupancy    :
+		//
+		//  Total Allocated Page          :
+		//  Total Page                    :
+		//  Total Page Occupancy          :
+		if (MacroGroupId == 0)
+		{
+			float2 StartPos = float2(50.0f, 100.0f ) / OutputResolution;
+			float2 Pos = StartPos;
+
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _V_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _W_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _Z_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, VirtualVoxel.VoxelWorldSize);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageResolution);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageCountResolution.x);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageCountResolution.y);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageCountResolution.z);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageTextureResolution.x);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageTextureResolution.y);
+			Pos = ShaderPrint(Pos, VirtualVoxel.PageTextureResolution.z);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			// Total page indices stats
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalAllocatedPageCount);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalPageIndexCount);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _Y_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalAllocatedPageCount / float(TotalPageIndexCount) * 100.f);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			// Total pages stats
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _V_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalAllocatedValidPageCount);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalPageCount);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _Y_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TotalAllocatedValidPageCount / float(TotalPageCount) * 100.f);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+		}
+
+		// MacroGroupId XX
+		//  Page Index Resolution: X Y Z (Linear/Total - %) 
+		//  Virtual Resolution   : X Y Z
+		//  Page Index Offset    : O
+		{
+			float2 StartPos = float2(50.0f, 350.0f + float(MacroGroupId) * 100.0f) / OutputResolution;
+			float2 Pos = StartPos;
+
+			Pos = ShaderPrintSymbol(Pos, _M_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, MacroGroupId);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _V_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, NodeDesc.VirtualResolution.x);
+			Pos = ShaderPrint(Pos, NodeDesc.VirtualResolution.y);
+			Pos = ShaderPrint(Pos, NodeDesc.VirtualResolution.z);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _R_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, NodeDesc.PageIndexResolution.x);
+			Pos = ShaderPrint(Pos, NodeDesc.PageIndexResolution.y);
+			Pos = ShaderPrint(Pos, NodeDesc.PageIndexResolution.z);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _P_);
+			Pos = ShaderPrintSymbol(Pos, _A_);
+			Pos = ShaderPrintSymbol(Pos, _G_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _D_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _F_);
+			Pos = ShaderPrintSymbol(Pos, _F_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _E_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, NodeDesc.PageIndexOffset);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+		}
+	}
+
+	bool bIsValid = false;
+	float3 HitColor = 0;
+	if (bDrawPage > 0)
+	{
+		// Reverse-Z
+		const float3 O = View.WorldCameraOrigin;
+		const float3 E = ReconstructWorldPositionFromDepth(UV, ConvertFromDeviceZ(0.0001f));
+		const float3 D = (E - O);
+
+		float PixelRadius = -1;
+		const float2 HitT = LineBoxIntersect(O, E, NodeDesc.MinAABB, NodeDesc.MaxAABB);
+		float AccDensity = 0;
+		if (HitT.x < HitT.y)
+		{
+			// Use different offseting to see either: 
+			// * Individual voxel (for debugging mainly)
+			// * Smoothed voxel (as used for transmittance computation)
+		#if VOXEL_FILTERING == VOXEL_BLOCK
+			const float3 Offset = 0;
+			const float Dither = InterleavedGradientNoise(PixelCoord.xy, 1);
+		#endif
+		#if VOXEL_FILTERING == VOXEL_SMOOTH
+			const float3 Offset = float3(InterleavedGradientNoise(PixelCoord.xy, 1), InterleavedGradientNoise(PixelCoord.xy, 2), InterleavedGradientNoise(PixelCoord.xy, 3));
+			const float Dither = 0;
+		#endif
+
+
+			// Intersect the indirection table to see if a brick is empty or not
+			const uint MaxStep = 256;
+			const float Delta = (HitT.y-HitT.x)/float(MaxStep);
+			for (uint StepIt=0; StepIt<MaxStep; ++StepIt)
+			{			
+				const float3 HitP = Offset + O + ((Dither+StepIt)*Delta + HitT.x) * D;
+				const int3 PageIndexCoord = PositionToCoord(HitP, NodeDesc.MinAABB, NodeDesc.MaxAABB, NodeDesc.PageIndexResolution);
+				const uint PageIndex = GetVoxelPageIndex(PageIndexCoord, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
+
+				bool bHasValidData = true;
+				if (bDrawPage == 2)
+				{
+					const uint2 PageIndexOccuancy = GetVoxelPageIndexOccupancy(PageIndexCoord, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
+					const int3 VoxelCoord = PositionToCoord(HitP, NodeDesc.MinAABB, NodeDesc.MaxAABB, NodeDesc.VirtualResolution);
+					const int3 VoxelBasePageCoord = PageIndexCoord * VirtualVoxel.PageResolution;
+					const int3 VoxelRelativeCoord = VoxelCoord - VoxelBasePageCoord;
+					bHasValidData = DoesVoxelContainData(PageIndexOccuancy, VoxelRelativeCoord);
+				}
+
+				if (PageIndex != INVALID_VOXEL_PAGE_INDEX && bHasValidData)
+				{
+					const uint3 PageCoord = IndexToCoord(PageIndex, VirtualVoxel.PageCountResolution);
+
+					AccDensity = 1;
+					bIsValid = true;
+					HitColor = PageCoord / 12.f;
+					break;
+				}
+			}
+		}
+	}
+	else 
+	{
+		FHairTraversalResult TraversalResult = (FHairTraversalResult)0;
+
+		const float DistanceThreshold = 10000;
+		const bool bDebugEnabled = false;
+		const float3 SampleRandom = GetHairVoxelJitter(PixelCoord, View.StateFrameIndexMod8);
+
+		const float3 WP0 = View.WorldCameraOrigin;
+		const float3 E = ReconstructWorldPositionFromDepth(UV, ConvertFromDeviceZ(0.0001f));
+		const float3 WP1 = normalize(E - WP0) * DistanceThreshold + WP0;
+
+		FVirtualVoxelCommonDesc CommonDesc;
+		CommonDesc.PageCountResolution	= VirtualVoxel.PageCountResolution;
+		CommonDesc.VoxelWorldSize		= VirtualVoxel.VoxelWorldSize;
+		CommonDesc.PageTextureResolution= VirtualVoxel.PageTextureResolution;
+		CommonDesc.PageResolution		= VirtualVoxel.PageResolution;
+
+		const FPackedVirtualVoxelNodeDesc PackedNode = VirtualVoxel.NodeDescBuffer[MacroGroupId];
+		const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(PackedNode, VirtualVoxel.PageResolution);
+
+		FHairTraversalSettings TraversalSettings = InitHairTraversalSettings();
+		TraversalSettings.DensityScale		= VirtualVoxel.DensityScale;
+		TraversalSettings.CountThreshold	= GetOpaqueVoxelValue();
+		TraversalSettings.DistanceThreshold = DistanceThreshold;
+		TraversalSettings.bDebugEnabled		= bDebugEnabled;
+		TraversalSettings.SteppingScale		= VirtualVoxel.SteppingScale_Shadow;
+		TraversalSettings.Random			= SampleRandom;
+		TraversalSettings.TanConeAngle		= 0;
+		TraversalSettings.bIsPrimaryRay		= true;
+		TraversalSettings.PixelRadius		= -1;
+		TraversalSettings.ForcedMip			= ForcedMipLevel;
+
+		TraversalResult = ComputeHairCountVirtualVoxel(
+			WP0,
+			WP1,
+			CommonDesc,
+			NodeDesc,
+			VirtualVoxel.PageIndexBuffer,
+			VirtualVoxel.PageIndexOccupancyBuffer,
+			VirtualVoxel.PageTexture,
+			TraversalSettings);
+
+		HitColor = GetColorCode(saturate(TraversalResult.HairCount / 16));
+		bIsValid = TraversalResult.HairCount > 0;
+
+		const bool bIsPixelEnable = all(int2(PixelCoord) == GetCursorPos());
+		if (bIsPixelEnable && bIsValid)
+		{
+			float2 StartPos = float2(50.0f, 50.0f) / OutputResolution;
+			float2 Pos = StartPos;
+
+			Pos = ShaderPrintSymbol(Pos, _X_);
+			Pos = ShaderPrintSymbol(Pos, _Y_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, GetCursorPos());
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _DOT_);
+			Pos = ShaderPrintSymbol(Pos, _C_);
+			Pos = ShaderPrintSymbol(Pos, _O_);
+			Pos = ShaderPrintSymbol(Pos, _U_);
+			Pos = ShaderPrintSymbol(Pos, _N_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TraversalResult.HairCount);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+			
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _DOT_);
+			Pos = ShaderPrintSymbol(Pos, _V_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _S_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _B_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _L_);
+			Pos = ShaderPrintSymbol(Pos, _I_);
+			Pos = ShaderPrintSymbol(Pos, _T_);
+			Pos = ShaderPrintSymbol(Pos, _Y_);
+			Pos = ShaderPrintSymbol(Pos, _SPC_);
+			Pos = ShaderPrint(Pos, TraversalResult.Visibility);
+			Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+		}
+	}
+
+	if (bIsValid)
+	{
+		OutputTexture[DispatchThreadId.xy] = float4(HitColor, 1);
+	}
+}

@@ -1,0 +1,74 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "HairStrandsMeshProjectionCommon.ush"
+#include "HairStrandsMeshRBF.ush"  
+
+////////////////////////////////////////////////////////////////////////
+
+#if SHADER_ROOTTRIANGLE
+
+uint MaxRootCount;
+uint MaxSampleCount;
+
+Buffer<float4> RestSamplePositionsBuffer;
+Buffer<float4> MeshSampleWeightsBuffer;
+
+Buffer<float4> RestRootTrianglePosition0;
+Buffer<float4> RestRootTrianglePosition1;
+Buffer<float4> RestRootTrianglePosition2;
+
+RWBuffer<float4> OutDeformedRootTrianglePosition0;
+RWBuffer<float4> OutDeformedRootTrianglePosition1;
+RWBuffer<float4> OutDeformedRootTrianglePosition2;
+
+void ApplyRBF(
+	uint InRootIndex,
+	Buffer<float4> InRestRootTrianglePosition,
+	RWBuffer<float4> OutDeformedRootTrianglePosition)
+{
+	const float3 RestControlPoint = InRestRootTrianglePosition[InRootIndex];
+	const float3 DeformedControlPoint = ApplyRBF(RestControlPoint, MaxSampleCount, RestSamplePositionsBuffer, MeshSampleWeightsBuffer);
+	OutDeformedRootTrianglePosition[InRootIndex + MaxRootCount] = float4(DeformedControlPoint, 1);
+}
+
+[numthreads(128, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{ 
+	const uint RootIndex = DispatchThreadId.x;
+	if (RootIndex >= MaxRootCount) 
+		return;
+
+	ApplyRBF(RootIndex, RestRootTrianglePosition0, OutDeformedRootTrianglePosition0);
+	ApplyRBF(RootIndex, RestRootTrianglePosition1, OutDeformedRootTrianglePosition1);
+	ApplyRBF(RootIndex, RestRootTrianglePosition2, OutDeformedRootTrianglePosition2);
+}
+
+#endif // SHADER_ROOTTRIANGLE
+
+////////////////////////////////////////////////////////////////////////
+
+#if SHADER_HAIRMESHES
+
+uint VertexCount;
+uint MaxSampleCount;
+
+Buffer<float4> RestSamplePositionsBuffer;
+Buffer<float4> MeshSampleWeightsBuffer;
+
+Buffer<float4> RestPositionBuffer;
+RWBuffer<float4> OutDeformedPositionBuffer;
+
+[numthreads(128, 1, 1)]
+void MainHairMeshesCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint VertexIndex = DispatchThreadId.x;
+	if (VertexIndex >= VertexCount)
+		return;
+
+	const float3 RestPosition = RestPositionBuffer[VertexIndex].xyz;
+	const float3 DeformedPosition = ApplyRBF(RestPosition, MaxSampleCount, RestSamplePositionsBuffer, MeshSampleWeightsBuffer);
+	OutDeformedPositionBuffer[VertexIndex] = float4(DeformedPosition,1);
+}
+
+#endif // SHADER_HAIRMESHES

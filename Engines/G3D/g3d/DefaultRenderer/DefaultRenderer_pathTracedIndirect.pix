@@ -1,0 +1,115 @@
+#version 410 // -*- c++ -*-
+#extension GL_ARB_texture_query_lod : enable
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <LightingEnvironment/LightingEnvironment_uniforms.glsl>
+#include <Light/Light.glsl>
+#include <Texture/Texture.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <reconstructFromDepth.glsl>
+
+// Declare a GBuffer with no prefix
+uniform_GBuffer(gbuffer_);
+
+#include "GIMode.glsl"
+
+#include <noise.glsl>
+#include <pathTraceHelpers.glsl>
+
+uniform sampler2D         incidentIrradianceTexture;
+uniform float             raysPerPixel;
+
+out Color3 E_lambertianIndirect;
+out Color3 E_glossyIndirect;
+
+// From https://www.shadertoy.com/view/4dsSzr
+vec3 neonGradient(float t) {
+    return clamp(vec3(t * 1.3 + 0.1, square(abs(0.43 - t) * 1.7), (1.0 - t) * 1.7), 0.0, 1.0);
+}
+
+
+vec3 fireGradient(float t) {
+    return max(pow(vec3(min(t * 1.02, 1.0)), vec3(1.7, 25.0, 100.0)),
+        vec3(0.06 * pow(max(1.0 - abs(t - 0.35), 0.0), 5.0)));
+}
+
+
+vec3 desertGradient(float t) {
+    float s = sqrt(clamp(1.0 - (t - 0.4) / 0.6, 0.0, 1.0));
+    vec3 sky = sqrt(mix(vec3(1, 1, 1), vec3(0, 0.8, 1.0), smoothstep(0.4, 0.9, t)) * vec3(s, s, 1.0));
+    vec3 land = mix(vec3(0.7, 0.3, 0.0), vec3(0.85, 0.75 + max(0.8 - t * 20.0, 0.0), 0.5), square(t / 0.4));
+    return clamp((t > 0.4) ? sky : land, 0.0, 1.0) * clamp(1.5 * (1.0 - abs(t - 0.4)), 0.0, 1.0);
+}
+
+
+vec3 probeVisualizationColor(float relativeProbeIndex) {
+    // Floating point hash
+    float t = frac(abs(sin(relativeProbeIndex * 1e2)) * 1e4);
+    return desertGradient(t);
+}
+
+vec3 probeCoordVisualizationColor(ivec3 coord) {
+    vec3 c = vec3(coord.x & 1, coord.y & 1, coord.z & 1);
+    // Make all probes the same brightness
+    c /= max(c.x + c.y + c.z, 0.01);
+    return c * 0.6 + 0.2;
+}
+
+void main() {
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    Vector3 wsN;
+    // Surface normal
+#ifndef gbuffer_WS_RAY_DIRECTION_notNull
+    Vector3 csN = texelFetch(gbuffer_CS_NORMAL_buffer, C, 0).xyz;
+
+    // Point being shaded
+    float csZ = reconstructCSZ(texelFetch(gbuffer_DEPTH_buffer, C, 0).r, gbuffer_camera_clipInfo);
+    if (dot(csN, csN) < 0.01 || csZ < -100.0) {
+        E_glossyIndirect = Color3(0);
+        E_lambertianIndirect = Color3(0);
+        return;
+    }
+    else {
+        wsN = normalize(mat3x3(gbuffer_camera_frame) * (csN * gbuffer_CS_NORMAL_readMultiplyFirst.xyz + gbuffer_CS_NORMAL_readAddSecond.xyz));
+    }
+#else
+    wsN = normalize(texelFetch(gbuffer_WS_NORMAL_buffer, C, 0)).xyz;
+
+    if (dot(wsN, wsN) < 0.01) {
+        E_glossyIndirect = Color3(0);
+        E_lambertianIndirect = Color3(0);
+        return;
+    }
+#endif
+    Point3 wsPosition;
+#ifndef gbuffer_WS_RAY_DIRECTION_notNull
+    Point3 csPosition = reconstructCSPosition(gl_FragCoord.xy, csZ, gbuffer_camera_projInfo);
+    wsPosition = (gbuffer_camera_frame * vec4(csPosition, 1.0)).xyz;
+#else
+    wsPosition = texelFetch(gbuffer_WS_POSITION_buffer, C, 0).xyz;
+#endif
+
+    // View vector
+    Vector3 w_o = normalize(gbuffer_camera_frame[3] - wsPosition);
+
+    // Glossy coefficient in BSDF (this code unpacks
+    // G3D::UniversalBSDF's encoding)
+    Color4  F0;
+#   ifdef gbuffer_GLOSSY_notNull
+    F0 = texelFetch(gbuffer_GLOSSY_buffer, C, 0);
+#   else
+    F0 = Color4(0);
+#   endif
+
+    float glossyExponent = smoothnessToBlinnPhongExponent(F0.a);
+
+    float cos_o = dot(wsN, w_o);
+
+    // Incoming reflection vector
+    Vector3 w_mi = normalize(wsN * (2.0 * cos_o) - w_o);
+
+    E_glossyIndirect = computeGlossyEnvironmentMapLighting(w_mi, (F0.a == 1.0), glossyExponent, false) / raysPerPixel;
+
+    E_lambertianIndirect = (texelFetch(gbuffer_LAMBERTIAN_buffer, C, 0) * texelFetch(incidentIrradianceTexture, C, 0)).rgb / raysPerPixel;
+}

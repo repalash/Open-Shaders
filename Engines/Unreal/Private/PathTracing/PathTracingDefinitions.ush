@@ -1,0 +1,10 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*================================================================================================
+	PathTracingDefinitions.ush: used in ray tracing shaders  and C++ code to define common constants
+=================================================================================================*/
+
+#pragma once
+
+#define GLOSSY_MIN_ROUGHNESS	0.001f
+#define GLOSSY_MAX_ROUGHNESS	0.999f

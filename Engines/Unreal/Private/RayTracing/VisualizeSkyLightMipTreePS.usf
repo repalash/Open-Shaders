@@ -1,0 +1,62 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	VisualizeSkyLightMipTreePixelShader.usf: Interactive visualization of sky light mip tree.
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "MipTreeCommon.ush"
+
+uint3 Dimensions;
+Buffer<float> MipTreePosX;
+Buffer<float> MipTreeNegX;
+Buffer<float> MipTreePosY;
+Buffer<float> MipTreeNegY;
+Buffer<float> MipTreePosZ;
+Buffer<float> MipTreeNegZ;
+
+float SampleMipTree(uint FaceIndex, uint BufferOffset)
+{
+	float Value = 0.0;
+	if (FaceIndex == 0)
+	{
+		Value = MipTreePosX[BufferOffset];
+	}
+	else if (FaceIndex == 1)
+	{
+		Value = MipTreeNegX[BufferOffset];
+	}
+	else if (FaceIndex == 2)
+	{
+		Value = MipTreePosY[BufferOffset];
+	}
+	else if (FaceIndex == 3)
+	{
+		Value = MipTreeNegY[BufferOffset];
+	}
+	else if (FaceIndex == 4)
+	{
+		Value = MipTreePosZ[BufferOffset];
+	}
+	else
+	{
+		Value = MipTreeNegZ[BufferOffset];
+	}
+
+	return Value;
+}
+
+void VisualizeSkyLightMipTreePS(
+	in noperspective float2 UV : TEXCOORD0,
+	out float4 OutColor : SV_Target0,
+	out float OutMipTree : SV_Target1
+)
+{
+	uint FaceIndex = 0;
+	uint MipLevel = 0;
+	uint2 TexCoord = UV * DimensionsAtLevel(Dimensions, MipLevel);
+	uint BufferOffset = BufferOffsetAtPixel(TexCoord, MipLevel, Dimensions);
+
+	OutColor = 0.f;
+	OutMipTree = SampleMipTree(FaceIndex, BufferOffset);
+}

@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ResolveVertexShader.usf: Resolve vertex shader source.
+=============================================================================*/
+
+#include "Common.ush"
+
+float4 PositionMinMax; // xy = min [x, y], zw = max [x, y]
+float4 UVMinMax;       // xy = min [u, v], zw = max [u, v]
+
+void Main(
+	uint VertexID          : SV_VertexID,
+	out float2 OutUV       : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION
+	)
+{
+	// Generate these positions:
+	// [0, 1], [1, 1], [0, 0], [1, 0]
+	float2 Pos = float2(
+		float(VertexID & 1),
+		float(1 - (VertexID >> 1))
+	);
+
+	OutPosition = float4(lerp(PositionMinMax.xy, PositionMinMax.zw, Pos), 0, 1);
+    OutUV = lerp(UVMinMax.xy, UVMinMax.zw, Pos);
+}

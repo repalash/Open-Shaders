@@ -1,0 +1,549 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ShaderPrintCommon.ush"
+#include "../ShaderDrawDebug.ush"
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairStrandsDebugCommon.ush"
+#include "HairStrandsAABBCommon.ush" 
+
+int2 PixelCoord;
+int2 MaxResolution;
+uint FastResolveMask;
+uint HairMacroGroupCount;
+uint MaxSampleCount;
+uint2 GroupSize; 
+uint HairVisibilityNodeGroupSize;
+
+Texture2D<float> HairCountTexture;
+Texture2D<uint> HairCountUintTexture;
+Texture2D<uint4> CategorizationTexture;
+Texture2D<uint2> DepthStencilTexture;
+SamplerState LinearSampler;
+Texture2D<uint> HairVisibilityNodeOffsetAndCount;
+StructuredBuffer<FPackedHairSample> HairVisibilityNodeData;
+Buffer<uint> HairVisibilityIndirectArgsBuffer;
+
+Buffer<int> HairMacroGroupAABBBuffer;
+
+#define MATERIAL_DATA 1
+#define DETAIL_DATA 1
+
+[numthreads(1, 1, 1)]
+void MainCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{	
+	// Draw AABB of the instance groups
+	if (DispatchThreadId.x == 0 && DispatchThreadId.y == 0 && DispatchThreadId.z == 0)
+	{
+		for (uint GroupIndex =0;GroupIndex< HairMacroGroupCount; GroupIndex++)
+		{
+			const float4 InstanceBoundColor = float4(1.f, 0.5f, 0.5f, 1.0f);
+			FHairAABB Bound = ReadHairAABB(GroupIndex, HairMacroGroupAABBBuffer);
+			AddAABB(Bound.Min, Bound.Max, InstanceBoundColor);
+		}
+
+
+		const uint DispatchX = HairVisibilityIndirectArgsBuffer[0];
+		const uint DispatchY = HairVisibilityIndirectArgsBuffer[1];
+		const uint TotalSampleCount = DispatchX * DispatchY * HairVisibilityNodeGroupSize;
+		const uint2 EquivalentResolution = ceil(sqrt(TotalSampleCount));
+
+		// Pixel coord
+		float2 OriginalPos = float2(50, 50) / float2(MaxResolution);
+		float2 Pos = OriginalPos;
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _M_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, TotalSampleCount);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _Q_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _V_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, EquivalentResolution);
+	}
+
+	const float2 PixelPos = PixelCoord;
+	if (PixelCoord.x < 0 || PixelCoord.y < 0 || PixelCoord.x >= MaxResolution.x || PixelCoord.y >= MaxResolution.y)
+		return;
+
+	ShaderPrintFilter(true);
+
+	const FCategorizationData CatData = DecodeCategorizationData(CategorizationTexture.Load(uint3(PixelPos,0)));
+	const bool bIsValid = CatData.PixelCoverage > 0;
+	if (!bIsValid)
+		return;
+
+	const float ViewHairCount = HairCountTexture.Load(uint3(PixelPos, 0));
+	const float ViewHairCountUint = HairCountUintTexture.Load(uint3(PixelPos, 0)) /  1000.f;
+
+	const float2 OriginalPos = PixelPos / float2(MaxResolution);
+	float2 Pos = OriginalPos;
+
+	uint Total8BitCoverage = 0;
+	const FNodeDesc NodeDesc = DecodeNodeDesc(HairVisibilityNodeOffsetAndCount.Load(uint3(PixelCoord, 0)));
+	for (uint SampleIt0 = 0; SampleIt0 < NodeDesc.Count; SampleIt0++)
+	{
+		const uint LocalOffset = NodeDesc.Offset + SampleIt0;
+		const FPackedHairSample NodeData = HairVisibilityNodeData[LocalOffset];
+		const FHairSample Sample = UnpackHairSample(NodeData);
+		Total8BitCoverage += Sample.Coverage8bit;
+	}
+
+	// Pixel coord
+	Pos = ShaderPrintSymbol(Pos, _P_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _X_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _L_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, PixelCoord);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+#if MATERIAL_DATA
+	// Dispatch thread id
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _H_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _D_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _D_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, uint4(PixelCoord.x/GroupSize.x, PixelCoord.x % GroupSize.x, PixelCoord.y / GroupSize.y, PixelCoord.y % GroupSize.y));
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+#endif
+
+	// Max sample
+	Pos = ShaderPrintSymbol(Pos, _M_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _X_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _M_);
+	Pos = ShaderPrintSymbol(Pos, _P_);
+	Pos = ShaderPrintSymbol(Pos, _L_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, MaxSampleCount);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// Unique sample
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _M_);
+	Pos = ShaderPrintSymbol(Pos, _P_);
+	Pos = ShaderPrintSymbol(Pos, _L_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, CatData.SampleCount);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// Accurate coverage (if coverage pass is activated)
+	Pos = ShaderPrintSymbol(Pos, _H_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _C_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _U_);
+	Pos = ShaderPrintSymbol(Pos, _N_);
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, ViewHairCount);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// Accurate coverage (if coverage pass is activated) uint
+	Pos = ShaderPrintSymbol(Pos, _H_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _C_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _U_);
+	Pos = ShaderPrintSymbol(Pos, _N_);
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _U_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _N_);
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, ViewHairCountUint);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+	
+	// Accurate coverage (if coverage pass is activated)
+	Pos = ShaderPrintSymbol(Pos, _C_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _V_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _G_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, CatData.PixelCoverage);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// 8 bit Coverage (cateogory texture)
+	Pos = ShaderPrintSymbol(Pos, _C_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _V_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _G_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _8_); 
+	Pos = ShaderPrintSymbol(Pos, _B_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, CatData.TotalCoverage8bit);
+	Pos = ShaderPrint(Pos, CatData.TotalCoverage8bit / 255.f);
+	
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// 8 bit Coverage (summed)
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _U_);
+	Pos = ShaderPrintSymbol(Pos, _M_);
+	Pos = ShaderPrintSymbol(Pos, _M_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _D_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _C_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _V_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _A_);
+	Pos = ShaderPrintSymbol(Pos, _G_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrintSymbol(Pos, _8_); 
+	Pos = ShaderPrintSymbol(Pos, _B_);
+	Pos = ShaderPrintSymbol(Pos, _I_);
+	Pos = ShaderPrintSymbol(Pos, _T_);
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	Pos = ShaderPrint(Pos, Total8BitCoverage);
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// Resolve type
+	const uint Stencil = DepthStencilTexture.Load(uint3(PixelPos,0)).y;
+	const bool bIsFastResolve = (Stencil & FastResolveMask) != 0;
+	Pos = ShaderPrintSymbol(Pos, _R_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _S_);
+	Pos = ShaderPrintSymbol(Pos, _O_);
+	Pos = ShaderPrintSymbol(Pos, _L_);
+	Pos = ShaderPrintSymbol(Pos, _V_);
+	Pos = ShaderPrintSymbol(Pos, _E_);
+	Pos = ShaderPrintSymbol(Pos, _SPC_);
+	if (bIsFastResolve)
+	{
+		Pos = ShaderPrintSymbol(Pos, _F_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+	}
+	else
+	{
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+	}
+
+	Pos = ShaderPrintNewline(Pos);
+	Pos.x = OriginalPos.x;
+
+	// Per sample description
+	for (uint SampleIt = 0; SampleIt < NodeDesc.Count; SampleIt++)
+	{
+		const uint LocalOffset = NodeDesc.Offset + SampleIt;
+		const FPackedHairSample NodeData = HairVisibilityNodeData[LocalOffset];		
+		const FHairSample Sample = UnpackHairSample(NodeData);
+
+		// Base Color
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+		Pos = ShaderPrintSymbol(Pos, _MINUS_);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+#if MATERIAL_DATA
+		// Base Color
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _B_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.BaseColor);
+		
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Roughness
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _H_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Roughness);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Specular
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Specular);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Backlit
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _B_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _K_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Backlit);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Tangent
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Tangent);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+#endif 
+
+#if DETAIL_DATA
+		// PrimitiveId
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _M_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _V_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.PrimitiveId);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// MacroGroupId
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _M_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _D_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.MacroGroupId);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;		
+
+		// Light channel mask
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _H_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _H_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, (Sample.LightChannelMask & 0x1) ? 1u : 0u);
+		Pos = ShaderPrint(Pos, (Sample.LightChannelMask & 0x2) ? 1u : 0u);
+		Pos = ShaderPrint(Pos, (Sample.LightChannelMask & 0x4) ? 1u : 0u);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Scene lighting scatter
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.bScatterSceneLighting ? 1u : 0u);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+
+		// Depth
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _D_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _H_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Depth);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+#endif
+
+		// Coverage8bit
+		Pos = ShaderPrintSymbol(Pos, _DOT_);
+		Pos = ShaderPrintSymbol(Pos, _C_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _V_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _G_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, Sample.Coverage8bit);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+	}
+}

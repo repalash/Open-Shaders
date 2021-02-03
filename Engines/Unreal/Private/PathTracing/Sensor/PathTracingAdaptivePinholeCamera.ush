@@ -1,0 +1,137 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingAdaptivePinholeCamera.ush: Reference path tracing camera functions
+===============================================================================================*/
+
+#pragma once
+
+uint2 DimensionsAtLevel(uint Level)
+{
+	return uint2(AdaptiveSamplingData.VarianceDimensions.x >> Level, AdaptiveSamplingData.VarianceDimensions.y >> Level);
+}
+
+uint BufferOffsetAtPixel(uint2 Pixel, uint Level)
+{
+	uint Offset = 0;
+	for (uint LevelIndex = 0; LevelIndex < Level; ++LevelIndex)
+	{
+		uint2 MipLevelDimensions = DimensionsAtLevel(LevelIndex);
+		Offset += MipLevelDimensions.x * MipLevelDimensions.y;
+	}
+
+	uint2 MipLevelDimensions = DimensionsAtLevel(Level);
+	Offset += Pixel.y * MipLevelDimensions.x + Pixel.x;
+	return Offset;
+}
+
+uint Log2(uint Value)
+{
+	uint Result = 0;
+	while (Value)
+	{
+		Result++;
+		Value = Value >> 1;
+	}
+	return Result - 1;
+}
+
+bool DoAdaptiveSampling()
+{
+	bool bVarianceMapExists = AdaptiveSamplingData.VarianceDimensions.x + AdaptiveSamplingData.VarianceDimensions.y > 0;
+	bool bVarianceMapIsPrimed = AdaptiveSamplingData.Iteration >= AdaptiveSamplingData.MinimumSamplesPerPixel;
+	bool bVarianceSumIsValid = false;
+	if (bVarianceMapExists && bVarianceMapIsPrimed)
+	{
+		uint MipCount = Log2(AdaptiveSamplingData.VarianceDimensions.x);
+		float VarianceSum = AdaptiveSamplingData.VarianceMipTree[BufferOffsetAtPixel(uint2(0, 0), MipCount)];
+		float Epsilon = 0.0001;
+		bVarianceSumIsValid = VarianceSum > Epsilon;
+	}
+	return bVarianceMapExists && bVarianceMapIsPrimed && bVarianceSumIsValid;
+}
+
+void AdaptivePinholeCamera_SampleEmitter(
+	uint2 LaunchIndex,
+	inout RandomSequence RandSequence,
+	inout uint SampleIndex,
+	uint SourceEmitterId,
+	uint SensorId,
+	out RayDesc OutRay,
+	out uint2 OutPixel,
+	out float OutPdf
+)
+{
+	// Fallback
+	if (!DoAdaptiveSampling())
+	{
+		return PinholeCamera_SampleEmitter(LaunchIndex, RandSequence, SampleIndex, SourceEmitterId, SensorId, OutRay, OutPixel, OutPdf);
+	}
+	OutPdf = 1.0;
+
+	uint2 MipPixel = 0;
+	uint MipCount = Log2(AdaptiveSamplingData.VarianceDimensions.x);
+
+	uint StopLevel = 0;
+	for (uint Index = 0; Index < MipCount - StopLevel; ++Index)
+	{
+		uint MipIndex = MipCount - Index - 1;
+		float4 VarianceCdf;
+		VarianceCdf.x = AdaptiveSamplingData.VarianceMipTree[BufferOffsetAtPixel(MipPixel, MipIndex)];
+		VarianceCdf.y = VarianceCdf.x + AdaptiveSamplingData.VarianceMipTree[BufferOffsetAtPixel(MipPixel + uint2(1, 0), MipIndex)];
+		VarianceCdf.z = VarianceCdf.y + AdaptiveSamplingData.VarianceMipTree[BufferOffsetAtPixel(MipPixel + uint2(0, 1), MipIndex)];
+		VarianceCdf.w = VarianceCdf.z + AdaptiveSamplingData.VarianceMipTree[BufferOffsetAtPixel(MipPixel + uint2(1, 1), MipIndex)];
+		VarianceCdf /= VarianceCdf.w;
+
+		float RandSample = RandomSequence_GenerateSample1D(RandSequence, SampleIndex);
+		if (RandSample < VarianceCdf.x)
+		{
+			OutPdf *= VarianceCdf.x;
+		}
+		else if (RandSample < VarianceCdf.y)
+		{
+			OutPdf *= VarianceCdf.y - VarianceCdf.x;
+			MipPixel.x += 1;
+		}
+		else if (RandSample < VarianceCdf.z)
+		{
+			OutPdf *= VarianceCdf.z - VarianceCdf.y;
+			MipPixel.y += 1;
+		}
+		else // if (RandSample < VarianceCdf.w)
+		{
+			OutPdf *= 1.0 - VarianceCdf.z;
+			MipPixel += 1;
+		}
+
+		MipPixel = uint2(MipPixel.x << 1, MipPixel.y << 1);
+	}
+#if 0
+	// Applying correct normalization causes catastrophic cancelation. Instead, OutPdf is only proportional to the correct weight
+	float NormalizationFactor = View.BufferSizeAndInvSize.x * View.BufferSizeAndInvSize.y;
+	float AreaPdf = (DimensionsAtLevel(StopLevel).x * DimensionsAtLevel(StopLevel).y) / (DimensionsAtLevel(0).x * DimensionsAtLevel(0).y);
+	OutPdf *= AreaPdf * NormalizationFactor;
+#endif
+	MipPixel = uint2(MipPixel.x >> 1, MipPixel.y >> 1);
+
+	float2 PixelOffset = RandomSequence_GenerateSample2D(RandSequence, SampleIndex);
+	float2 MipPixelUV = (MipPixel + PixelOffset) / float2(DimensionsAtLevel(StopLevel));
+	// Correct for ViewSize/BufferSize discrepancy
+	MipPixelUV *= View.ViewSizeAndInvSize.xy * View.BufferSizeAndInvSize.zw;
+
+	OutRay = CreatePrimaryRay(MipPixelUV);
+	OutPixel = MipPixelUV * View.BufferSizeAndInvSize.xy;
+}
+
+void AdaptivePinholeCamera_PdfEmitter(
+	RayDesc Ray,
+	out float OutPdf
+)
+{
+	if (!DoAdaptiveSampling())
+	{
+		return PinholeCamera_PdfEmitter(Ray, OutPdf);
+	}
+
+	OutPdf = 1.0;
+}

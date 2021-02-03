@@ -1,0 +1,145 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+uint Value;
+uint Size;
+uint Float4sPerLine;
+uint NumScatters;
+uint SrcOffset;
+uint DstOffset;
+
+#if FLOAT4_BUFFER
+	StructuredBuffer< uint >		ScatterStructuredBuffer;
+	StructuredBuffer< float4 >		SrcStructuredBuffer;
+	StructuredBuffer< float4 >		UploadStructuredBuffer;
+	RWStructuredBuffer< float4 >	DstStructuredBuffer;
+#elif FLOAT4_TEXTURE
+	StructuredBuffer< uint >		ScatterStructuredBuffer;
+	Texture2D<float4>				SrcTexture;
+	StructuredBuffer< float4 >		UploadStructuredBuffer;
+	RWTexture2D<float4>				DstTexture;
+#else
+	ByteAddressBuffer				ScatterByteAddressBuffer;
+	ByteAddressBuffer				SrcByteAddressBuffer;
+	ByteAddressBuffer				UploadByteAddressBuffer;
+	RWByteAddressBuffer				DstByteAddressBuffer;
+#endif
+
+#if FLOAT4_TEXTURE == false
+[numthreads(64, 1, 1)]
+void MemsetBufferCS( uint ThreadId : SV_DispatchThreadID ) 
+{
+#if FLOAT4_BUFFER
+	// Size is in float4s
+	if( ThreadId < Size )
+	{
+		DstStructuredBuffer[ DstOffset + ThreadId ] = asfloat( Value );
+	}
+#else
+	// Size and offset is in dwords
+	uint DstIndex = DstOffset + ThreadId * 4;
+
+	if( ThreadId * 4 + 3 < Size )
+	{
+		DstByteAddressBuffer.Store4( DstIndex * 4, uint4( Value, Value, Value, Value ) );
+	}
+	else if( ThreadId * 4 + 2 < Size )
+	{
+		DstByteAddressBuffer.Store3( DstIndex * 4, uint3( Value, Value, Value ) );
+	}
+	else if( ThreadId * 4 + 1 < Size )
+	{
+		DstByteAddressBuffer.Store2( DstIndex * 4, uint2( Value, Value ) );
+	}
+	else if( ThreadId * 4 < Size )
+	{
+		DstByteAddressBuffer.Store( DstIndex * 4, Value );
+	}
+#endif
+}
+#endif
+
+[numthreads(64, 1, 1)]
+void MemcpyCS( uint ThreadId : SV_DispatchThreadID ) 
+{
+#if FLOAT4_BUFFER
+	// Size is in float4s
+	if( ThreadId < Size )
+	{
+		DstStructuredBuffer[ DstOffset + ThreadId ] = SrcStructuredBuffer[ SrcOffset + ThreadId ];
+	}
+#elif FLOAT4_TEXTURE
+	uint2 IndexTexture;
+	IndexTexture.y = ThreadId / (Float4sPerLine);
+	IndexTexture.x = ThreadId % (Float4sPerLine);
+
+	if(ThreadId < Size)
+	{
+		float4 SrcValue = SrcTexture.Load(float3(IndexTexture.x, IndexTexture.y, 0));
+		DstTexture[IndexTexture.xy] = SrcValue;
+	}
+#else
+	// Size and offsets are in dwords
+	uint SrcIndex = SrcOffset + ThreadId * 4;
+	uint DstIndex = DstOffset + ThreadId * 4;
+
+	if( ThreadId * 4 + 3 < Size )
+	{
+		uint4 SrcData = SrcByteAddressBuffer.Load4( SrcIndex * 4 );
+		DstByteAddressBuffer.Store4( DstIndex * 4, SrcData );
+	}
+	else if( ThreadId * 4 + 2 < Size )
+	{
+		uint3 SrcData = SrcByteAddressBuffer.Load3( SrcIndex * 4 );
+		DstByteAddressBuffer.Store3( DstIndex * 4, SrcData );
+	}
+	else if( ThreadId * 4 + 1 < Size )
+	{
+		uint2 SrcData = SrcByteAddressBuffer.Load2( SrcIndex * 4 );
+		DstByteAddressBuffer.Store2( DstIndex * 4, SrcData );
+	}
+	else if( ThreadId * 4 < Size )
+	{
+		uint SrcData = SrcByteAddressBuffer.Load( SrcIndex * 4 );
+		DstByteAddressBuffer.Store( DstIndex * 4, SrcData );
+	}
+#endif
+}
+
+[numthreads(64, 1, 1)]
+void ScatterCopyCS( uint DispatchThreadId : SV_DispatchThreadID ) 
+{
+	uint ThreadId = DispatchThreadId + SrcOffset;
+
+	uint ScatterIndex = ThreadId / Size;
+	uint ScatterOffset = ThreadId - ScatterIndex * Size;
+
+	if( ScatterIndex < NumScatters )
+	{
+#if FLOAT4_BUFFER
+		uint DstIndex = ScatterStructuredBuffer[ ScatterIndex ] * Size + ScatterOffset;
+		uint SrcIndex = ThreadId;
+		DstStructuredBuffer[ DstIndex ] = UploadStructuredBuffer[ SrcIndex ];
+#elif UINT4_ALIGNED
+		uint DstIndex = ScatterByteAddressBuffer.Load( ScatterIndex * 4 ) * Size + ScatterOffset;
+		uint SrcIndex = ThreadId;
+		uint4 SrcData = UploadByteAddressBuffer.Load4( SrcIndex * 16 );
+		DstByteAddressBuffer.Store4( DstIndex * 16, SrcData );
+#elif FLOAT4_TEXTURE
+		uint DstIndex = ScatterStructuredBuffer[ScatterIndex] * Size + ScatterOffset;
+		uint SrcIndex = ThreadId;
+		uint2 IndexTexture;
+		IndexTexture.y = DstIndex / (Float4sPerLine);
+		IndexTexture.x = DstIndex % (Float4sPerLine);
+
+		float4 srvResourceVal = UploadStructuredBuffer[SrcIndex];
+		DstTexture[IndexTexture.xy] = srvResourceVal;
+#else
+		uint DstIndex = ScatterByteAddressBuffer.Load( ScatterIndex * 4 ) * Size + ScatterOffset;
+		uint SrcIndex = ThreadId;
+		uint SrcData = UploadByteAddressBuffer.Load( SrcIndex * 4 );
+		DstByteAddressBuffer.Store( DstIndex * 4, SrcData );
+#endif
+	}
+}

@@ -1,0 +1,289 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+LightSampling.usf: Light sampling for next-event estimation 
+===============================================================================================*/
+
+#pragma once
+
+#ifndef ENABLE_TRANSMISSION
+	#define ENABLE_TRANSMISSION 1
+#endif
+
+#include "PathTracingLightCommon.ush"
+#include "PathTracingDirectionalLight.ush"
+#include "PathTracingPointLight.ush"
+#include "PathTracingRectLight.ush"
+#include "PathTracingSkyLight.ush"
+#include "PathTracingSpotLight.ush"
+
+void GenerateLightRay(RayDesc Ray, int LightId, float3 LightUV, inout RayDesc OutLightRay)
+{
+	OutLightRay = (RayDesc)0; // #dxr_todo: Return false in the case of no matching light type and handle case from caller rather than blindly using a degenerate ray
+
+	if (IsPointLight(LightId))
+	{
+		PointLight_GenerateLightRay(Ray, LightId, LightUV, OutLightRay);
+	}
+	else if (IsSpotLight(LightId))
+	{
+		SpotLight_GenerateLightRay(Ray, LightId, LightUV, OutLightRay);
+	}
+	else if (IsDirectionalLight(LightId))
+	{
+		DirectionalLight_GenerateLightRay(Ray, LightId, LightUV, OutLightRay);
+	}
+	else if (IsEnvironmentLight(LightId))
+	{
+		SkyLight_GenerateLightRay(Ray, LightId, LightUV, OutLightRay);
+	}
+	else if (IsRectLight(LightId))
+	{
+		RectLight_GenerateLightRay(Ray, LightId, LightUV, OutLightRay);
+	}
+}
+
+
+void EstimateLight(
+	int LightId,
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	inout float OutIrradiance
+)
+{
+	OutIrradiance = 0.0f;
+	if ((GetLightingChannelMask(LightId) & Payload.PrimitiveLightingChannelMask) == 0) return;
+
+	if (IsPointLight(LightId))
+	{
+		PointLight_EstimateLight(LightId, Ray, Payload, OutIrradiance);
+	}
+	else if (IsSpotLight(LightId))
+	{
+		SpotLight_EstimateLight(LightId, Ray, Payload, OutIrradiance);
+	}
+	else if (IsEnvironmentLight(LightId))
+	{
+		SkyLight_EstimateLight(LightId, Ray, Payload, OutIrradiance);
+	}
+	else if (IsDirectionalLight(LightId))
+	{
+		DirectionalLight_EstimateLight(LightId, Ray, Payload, OutIrradiance);
+	}
+	else if (IsRectLight(LightId))
+	{
+		RectLight_EstimateLight(LightId, Ray, Payload, OutIrradiance);
+	}
+}
+
+bool SampleLightSelection(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	float RandSample,
+	inout int OutLightId,
+	inout float OutLightSelectionPdf
+)
+{
+	OutLightSelectionPdf = 0.0;
+
+//#define UNIFORM_LIGHT_SELECTION
+#ifdef UNIFORM_LIGHT_SELECTION
+	OutLightId = RandSample * SceneLightsData.Count;
+	OutLightSelectionPdf = 1.0 / SceneLightsData.Count;
+	return true;
+#else
+	if (SceneLightsData.Count == 0) return false;
+
+	// Build irradiance estimate prefix sum
+	float IrradianceEstimate[RAY_TRACING_LIGHT_COUNT_MAXIMUM];
+	EstimateLight(0, Ray, Payload, IrradianceEstimate[0]);
+	{
+		for (uint LightIndex = 1; LightIndex < SceneLightsData.Count; ++LightIndex)
+		{
+			EstimateLight(LightIndex, Ray, Payload, IrradianceEstimate[LightIndex]);
+			IrradianceEstimate[LightIndex] += IrradianceEstimate[LightIndex - 1];
+		}
+	}
+	// dxr_todo: Consider when IrradianceEstimate[SceneLightsData.Count] == 0
+
+	// CDF normalization
+	{
+		for (uint LightIndex = 0; LightIndex < SceneLightsData.Count; ++LightIndex)
+		{
+			IrradianceEstimate[LightIndex] /= IrradianceEstimate[SceneLightsData.Count - 1];
+		}
+	}
+	IrradianceEstimate[SceneLightsData.Count - 1] = 1.0;
+
+	// Draw random variable
+	// dxr_todo: binary search
+	for (OutLightId = 0; OutLightId < SceneLightsData.Count; ++OutLightId)
+	{
+		if (RandSample < IrradianceEstimate[OutLightId]) break;
+	}
+
+	OutLightSelectionPdf = IrradianceEstimate[OutLightId];
+	if (OutLightId > 0)
+	{
+		OutLightSelectionPdf -= IrradianceEstimate[OutLightId - 1];
+	}
+
+	return true;
+#endif
+}
+
+void PdfLightSelection(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	uint LightId,
+	inout float OutLightSelectionPdf
+)
+{
+	OutLightSelectionPdf = 0.0;
+
+#ifdef UNIFORM_LIGHT_SELECTION
+	OutLightSelectionPdf = 1.0 / SceneLightsData.Count;
+	return;
+#else
+	if (SceneLightsData.Count == 0) return;
+
+	// Build irradiance estimate prefix sum
+	float IrradianceEstimate[RAY_TRACING_LIGHT_COUNT_MAXIMUM];
+	EstimateLight(0, Ray, Payload, IrradianceEstimate[0]);
+	{
+		for (uint LightIndex = 1; LightIndex < SceneLightsData.Count; ++LightIndex)
+		{
+			EstimateLight(LightIndex, Ray, Payload, IrradianceEstimate[LightIndex]);
+			IrradianceEstimate[LightIndex] += IrradianceEstimate[LightIndex - 1];
+		}
+	}
+	// dxr_todo: Consider when IrradianceEstimate[SceneLightsData.Count] == 0
+
+	// CDF normalization
+	{
+		for (uint LightIndex = 0; LightIndex < SceneLightsData.Count; ++LightIndex)
+		{
+			IrradianceEstimate[LightIndex] /= IrradianceEstimate[SceneLightsData.Count - 1];
+		}
+	}
+	IrradianceEstimate[SceneLightsData.Count - 1] = 1.0;
+
+	OutLightSelectionPdf = IrradianceEstimate[LightId];
+	if (LightId > 0)
+	{
+		OutLightSelectionPdf -= IrradianceEstimate[LightId - 1];
+	}
+#endif
+}
+
+void PdfLight(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	int LightId,
+	float3 LightUV,
+	inout float OutPdf)
+{
+	// Light selection
+	// TODO: Use radiance estimate instead of uniform random selection
+	float LightSelectionPdf = 1.0 / SceneLightsData.Count;
+	PdfLightSelection(Ray, Payload, LightId, LightSelectionPdf);
+	float LightPdf = 0.0;
+
+	// Light sampling
+	if (IsEnvironmentLight(LightId))
+	{
+		SkyLight_PdfLight(Ray, LightId, LightUV, LightPdf);
+	}
+	else if (IsPointLight(LightId))
+	{
+		PointLight_PdfLight(Ray, LightId, LightUV, LightPdf);
+	}
+	else if (IsSpotLight(LightId))
+	{
+		SpotLight_PdfLight(Ray, LightId, LightUV, LightPdf);
+	}
+	else if (IsDirectionalLight(LightId))
+	{
+		DirectionalLight_PdfLight(Ray, LightId, LightUV, LightPdf);
+	}
+	else if (IsRectLight(LightId))
+	{
+		RectLight_PdfLight(Ray, LightId, LightUV, LightPdf);
+	}
+
+	OutPdf = LightSelectionPdf * LightPdf;
+}
+
+void EvalLight(
+	int LightId,
+	float3 LightUV,
+	RayDesc Ray,
+	inout float3 OutRadiance
+)
+{
+	OutRadiance = float3(0.0f, 0.0f, 0.0f);
+
+	if (IsPointLight(LightId))
+	{
+		PointLight_EvalLight(LightId, LightUV, Ray, OutRadiance);
+	}
+	else if (IsSpotLight(LightId))
+	{
+		SpotLight_EvalLight(LightId, LightUV, Ray, OutRadiance);
+	}
+	else if (IsEnvironmentLight(LightId))
+	{
+		SkyLight_EvalLight(LightId, LightUV, Ray, OutRadiance);
+	}
+	else if (IsDirectionalLight(LightId))
+	{
+		DirectionalLight_EvalLight(LightId, LightUV, Ray, OutRadiance);
+	}
+	else if (IsRectLight(LightId))
+	{
+		RectLight_EvalLight(LightId, LightUV, Ray,  OutRadiance);
+	}
+}
+
+void SampleLight(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	inout int OutLightId,
+	inout float3 OutLightUV,
+	inout float OutPdf)
+{
+	OutPdf = 0.0f;
+
+	// Light selection
+	float LightSelectionPdf = 0.0;
+	if (!SampleLightSelection(Ray, Payload, RandSample.x, OutLightId, LightSelectionPdf))
+	{
+		return;
+	}
+
+	// Light sampling
+	float LightPdf = 0.0;
+	if (IsPointLight(OutLightId))
+	{
+		PointLight_SampleLight(Ray, Payload, RandSample, OutLightId, OutLightUV, LightPdf);
+	}
+	else if (IsSpotLight(OutLightId))
+	{
+		SpotLight_SampleLight(Ray, Payload, RandSample, OutLightId, OutLightUV, LightPdf);
+	}
+	else if (IsDirectionalLight(OutLightId))
+	{
+		DirectionalLight_SampleLight(Ray, Payload, RandSample, OutLightId, OutLightUV, LightPdf);
+	}
+	else if (IsEnvironmentLight(OutLightId))
+	{
+		SkyLight_SampleLight(Ray, Payload, RandSample, OutLightId, OutLightUV, LightPdf);
+	}
+	else if (IsRectLight(OutLightId))
+	{
+		RectLight_SampleLight(Ray, Payload, RandSample, OutLightId, OutLightUV, LightPdf);
+	}
+
+	OutPdf = LightSelectionPdf * LightPdf;
+}

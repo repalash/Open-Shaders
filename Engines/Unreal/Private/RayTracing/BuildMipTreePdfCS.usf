@@ -1,0 +1,95 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+BuildMipTreeCS.usf: Build MipTree PDF structure
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "SkyLightMipTreeCommon.ush"
+
+uint2 Dimensions;
+uint FaceIndex;
+uint MipLevel;
+
+Buffer<float> MipTree;
+RWBuffer<float> RWMipTreePdf;
+
+float SampleMipTree(uint2 MipPixel, uint MipIndex)
+{
+	return MipTree[BufferOffsetAtPixel(MipPixel, MipIndex, Dimensions)];
+}
+
+float CalcSkyLightPdf(uint2 Pixel)
+{
+	uint2 MipPixel = 0;
+	float MipPdf = 1.0;
+	uint StopLevel = MipLevel;
+	uint MipCount = log2(Dimensions.x);
+	for (uint Index = 0; Index < MipCount - StopLevel; ++Index)
+	{
+		uint MipIndex = MipCount - Index - 1;
+
+		float Cdf[4];
+		Cdf[0] = SampleMipTree(MipPixel, MipIndex);
+		Cdf[1] = Cdf[0] + SampleMipTree(MipPixel + uint2(1, 0), MipIndex);
+		Cdf[2] = Cdf[1] + SampleMipTree(MipPixel + uint2(0, 1), MipIndex);
+		Cdf[3] = Cdf[2] + SampleMipTree(MipPixel + uint2(1, 1), MipIndex);
+
+		float Sum = Cdf[3];
+		if (Sum > 0.0)
+		{
+			for (uint i = 0; i < 3; ++i)
+			{
+				Cdf[i] /= Sum;
+			}
+			Cdf[3] = 1.0;
+		}
+
+		// Determine probability
+		uint2 MipOffset = (Pixel.xy >> (MipIndex - StopLevel)) - MipPixel;
+		uint LinearIndex = MipOffset.y << 1 | MipOffset.x;
+
+		if (LinearIndex > 0)
+		{
+			MipPdf *= Cdf[LinearIndex] - Cdf[LinearIndex - 1];
+		}
+		else
+		{
+			MipPdf *= Cdf[LinearIndex];
+		}
+
+#if 0
+		float LevelPdf = Cdf[LinearIndex];
+		if (LinearIndex > 0)
+			LevelPdf -= Cdf[LinearIndex - 1];
+		MipPdf *= LevelPdf;
+#endif
+		MipPixel += MipOffset;
+
+		MipPixel = MipPixel << 1;
+	}
+	//MipPdf = max(MipPdf, 0.0);
+	return MipPdf;
+
+	MipPixel = MipPixel >> 1;
+	float AreaPdf = 1.0 / TexelCoordSolidAngle(MipPixel, DimensionsAtLevel(Dimensions, StopLevel));
+	return MipPdf * AreaPdf;
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildMipTreePdfCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+	uint2 Bounds = DimensionsAtLevel(Dimensions, MipLevel);
+	if (GridCoordinate.x < 0 || GridCoordinate.x >= Bounds.x || GridCoordinate.y < 0 || GridCoordinate.y >= Bounds.y)
+	{
+		return;
+	}
+
+	float Pdf = CalcSkyLightPdf(GridCoordinate.xy);
+	uint BufferOffset = BufferOffsetAtPixel(GridCoordinate.xy, MipLevel, Dimensions);
+	RWMipTreePdf[BufferOffset] = Pdf;
+	//RWMipTreePdf[BufferOffset] = SampleMipTree(GridCoordinate.xy, MipLevel);
+}

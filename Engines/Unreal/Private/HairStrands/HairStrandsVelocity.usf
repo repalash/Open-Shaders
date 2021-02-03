@@ -1,0 +1,114 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+#if PERMUTATION_GROUPSIZE == 64
+#define TILE_PIXEL_SIZE_X 8
+#define TILE_PIXEL_SIZE_Y 8
+#elif PERMUTATION_GROUPSIZE == 32
+#define TILE_PIXEL_SIZE_X 8
+#define TILE_PIXEL_SIZE_Y 4
+#endif
+
+uint2 ResolutionOffset;
+float VelocityThreshold;
+
+Texture2D<uint> NodeIndex;
+Buffer<float2> NodeVelocity;
+StructuredBuffer<FNodeVis> NodeVis; 
+
+#define VELOCITY_TYPE_NONE 0
+#define VELOCITY_TYPE_AVG 1  
+#define VELOCITY_TYPE_CLOSEST 2
+#define VELOCITY_TYPE_MAX 3
+#if PERMUTATION_VELOCITY != VELOCITY_TYPE_NONE
+  #if PERMUTATION_OUTPUT_FORMAT == 0
+	RWTexture2D<float2> OutVelocityTexture;
+  #else
+	RWTexture2D<float4> OutVelocityTexture;
+  #endif
+#endif
+
+RWTexture2D<uint> OutResolveMaskTexture;
+
+#if PERMUTATION_OUTPUT_FORMAT == 0
+float2 ToOutput(float2 In) { return In; }
+#else
+float4 ToOutput(float2 In) { return float4(In, 0, 0); }
+#endif
+
+[numthreads(TILE_PIXEL_SIZE_X, TILE_PIXEL_SIZE_Y, 1)]
+void MainCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 PixelCoord = DispatchThreadId.xy + ResolutionOffset;
+	const FNodeDesc NodeDesc = DecodeNodeDesc(NodeIndex.Load(uint3(PixelCoord, 0)));
+	if (NodeDesc.Count > 0)
+	{
+		// Store final sort node data 
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_AVG
+		float2 AverageVelocity = 0;
+		#endif
+
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_CLOSEST
+		float2 ClosestEncodedVelocity = 0;
+		float ClosestDepth = 0; // Inverse-Z
+		#endif		
+
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_MAX
+		float2 MaxEncodedVelocity = 0;
+		float MaxVelocityMagnitude2 = 0;
+		#endif		
+
+		bool bNeedFastResolve = false;
+		for (uint NodeIt = 0; NodeIt < NodeDesc.Count; ++NodeIt)
+		{
+			const uint SampleIndex = NodeDesc.Offset + NodeIt;
+			const float2 EncodedVelocity = NodeVelocity[SampleIndex];
+
+			#if PERMUTATION_VELOCITY == VELOCITY_TYPE_AVG
+			AverageVelocity += DecodeVelocityFromTexture(float4(EncodedVelocity, 0.0, 0.0)).xy;
+			#endif			
+
+			#if PERMUTATION_VELOCITY == VELOCITY_TYPE_CLOSEST
+			const float NodeDepth = NodeVis[SampleIndex].Depth;
+			if (NodeDepth > ClosestDepth) // Inverse-Z
+			{
+				ClosestEncodedVelocity = EncodedVelocity;
+				ClosestDepth = NodeDepth;
+			}
+			#endif
+
+			#if PERMUTATION_VELOCITY == VELOCITY_TYPE_MAX
+			const float2 CurrentVelocity = DecodeVelocityFromTexture(float4(EncodedVelocity, 0.0, 0.0)).xy;
+			const float CurrentVelocityMagnitude2 = dot(CurrentVelocity, CurrentVelocity);
+			if (CurrentVelocityMagnitude2 > MaxVelocityMagnitude2)
+			{
+				MaxEncodedVelocity = EncodedVelocity;
+				MaxVelocityMagnitude2 = CurrentVelocityMagnitude2;
+			}
+			#endif			
+
+			// If the velocity is above a certain threshold, the pixel will be resolve with a fast resolved. 
+			// This will result into a sharper, but more noisy output. However it sill avoid getting smearing 
+			// from TAA.
+			bNeedFastResolve = bNeedFastResolve || NeedFastResolve(EncodedVelocity, VelocityThreshold);
+		}
+
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_AVG
+		OutVelocityTexture[PixelCoord] = ToOutput(EncodeVelocityToTexture(float3(AverageVelocity / max(NodeDesc.Count, 1u), 0.0)).xy);
+		#endif		
+
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_CLOSEST
+		OutVelocityTexture[PixelCoord] = ToOutput(ClosestEncodedVelocity);
+		#endif		
+
+		#if PERMUTATION_VELOCITY == VELOCITY_TYPE_MAX
+		OutVelocityTexture[PixelCoord] = ToOutput(MaxEncodedVelocity);
+		#endif		
+
+		OutResolveMaskTexture[PixelCoord] = bNeedFastResolve ? 1 : 0;
+	}
+}

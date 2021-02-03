@@ -1,0 +1,38 @@
+#version 420 or 430
+/**
+  \file data-files/shader/SVO/SVO_updateLevelSizeBuffer.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(r32ui) uniform uimageBuffer       levelSizeBuffer;
+
+layout(r32ui) uniform uimageBuffer       levelIndexBuffer;
+
+/** Number of nodes allocated; indices are number * 8 */
+layout(r32ui) uniform uimageBuffer   numberOfAllocatedNodes;
+
+layout(r32ui) uniform uimageBuffer   prevNodeCountBuffer;
+
+uniform int                          level;
+
+void main() {
+	uint prevVal = imageLoad(levelSizeBuffer, level).x;
+
+	//uint numNodes = (imageLoad(numberOfAllocatedNodes, 0).x * 8) - imageLoad(levelIndexBuffer, level-1).x;
+	uint numNodes = (imageLoad(numberOfAllocatedNodes, 0).x * 8) - imageLoad(prevNodeCountBuffer, 0).x;
+	
+	//numNodes += 8;
+	//numNodes *= 2;
+
+    imageStore(levelSizeBuffer, level, uvec4(prevVal + numNodes) );
+}

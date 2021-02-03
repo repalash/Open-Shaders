@@ -1,0 +1,32 @@
+/**
+  \file GaussianBlur.pix
+  \author Morgan McGuire, http://graphics.cs.williams.edu, Michael Mara
+ */
+#version 120 or 150 compatibility
+#include <compatibility.glsl>
+
+#expect KERNEL_RADIUS      "Half the width, plus 0.5"
+#expect LOG_DOWNSAMPLE_X   "Bits to shift coordinates right in X, e.g., for downsampling output"
+#expect LOG_DOWNSAMPLE_Y   "Bits to shift coordinates right in X, e.g., for downsampling output"
+const int2 shift = int2(LOG_DOWNSAMPLE_X, LOG_DOWNSAMPLE_Y);
+
+uniform sampler2D source;
+uniform int2      direction;
+
+void main() {
+              
+    int2   P = int2(gl_FragCoord.xy) << shift;         
+    float4 sum = texelFetch(source, P, 0) * gaussCoef[KERNEL_RADIUS - 1];
+    
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        float4 v = texelFetch(source, (KERNEL_RADIUS - 1 - tap) * direction + P, 0);
+        sum += v * gaussCoef[tap];
+    }
+
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        float4 v = texelFetch(source, -(KERNEL_RADIUS - 1 - tap) * direction + P, 0);
+        sum += v * gaussCoef[tap];
+    }
+
+    gl_FragColor = sum;
+}

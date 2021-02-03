@@ -1,0 +1,8 @@
+// -*- c++ -*-
+/**
+ \file UniversalSurface_modulateBackground.vrt
+
+ \created 2014-04-04
+ \edited  2014-04-04
+ */
+#include <UniversalSurface/UniversalSurface_render.vrt>

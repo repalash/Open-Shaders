@@ -1,0 +1,36 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define HAIR_CONTROLPOINT_INSIDE 0
+#define HAIR_CONTROLPOINT_START	1
+#define HAIR_CONTROLPOINT_END	2
+
+struct FHairControlPoint
+{
+	float3 Position;
+	float  WorldRadius;
+	float  WorldLength;
+	uint   Type;
+};
+
+FHairControlPoint UnpackHairControlPoint(
+	uint4 InPackedData,
+	float3 InVF_PositionOffset,
+	float InVF_Radius,
+	float InVF_Length)
+{
+	const uint PackedAlpha	= asuint(InPackedData.a);
+
+	FHairControlPoint Out = (FHairControlPoint)0;
+	Out.Position	= f16tof32(InPackedData.xyz) + InVF_PositionOffset;
+	Out.WorldRadius	= ((PackedAlpha & 0x00FC) >> 2) / 63.f * InVF_Radius;
+	Out.WorldLength	= ((PackedAlpha & 0xFF00) >> 8) / 255.f * InVF_Length;
+	Out.Type		= PackedAlpha & 0x3;
+
+	return Out;
+}
+
+bool IsValidHairStrandsSegment(const FHairControlPoint CP0, const FHairControlPoint CP1)
+{
+	return !(CP0.Type == HAIR_CONTROLPOINT_END && CP1.Type == HAIR_CONTROLPOINT_START);
+}
+

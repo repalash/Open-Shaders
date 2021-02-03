@@ -1,0 +1,41 @@
+#version 440
+/**
+  \file data-files/shader/PointSurface/PointSurface_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+
+
+/** LOD is exponential in this value (like MIP maps) */
+#expect LOD "int"
+
+// Even for mostly 1-pixel disks, there appears to be a slight performance
+// improvement from culling
+#expect RENDER_AS_DISK "0 or 1"
+
+in  Radiance3       pointEmission;
+
+#if RENDER_AS_DISK
+    in  Point2      gl_PointCoord;
+#endif
+
+out Radiance4       result;
+
+void main() {
+#   if RENDER_AS_DISK
+    {
+        Point2 coord = gl_PointCoord - Point2(0.5);  // from [0, 1] to [-0.5, 0.5]
+        // Slightly rounded rectangle
+        if (dot(coord, coord) > 0.65 * 0.5) {
+            // outside of disk radius
+            discard;
+        }
+    }
+#   endif    
+    
+    result = vec4(pointEmission, 1.0);
+}

@@ -1,0 +1,126 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_copyBrickBorder.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#extension GL_NV_gpu_shader5 : enable
+#extension GL_EXT_shader_image_load_store : enable
+#extension GL_EXT_bindable_uniform : enable
+#extension GL_NV_shader_buffer_load : enable
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+/** Used for reading the total thread count from the fourth element */
+layout(r32ui) uniform uimageBuffer   dispatchIndirectLevelBuffer;
+
+
+
+
+/** Level to render */
+uniform int             level;
+
+#include <SVO/SVO.glsl>
+
+void main() {
+
+	uint threadIndex = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * (WORK_GROUP_SIZE_X * WORK_GROUP_SIZE_Y) + gl_LocalInvocationID.x + gl_LocalInvocationID.y * WORK_GROUP_SIZE_X;
+	
+	uint numThreads = imageLoad(dispatchIndirectLevelBuffer, 3).r;
+    if (threadIndex >= numThreads) { return; }
+
+	uint nodeIndex = threadIndex + imageLoad(levelIndexBuffer, level - 1).r;
+
+	//Bottom-up coordinates calculation
+
+	vec3  pos = vec3(0.0);
+	pos = svoGetPositionFromLevelIndex( level, (int)nodeIndex );
+
+	int levelRes=1<<level;
+	ivec3 voxelCoords= ivec3(pos*float(levelRes));
+
+
+	ivec3 brickOffset=ivec3(0);
+#if SVO_OCTREE_BIAS>0
+	for(brickOffset.z=0; brickOffset.z<(SVO_BRICK_RES/2); brickOffset.z++)
+	for(brickOffset.y=0; brickOffset.y<(SVO_BRICK_RES/2); brickOffset.y++)
+	for(brickOffset.x=0; brickOffset.x<(SVO_BRICK_RES/2); brickOffset.x++)
+#endif	
+	{
+
+	ivec3 gbufferCoords=svoGBufferCoordsFromNodeIdx(nodeIndex, brickOffset);
+	
+	ivec3 nodeOffset = ivec3(nodeIndex&1, (nodeIndex>>1)&1, (nodeIndex>>2)&1);
+	ivec3 coordsInBrick = (nodeOffset<<SVO_OCTREE_BIAS) + brickOffset;
+
+	if( (coordsInBrick.x==0 || coordsInBrick.y==0 || coordsInBrick.z==0) )
+	{
+
+#   foreach (NAME, name) in (WS_NORMAL, normal), (CS_NORMAL, csNormal), (WS_FACE_NORMAL, faceNormal), (CS_FACE_NORMAL, csFaceNormal), (WS_POSITION, wsPosition), (CS_POSITION, csPosition), (LAMBERTIAN, lambertian), (GLOSSY, glossy), (TRANSMISSIVE, transmissive), (EMISSIVE, emissive), (CS_POSITION_CHANGE, csPosChange), (SS_POSITION_CHANGE, ssPosChange), (CS_Z, csZ), (DEPTH_AND_STENCIL, depthStencil), (TS_NORMAL, tsNormal), (SVO_POSITION, svoPos), (SVO_COVARIANCE_MAT1, cov1), (SVO_COVARIANCE_MAT2, cov2)
+#       ifdef GBUFFER_CHANNEL_svo_$(NAME)
+	{
+		vec4  voxCol=texelFetch( GBUFFER_TEX(svo, $(NAME)), GBUFFER_COORDS(svo, gbufferCoords), 0).rgba;
+
+#if 1
+		//if(voxCol.a>0.0f)
+		{
+
+			ivec3 neighborDir = ivec3(coordsInBrick.x==0 ? -1 : 0, coordsInBrick.y==0 ? -1 : 0, coordsInBrick.z==0 ? -1 : 0);
+
+			ivec3 posoffset = ivec3(0);
+			for(posoffset.z=neighborDir.z; posoffset.z<=0; posoffset.z++)
+			for(posoffset.y=neighborDir.y; posoffset.y<=0; posoffset.y++)
+			for(posoffset.x=neighborDir.x; posoffset.x<=0; posoffset.x++){
+				if(posoffset!=ivec3(0,0,0)){
+
+					ivec3 neighborCoords=voxelCoords+posoffset;
+					//int startNodeIndex = ROOT_LOCATION; 
+					int startNodeIndex = (int)svoGetRootLocation(
+										#ifdef SVO_USE_VARIABLE_SVO_ID
+												svoCurrentSvoID
+										#else
+												SVO_CUR_SVO_ID
+										#endif
+												);
+					int startLevel=1; int outLevel;
+					int neighborNodeIdx=svoTraverseOctreeDown(startNodeIndex, startLevel, neighborCoords, level, outLevel);
+
+					if(outLevel==level && neighborNodeIdx!=0 && neighborNodeIdx!=0xFFFFFFFF){
+
+						ivec3 neighborBrickOffset=ivec3(0);
+	#if SVO_OCTREE_BIAS>0
+						neighborBrickOffset = (brickOffset - posoffset * (SVO_BRICK_RES/2));
+						//neighborBrickOffset = ivec3(SVO_BRICK_RES/2);
+	#endif
+
+						ivec3 outCoord = svoGBufferCoordsFromNodeIdx(neighborNodeIdx, neighborBrickOffset);
+#if SVO_OCTREE_BIAS==0
+						outCoord=outCoord-posoffset;
+#endif
+						//voxCol=vec4(1.0f, 0.0f, 0.0f, 1.0f);
+						imageStore(GBUFFER_IMAGE(svo, $(NAME)), GBUFFER_COORDS(svo, outCoord), voxCol);
+					}
+
+				}
+
+
+			}
+
+		}
+#else
+		imageStore(GBUFFER_IMAGE(svo, $(NAME)), GBUFFER_COORDS(svo, gbufferCoords), vec4(1.0f, 0.0f, 0.0f, 1.0f));
+#endif
+	}
+#       endif
+#   endforeach
+	}
+
+	}
+}

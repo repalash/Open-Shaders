@@ -1,0 +1,68 @@
+#version 330
+/**
+  \file data-files/shader/GFont/GFont_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+
+uniform sampler2D   fontTexture;
+uniform float       alphaThreshold;
+uniform float       textureLODBias;
+uniform vec2        borderWidth;
+
+in  vec4 fontColor;
+in  vec4 bColor;
+in  vec2 texCoord;
+
+out vec4 result;
+
+void main() {
+    float lod = mipMapLevel(texCoord, textureSize(fontTexture, 0).xy) + textureLODBias;
+    float alpha = textureLod(fontTexture, texCoord, lod).r;
+
+    if (bColor.a < alphaThreshold) {
+        // No outline
+        if (alpha < alphaThreshold) {
+            discard;
+        }
+        result = vec4(fontColor.rgb, fontColor.a * alpha);
+        // Premultiplied alpha
+        result.rgb *= result.a;
+    } else {
+        // Outline 
+        float borderAlpha =             textureLod(fontTexture, vec2(texCoord.x - borderWidth.x, texCoord.y), lod).r;
+        borderAlpha = max(borderAlpha,  textureLod(fontTexture, vec2(texCoord.x + borderWidth.x, texCoord.y), lod).r);
+        borderAlpha = max(borderAlpha,  textureLod(fontTexture, vec2(texCoord.x, texCoord.y - borderWidth.y), lod).r);
+        borderAlpha = max(borderAlpha,  textureLod(fontTexture, vec2(texCoord.x, texCoord.y + borderWidth.y), lod).r);
+        borderAlpha *= bColor.a;
+        if ((alpha < alphaThreshold) && (borderAlpha < alphaThreshold)) {
+            discard;
+        }
+
+        float fontAlpha = alpha * fontColor.a;
+
+        // Net algorithm:
+        //
+        // 1. C = Composite border (B) over background (G) = lerp(G.rgb, B.rgb, B.a)
+        // 2. Composite font (F) over C = lerp(C.rgb, F.rgb, F.a)
+        //
+        // 1. C = G.rgb * (1 - B.a) + B.rgb * B.a
+        // 2. net = (G.rgb * (1 - B.a) + B.rgb * B.a) * (1 - F.a) + F.rgb * F.a
+        //
+        // Solve for the net multiplier on G.rgb, the existing framebuffer value:
+        //
+        //  net = G.rgb * [(1 - B.a) * (1 - F.a)] + B.rgb * [B.a * (1 - F.a)] + F.rgb * F.a
+        //
+        //  We want to multiply the existing framebuffer by [(1 - B.a) * (1 - F.a)]
+        //  and then add B.rgb * [B.a * (1 - F.a)] + F.rgb * F.a.
+        //
+        //  Use rd->setBlendFunc(BLEND_ONE, BLEND_ONE_MINUS_SRC_ALPHA);
+
+        result.rgb = lerp(bColor.rgb * borderAlpha, fontColor.rgb, fontAlpha);
+        result.a = 1.0 - ((1 - borderAlpha) * (1 - fontAlpha));
+    }
+}

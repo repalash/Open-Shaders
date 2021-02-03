@@ -1,0 +1,124 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ShadingCommon.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingHitGroupCommon.ush"
+
+#include "/Engine/Shared/RayTracingDebugDefinitions.h"
+
+RWTexture2D<float4> Output;
+RaytracingAccelerationStructure TLAS;
+
+uint VisualizationMode;
+uint ShouldUsePreExposure;
+uint OpaqueOnly;
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingDebugMainRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin;
+
+	float2 RenderTargetUV = (float2(PixelCoord) + .5f) * View.BufferSizeAndInvSize.zw;
+
+	RayDesc Ray = CreatePrimaryRay(RenderTargetUV);
+    FRayCone RayCone = (FRayCone)0;
+	RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+
+	const uint RayFlags = 0;
+	const uint InstanceInclusionMask = OpaqueOnly ? RAY_TRACING_MASK_OPAQUE : RAY_TRACING_MASK_ALL;
+	const bool bEnableSkyLightContribution = true;
+	const bool bIgnoreTranslucentMaterials = false;
+
+	FMaterialClosestHitPayload Payload = TraceMaterialRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		Ray,
+		RayCone,
+		PixelCoord,
+		bEnableSkyLightContribution,
+		bIgnoreTranslucentMaterials);
+
+	float4 Result = float4(0, 0, 0, 1);
+
+	if (Payload.IsHit())
+	{
+		switch (VisualizationMode)
+		{
+		default:
+		case RAY_TRACING_DEBUG_VIZ_RADIANCE:
+			Result = float4(Payload.Radiance, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_WORLD_NORMAL:
+			Result = float4(Payload.WorldNormal * 0.5 + 0.5, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_BASE_COLOR:
+			Result = float4(Payload.BaseColor.rgb, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_DIFFUSE_COLOR:
+			Result = float4(Payload.DiffuseColor.rgb, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_SPECULAR_COLOR:
+			Result = float4(Payload.SpecularColor.rgb, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_OPACITY:
+			Result = float4(1.0f - Payload.Opacity, 1.0f - Payload.Opacity, 1.0f - Payload.Opacity, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_METALLIC:
+			Result = float4(Payload.Metallic, Payload.Metallic, Payload.Metallic, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_SPECULAR:
+			Result = float4(Payload.Specular, Payload.Specular, Payload.Specular, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_ROUGHNESS:
+			Result = float4(pow(Payload.Roughness, 2.2f).xxx, 1.0f); // NOTE: pow 2.2 is used for consistency with BufferVisualization/Roughness shader
+			break;
+		case RAY_TRACING_DEBUG_VIZ_IOR:
+			Result = float4(Payload.Ior, Payload.Ior, Payload.Ior, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_SHADING_MODEL:
+            Result = float4(GetShadingModelColor(Payload.ShadingModelID), 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_BLENDING_MODE:
+			Result = float4(Payload.BlendingMode, Payload.BlendingMode, Payload.BlendingMode, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_LIGHTING_CHANNEL_MASK:
+			Result = float4(Payload.PrimitiveLightingChannelMask & 0x1, Payload.PrimitiveLightingChannelMask & 0x2, Payload.PrimitiveLightingChannelMask & 0x4, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_CUSTOM_DATA:
+			Result = float4(Payload.CustomData);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_GBUFFER_AO:
+			Result = float4(Payload.GBufferAO, Payload.GBufferAO, Payload.GBufferAO, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_INDIRECT_IRRADIANCE:
+			Result = float4(Payload.IndirectIrradiance, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_WORLD_POSITION:
+			Result = float4(Payload.WorldPos, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_HITKIND:
+			Result = Payload.IsFrontFace() ? float4(0.0, 1.0, 0.0, 1.0f) : float4(1.0, 0.0, 0.0, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_WORLD_TANGENT:
+			Result = float4(Payload.WorldTangent * 0.5 + 0.5, 1.0f);
+			break;
+		case RAY_TRACING_DEBUG_VIZ_ANISOTROPY:
+			{	
+			// Follow same mapping than raster buffer visualization (BP located in Engine/Contents/Anisotropy)
+			float AniG = saturate(Payload.Anisotropy);
+			float AniB = saturate(-1.0 * Payload.Anisotropy);
+			Result = float4(0.0, pow(AniG, 2.2), pow(AniB, 2.2), 1.0f);
+			break;
+			}
+		}
+	}
+
+	if (ShouldUsePreExposure)
+	{
+		// Only  when the output is tonemapped
+		Result *= View.PreExposure;
+	}
+
+	Output[PixelCoord] = Result;
+}

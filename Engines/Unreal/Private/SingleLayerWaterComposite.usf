@@ -1,0 +1,329 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	SingleLayerWaterComposite - final step of the single layer water
+=============================================================================*/
+
+#include "Common.ush"
+#include "DeferredShadingCommon.ush"  
+#include "BRDF.ush"
+#include "ReflectionEnvironmentShared.ush"
+#include "ShadingModels.ush"
+#include "SceneTextureParameters.ush"
+#include "LightGridCommon.ush"
+
+// Scale for encoding depth into SceneDepthWithoutSingleLayerWaterTexture
+// Must match FDeferredShadingSceneRenderer::RenderUnderWaterFog
+#define SINGLE_LAYER_WATER_DEPTH_SCALE 100.0f
+
+#define ENABLE_SKY_LIGHT 1
+
+#define REFLECTION_COMPOSITE_USE_BLENDED_REFLECTION_CAPTURES (FEATURE_LEVEL >= FEATURE_LEVEL_SM5)
+#define REFLECTION_COMPOSITE_SUPPORT_SKYLIGHT_BLEND 0
+#include "ReflectionEnvironmentComposite.ush"
+
+
+Texture2D ScreenSpaceReflectionsTexture;
+SamplerState ScreenSpaceReflectionsSampler;
+
+Texture2D SceneNoWaterDepthTexture;
+SamplerState SceneNoWaterDepthSampler;
+
+float4 SceneNoWaterMinMaxUV;
+
+struct SingleLayerWaterCompositeOutput
+{
+	float4 LuminanceTransmittance;
+	float  Clip;
+};
+
+SingleLayerWaterCompositeOutput SingleLayerWaterComposite(float2 BufferUV, float2 ScreenPosition)
+{
+	// Sample scene textures.
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	uint ShadingModelID = GBuffer.ShadingModelID;
+	// No AO or DFAO
+
+	const float3 OneThird3 = float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+	const bool CameraIsUnderWater = false;
+
+	SingleLayerWaterCompositeOutput Output;
+	Output.LuminanceTransmittance = float4(0.0f, 0.0f, 0.0f, 1.0f);
+	Output.Clip = 1.0f; // no clipping
+
+	float3 TransmittanceToScene = 1.0f;
+
+#if USE_PREEXPOSURE
+	const float PreExposure = View.PreExposure;
+#else
+	const float PreExposure = 1.f;
+#endif
+	if (ShadingModelID == SHADINGMODELID_SINGLELAYERWATER)
+	{
+		const float2 SceneNoWaterUV = clamp(BufferUV, SceneNoWaterMinMaxUV.xy, SceneNoWaterMinMaxUV.zw);
+
+		float OpaqueDepth = SceneNoWaterDepthTexture.SampleLevel(SceneNoWaterDepthSampler, SceneNoWaterUV, 0).x * SINGLE_LAYER_WATER_DEPTH_SCALE;
+		float WaterDepth = GBuffer.Depth;
+
+		float DeltaDepth = CameraIsUnderWater ? WaterDepth : OpaqueDepth - WaterDepth;	// Inverted depth
+		if (DeltaDepth > 0.0)
+		{
+			// Compute the sky reflection contribution
+			float3 Reflection = 0.0f;
+
+			// TODO MAKE COMMON WITH ReflectionEnvironment?
+			float3 WorldPosition = mul(float4(ScreenPosition * GBuffer.Depth, GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+			float3 CameraToPixel = normalize(WorldPosition - View.WorldCameraOrigin);
+			float3 ReflectionVector = reflect(CameraToPixel, GBuffer.WorldNormal);
+			float IndirectIrradiance = 0.0;// GBuffer.IndirectIrradiance;
+			float IndirectSpecularOcclusion = 1.0f;
+			float3 ExtraIndirectSpecular = 0;
+			uint CaptureDataStartIndex = 0;
+			uint NumCulledReflectionCaptures = 0;
+			//
+			float3 N = GBuffer.WorldNormal;
+			float3 V = -CameraToPixel;
+			float3 R = 2 * dot(V, N) * N - V;
+			float NoV = saturate(dot(N, V));
+			// Point lobe in off-specular peak direction
+			R = GetOffSpecularPeakReflectionDir(N, R, GBuffer.Roughness);
+			const bool bCompositeSkylight = true;
+			Reflection += PreExposure * CompositeReflectionCapturesAndSkylight(
+				1,
+				WorldPosition,
+				R,
+				GBuffer.Roughness,
+				IndirectIrradiance,
+				IndirectSpecularOcclusion,
+				ExtraIndirectSpecular,
+				NumCulledReflectionCaptures,
+				CaptureDataStartIndex,
+				0,
+				bCompositeSkylight);
+
+			// Then combine reflection with SSR
+			float4 SSR = Texture2DSample(ScreenSpaceReflectionsTexture, ScreenSpaceReflectionsSampler, BufferUV);
+			Reflection = SSR.rgb + Reflection * (1 - SSR.a);
+
+			// Apply the BRDF reflection integral to reflection. 
+			// BRDF/Fresnel is already applied for the under water part in the scene.
+			float3 EnvBrdf = EnvBRDF(GBuffer.SpecularColor, GBuffer.Roughness, NoV);
+			Reflection *= EnvBrdf;
+
+			// Soft fading near shor to avoid seeing triangles.
+			const float ShoreOpacity = saturate(DeltaDepth * 0.02f);
+			Reflection.rgb *= ShoreOpacity;
+
+			// Apply transmittance to reflection if under water
+			if (CameraIsUnderWater)
+			{
+				TransmittanceToScene *= 1.0 - EnvBrdf;
+
+				// Using default under water material: compute transmittance and scattering
+				float3 WaterMediumScattering = 0.0f;
+				float3 WaterMediumTransmittance = float3(0.1, 0.1, 0.8);
+
+				Reflection *= WaterMediumTransmittance;
+				TransmittanceToScene *= WaterMediumTransmittance;
+			}
+
+			Output.LuminanceTransmittance = float4(Reflection, dot(OneThird3, TransmittanceToScene));
+		}
+		else
+		{
+			Output.Clip = -1.0f;
+		}
+	}
+	else
+	{
+		Output.Clip = -1.0f;
+	}
+
+	return Output;
+}
+
+
+
+#ifdef TILE_CATERGORISATION_SHADER
+
+
+uint VertexCountPerInstanceIndirect;
+
+RWBuffer<uint> DispatchIndirectDataUAV;
+RWBuffer<uint> WaterTileListDataUAV;
+
+groupshared bool ContainsWater[WORK_TILE_SIZE*WORK_TILE_SIZE];
+
+[numthreads(WORK_TILE_SIZE, WORK_TILE_SIZE, 1)]
+void WaterTileCatergorisationCS(uint3 ThreadId : SV_DispatchThreadID, uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+	if (ThreadId.x == 0 && ThreadId.y == 0 && GroupThreadId.x == 0 && GroupThreadId.y == 0)
+	{
+		// TODO compute clear myself
+		DispatchIndirectDataUAV[0] = VertexCountPerInstanceIndirect;		// VertexCountPerInstance
+		//DispatchIndirectDataUAV[1]		// InstanceCount			already cleared to 0
+		//DispatchIndirectDataUAV[2] = 0;	// StartVertexLocation			"			"
+		//DispatchIndirectDataUAV[3] = 0;	// StartInstanceLocation		"			"
+	}
+
+#if 0
+	// Slow reference path
+	const int LinearIndex = GroupThreadId.y * WORK_TILE_SIZE + GroupThreadId.x;
+	if (LinearIndex < 1)
+	{
+		bool bContainsWater = false;
+		for (uint i = 0; i < WORK_TILE_SIZE; ++i)
+		{
+			for (uint j = 0; j < WORK_TILE_SIZE; ++j)
+			{
+				uint2 PixelPos = (ThreadId.xy + uint2(i, j)) + View.ViewRectMin.xy;
+				float2 BufferUV = (PixelPos + 0.5f) * View.BufferSizeAndInvSize.zw;
+				FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+
+				bContainsWater = bContainsWater || GBuffer.ShadingModelID == SHADINGMODELID_SINGLELAYERWATER;
+			}
+		}
+		if (bContainsWater)
+		{
+			uint WriteToIndex;
+			InterlockedAdd(DispatchIndirectDataUAV[0], 1, WriteToIndex);
+			WaterTileListDataUAV[WriteToIndex] = GroupId.x | (GroupId.y << 16); // assumes 16bit is enought to represent a tiled resolution up to 65,535 :)
+		}
+	}
+
+#else
+
+	bool bContainsWater = false;
+	if(ThreadId.x < uint(View.BufferSizeAndInvSize.x) && ThreadId.y < uint(View.BufferSizeAndInvSize.y))
+	{
+		uint2 PixelPos = ThreadId.xy + View.ViewRectMin.xy;
+		float2 BufferUV = (PixelPos + 0.5f) * View.BufferSizeAndInvSize.zw;
+		FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+		bContainsWater = GBuffer.ShadingModelID == SHADINGMODELID_SINGLELAYERWATER;
+	}
+
+	const int LinearIndex = GroupThreadId.y * WORK_TILE_SIZE + GroupThreadId.x;
+	ContainsWater[LinearIndex] = bContainsWater;
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearIndex < 32) // 8*8 = 64 elements to merge
+	{
+		ContainsWater[LinearIndex] = ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 32];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (LinearIndex < 16)
+	{
+		ContainsWater[LinearIndex] = ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 16];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// The smallest wave size is 16 on Intel hardware. So now we can do simple math operations without group sync.
+	// EDIT: for some reason group sync is needed until the end, otherwise some pixels are missing...
+
+	if (LinearIndex < 8)
+	{
+		ContainsWater[LinearIndex] = ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 8];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (LinearIndex < 4)
+	{
+		ContainsWater[LinearIndex] = ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 4];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (LinearIndex < 2)
+	{
+		ContainsWater[LinearIndex] = ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 2];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (LinearIndex < 1 && (ContainsWater[LinearIndex] || ContainsWater[LinearIndex + 1]))
+	{
+		uint WriteToIndex;  
+		InterlockedAdd(DispatchIndirectDataUAV[1], 1, WriteToIndex);
+		WaterTileListDataUAV[WriteToIndex] = GroupId.x | (GroupId.y << 16); // assumes 16bit is enought to represent a tiled resolution up to 65,535 :)
+	}
+#endif
+} 
+
+
+
+#elif defined(TILE_VERTEX_SHADER)
+
+
+Buffer<uint> TileListData;
+
+void WaterTileVS(
+	in uint InstanceId : SV_InstanceID,
+	in uint VertexId : SV_VertexID,
+	out float4 Position : SV_POSITION) 
+{
+	uint TileData = TileListData[InstanceId.x];
+	uint2 TileOrigin = uint2((TileData & 0x0000FFFF) * WORK_TILE_SIZE, (TileData >> 16) * WORK_TILE_SIZE);
+
+	uint2 TileVertex = TileOrigin;
+	TileVertex.x += VertexId == 1 || VertexId == 2 || VertexId == 4 ? WORK_TILE_SIZE : 0;
+	TileVertex.y += VertexId == 2 || VertexId == 4 || VertexId == 5 ? WORK_TILE_SIZE : 0;
+
+	// View port is set on the view rect. So no offset are needed.
+	Position = float4(float2(TileVertex) * View.ViewSizeAndInvSize.zw * float2(2.0f, -2.0f) + float2(-1.0, 1.0f), 0.5f, 1.0f);
+}
+
+
+#else
+
+
+
+void SingleLayerWaterCompositePS(
+	in float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 BufferUV = SvPositionToBufferUV(SvPosition);
+	float2 ScreenPosition = SvPositionToScreenPosition(SvPosition).xy;
+
+	// TODO use dual source blending to apply TransmittanceToScene
+	SingleLayerWaterCompositeOutput Result = SingleLayerWaterComposite(BufferUV, ScreenPosition);
+
+	clip(Result.Clip); // Since this shader does not write to depth or stencil it should still benefit from EarlyZ (See AMD depth-in-depth documentation)
+	OutColor = Result.LuminanceTransmittance;
+}
+
+
+
+#endif
+
+Texture2D<float4> SceneColorCopyDownsampleTexture;
+SamplerState      SceneColorCopyDownsampleSampler;
+Texture2D<float4> SceneDepthCopyDownsampleTexture;
+SamplerState      SceneDepthCopyDownsampleSampler;
+float2 SVPositionToSourceTextureUV;
+
+void WaterRefractionCopyPS(
+	in float4 SVPosition : SV_Position,
+	out float OutSceneDepth : SV_Target0
+#if DOWNSAMPLE_COLOR
+	, out float4 OutSceneColor : SV_Target1
+#endif
+)
+{
+	float2 BufferUV = SVPosition.xy * SVPositionToSourceTextureUV;
+
+#if DOWNSAMPLE_COLOR
+	// Downsample and average all 2x2 quads
+	OutSceneColor.xyz = Texture2DSampleLevel(SceneColorCopyDownsampleTexture, SceneColorCopyDownsampleSampler, BufferUV, 0).xyz;
+	OutSceneColor.w = 1.0f;
+#endif
+
+	float DeviceDepthZ = 0.0f;
+#if DOWNSAMPLE_REFRACTION
+	// Pick furthermost depth to minimize downsampling artifacts (UE4 is using reverse-z)
+	float4 Depth4 = SceneDepthCopyDownsampleTexture.Gather(SceneDepthCopyDownsampleSampler, BufferUV);
+	DeviceDepthZ = min(min(min(Depth4.x, Depth4.y), Depth4.z), Depth4.w);
+#else
+	DeviceDepthZ = Texture2DSampleLevel(SceneDepthCopyDownsampleTexture, SceneDepthCopyDownsampleSampler, BufferUV, 0).x;
+#endif
+	OutSceneDepth = ConvertFromDeviceZ(DeviceDepthZ) / SINGLE_LAYER_WATER_DEPTH_SCALE;
+
+#if METAL_PROFILE
+	// Clamp on iOS to avoid #inf
+    OutSceneDepth = min(OutSceneDepth, 65500.0f);
+#endif
+}

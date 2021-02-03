@@ -1,0 +1,116 @@
+#version 120 // -*- c++ -*-
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+
+// Enable these terms in the light headers
+#define HAS_LAMBERTIAN_TERM 1
+#define HAS_GLOSSY_TERM 0
+#include <LightingEnvironment/LightingEnvironment_uniforms.glsl>
+#include <Light/Light.glsl>
+
+#include <GBuffer/GBuffer.glsl>
+
+#include <reconstructFromDepth.glsl>
+
+// Declare a GBuffer with no prefix
+uniform_GBuffer( );
+
+uniform_Texture(2D, ssPositionChange_);
+
+#expect USE_INDIRECT "binary"
+#if USE_INDIRECT
+
+#   expect USE_PEELED_LAYER "binary"
+
+    uniform float propagationDamping;
+    uniform_Texture(2D, previousIndirectRadiosity_);
+    uniform_Texture(2D, previousDepth_);
+
+#   if USE_PEELED_LAYER
+        uniform_Texture(2D, previousPeeledIndirectRadiosity_);
+        uniform_Texture(2D, previousPeeledDepth_);
+#   endif
+
+#endif
+
+uniform float   saturatedLightBoost;
+uniform float   unsaturatedLightBoost;
+
+
+#include "colorBoost.glsl"
+
+
+void main() {
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    
+
+    // Surface normal
+    vec3 csN = texelFetch(CS_NORMAL_buffer, C, 0).xyz;
+    vec3 wsN;
+    if (dot(csN, csN) < 0.01) {
+        // This is a background pixel, not part of an object
+        discard;
+    } else {
+        wsN = normalize(mat3x3(camera_frame) * (csN * CS_NORMAL_readMultiplyFirst.xyz + CS_NORMAL_readAddSecond.xyz));
+    }
+
+
+    if (dot(wsN, wsN) < 0.01) {
+        // This is a background pixel, not part of an object
+        discard;
+    } 
+
+
+    // Point being shaded
+    // Point being shaded
+    float csZ = reconstructCSZ(texelFetch(DEPTH_buffer, C, 0).r, camera_clipInfo);
+    vec3 csPosition = reconstructCSPosition(gl_FragCoord.xy, csZ, camera_projInfo);
+    vec3 wsPosition = (camera_frame * vec4(csPosition, 1.0)).xyz;
+    
+    
+    // View vector
+    vec3 w_o = normalize(camera_frame[3] - wsPosition);
+
+    // Lambertian coefficient in BSDF
+    vec3 p_L  = (texelFetch(LAMBERTIAN_buffer, C, 0).rgb * LAMBERTIAN_readMultiplyFirst.rgb + LAMBERTIAN_readAddSecond.rgb) / pi;
+
+    /////////////////////////////////////////////////////////
+    vec3 E_lambertian = vec3(0);
+    vec3 w_i;
+    vec3 E_glossy = vec3(0);
+    float glossyExponent = 0.0;
+    float glossyCoefficient = 0.0;
+
+
+    computeDirectLighting(wsN, w_o, wsN, 1.0, wsPosition, glossyExponent, E_lambertian, E_glossy);
+
+#if USE_INDIRECT
+    vec2 ssV = texelFetch(ssPositionChange_buffer, C, 0).rg * ssPositionChange_readMultiplyFirst.xy + ssPositionChange_readAddSecond.xy;
+    vec2 currentCoord   = gl_FragCoord.xy;
+    vec2 previousCoord  = currentCoord - ssV;
+    vec4 previousVal = texture(previousIndirectRadiosity_buffer, previousCoord * previousIndirectRadiosity_invSize.xy);
+    vec3 indirect = previousVal.rgb;
+    
+    float epsilon = 0.05;
+    vec3 wsPositionPrev = camera_previousFrame * vec4(reconstructCSPosition(previousCoord, reconstructCSZ(texture(previousDepth_buffer, previousCoord * previousDepth_invSize.xy).r, camera_clipInfo), camera_projInfo), 1.0);
+    float dist = length(wsPosition - wsPositionPrev);
+#   if USE_PEELED_LAYER
+        vec3 wsPositionPeeledPrev = camera_previousFrame * vec4(reconstructCSPosition(previousCoord, reconstructCSZ(texture(previousPeeledDepth_buffer, previousCoord * previousDepth_invSize.xy).r, clipInfo), projInfo), 1.0);
+        float distPeeled = length(wsPosition - wsPositionPeeledPrev);
+        if (distPeeled < dist) {
+            dist = distPeeled;
+            indirect = texture(previousPeeledIndirectRadiosity_buffer, previousCoord * previousPeeledIndirectRadiosity_invSize.xy).rgb;
+        }
+#   endif
+
+    float weight = 1.0 - smoothstep(epsilon * 0.8, epsilon * 1.2, dist);
+    indirect *= weight;
+    E_lambertian += indirect * (1.0 - propagationDamping) * colorBoost(indirect, unsaturatedLightBoost, saturatedLightBoost);
+#endif
+
+    // Energy-conserving Phong shading
+    gl_FragColor.rgb = 
+        // Lambertian
+        p_L * (E_lambertian);
+}

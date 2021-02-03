@@ -1,0 +1,27 @@
+// Unity built-in shader source. Copyright (c) 2016 Unity Technologies. MIT license (see license.txt)
+
+#pragma kernel ReplaceTranslationTable
+
+static const uint TGSize = 256;
+
+RWByteAddressBuffer _output_buf : register(u0);
+ByteAddressBuffer _input_map : register(t0);
+
+cbuffer cbReplacementData
+{
+    uint numReplacements;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+[numthreads(TGSize, 1, 1)]
+void ReplaceTranslationTable(in uint3 GroupID : SV_GroupID, in uint3 GroupThreadID : SV_GroupThreadID)
+{
+    const uint pos = GroupID.x * TGSize + GroupThreadID.x;
+    if (pos < numReplacements)
+    {
+        uint2 data = _input_map.Load2(pos * 2 * 4); //*2 ints per tuple, *4 bytes per int
+        _output_buf.Store(data.x * 4, data.y);  //*4 bytes per int
+    }
+}

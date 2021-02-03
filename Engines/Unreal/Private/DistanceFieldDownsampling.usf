@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DistanceFieldDownsampling.usf
+=============================================================================*/
+
+#include "Common.ush"
+
+
+float3 TexelSrcSize;
+uint4 DstSize;
+uint4 OffsetInAtlas;
+SamplerState MeshDFSampler;
+Texture3D<float> MeshDF;
+RWTexture3D<float> DFAtlas;
+
+[numthreads(8,8,1)]
+void DistanceFieldDownsamplingCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (all(ThreadId.xyz < DstSize.xyz))  
+	{
+		float3 VolumeUV = float3(ThreadId.xyz) / float3(DstSize.xyz);
+		VolumeUV += TexelSrcSize;
+		int3 TexturePixelOffset = ThreadId.xyz + (int3)OffsetInAtlas.xyz;
+		DFAtlas[TexturePixelOffset] = MeshDF.SampleLevel(MeshDFSampler, VolumeUV, 0).x;
+	}
+}

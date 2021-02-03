@@ -1,0 +1,242 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../Montecarlo.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+#include "../SphericalGaussian.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+
+
+#define CONFIG_SHOOT_WITH_GEOMETRIC_NORMAL 1
+
+
+uint SamplesPerPixel;
+float MaxRayDistance;
+float Intensity;
+float MaxNormalBias;
+RaytracingAccelerationStructure TLAS;
+RWTexture2D<float> RWAmbientOcclusionMaskUAV;
+RWTexture2D<float> RWAmbientOcclusionHitDistanceUAV;
+
+
+/** Returns the radius of a pixel in world space. */
+float ComputeWorldBluringRadiusCausedByPixelSize(float WorldDepth)
+{
+	float WorldDepthToPixelWorldRadius = GetTanHalfFieldOfView().x * View.ViewSizeAndInvSize.z;
+
+	// Should be multiplied 0.5* for the diameter to radius, and by 2.0 because GetTanHalfFieldOfView() cover only half of the pixels.
+	return WorldDepthToPixelWorldRadius * WorldDepth;
+}
+
+void GenerateCosineNormalRay(
+	uint2 PixelCoord,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float3 GeometricNormal,
+	inout RandomSequence RandSequence,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPDF
+)
+{
+	// Draw random variable
+	float2 BufferSize = View.BufferSizeAndInvSize.xy;
+	uint DummyVariable;
+	float2 RandSample = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+
+	// Perform cosine-hemispherical sampling and convert to world-space
+	float4 Direction_Tangent;
+	#if 1
+	{
+		Direction_Tangent.xy = UniformSampleDiskConcentric(RandSample);
+
+		Direction_Tangent.z = sqrt(1.0 - dot(Direction_Tangent.xy, Direction_Tangent.xy));
+		Direction_Tangent.w = Direction_Tangent.z;
+	}
+	#else
+	{
+		Direction_Tangent = CosineSampleHemisphere(RandSample);
+	}
+	#endif
+
+	#if CONFIG_SHOOT_WITH_GEOMETRIC_NORMAL
+		float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, GeometricNormal);
+	#else
+		float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
+	#endif
+
+	RayOrigin = WorldPosition;
+	RayDirection = Direction_World;
+	RayTMin = 0.0;
+	RayTMax = MaxRayDistance;
+	RayPDF = Direction_Tangent.w;
+}
+
+float3 SampleNeightborPosition(uint2 PixelCoord, int2 Offset)
+{
+	uint2 ClampedPixelCoord = clamp(uint2(PixelCoord + Offset), uint2(View.ViewRectMin.xy), uint2(View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy - 1));
+
+	float DeviceZ = SceneDepthTexture.Load(int3(ClampedPixelCoord, 0)).r;
+
+	return ReconstructWorldPositionFromDeviceZ(PixelCoord + Offset, DeviceZ);
+}
+
+RAY_TRACING_ENTRY_RAYGEN(AmbientOcclusionRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin;
+
+	RandomSequence RandSequence;
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex);
+
+	// Get G-Buffer surface data
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+
+#if 0
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+	//#dxr-todo: workaround for flickering. UE-87281
+	FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+
+	float Depth = GBufferData.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	float3 WorldNormal = GBufferData.WorldNormal;
+
+	float3 GeometricNormal;
+	float ShadingDotGeometric;
+	if (GBufferData.ShadingModelID != SHADINGMODELID_TWOSIDED_FOLIAGE && CONFIG_SHOOT_WITH_GEOMETRIC_NORMAL)
+	{
+		float WorldPixelRadius = ComputeWorldBluringRadiusCausedByPixelSize(Depth);
+
+		float3 E = SampleNeightborPosition(PixelCoord, int2( 1,  0)) - WorldPosition;
+		float3 W = SampleNeightborPosition(PixelCoord, int2(-1,  0)) - WorldPosition;
+
+		float3 N = SampleNeightborPosition(PixelCoord, int2( 0, -1)) - WorldPosition;
+		float3 S = SampleNeightborPosition(PixelCoord, int2( 0,  1)) - WorldPosition;
+
+		float DH = dot(E, View.ViewForward) + dot(W, View.ViewForward);
+		float DV = dot(N, View.ViewForward) + dot(S, View.ViewForward);
+
+		float3 H = (length2(E) < length2(W)) ? E : W;
+		float3 V = (length2(S) < length2(N)) ? S : N;
+
+		GeometricNormal = normalize(cross(H, V));
+
+		FLATTEN
+		if (dot(GeometricNormal, CameraDirection) > 0)
+		{
+			GeometricNormal = -GeometricNormal;
+		}
+
+		FSphericalGaussian CosineSG = ClampedCosine_ToSphericalGaussian(float3(0, 0, 1));
+		FSphericalGaussian ShadingSG = ClampedCosine_ToSphericalGaussian(WorldNormal);
+		FSphericalGaussian GeometricSG = ClampedCosine_ToSphericalGaussian(GeometricNormal);
+
+		ShadingDotGeometric = saturate(Dot(ShadingSG, GeometricSG) * rcp(Dot(CosineSG, CosineSG)));
+
+		// Detect the grass to fail grassfully and avoid 1pixel outlining.
+		if (any(float2(DH, DV) < -5 * WorldPixelRadius))
+		{
+			GeometricNormal = WorldNormal;
+			ShadingDotGeometric = 1.0;
+		}
+	}
+	else
+	{
+		GeometricNormal = WorldNormal;
+		ShadingDotGeometric = 1.0;
+	}
+
+
+	float RayCount = 0.0;
+	float Visibility = 0.0;
+	float ClosestRayHitDistance = 10000.0;
+	// Declaring intensity as a local variable is a workaround for a shader compiler bug with NV drivers 430.39 and 430.64.
+	const float IntensityLocal = Intensity;
+	uint SamplesPerPixelLocal = SamplesPerPixel;
+	
+	// Mask out depth values beyond far plane
+	bool IsFiniteDepth = DeviceZ > 0.0;
+	bool bTraceRay = (IsFiniteDepth && GBufferData.ShadingModelID != SHADINGMODELID_UNLIT);
+	if (!bTraceRay)
+	{
+		Visibility = 1.0;
+		RayCount = SamplesPerPixel;
+		SamplesPerPixelLocal = 0.0;
+	}
+
+	for (uint SampleIndex = 0; SampleIndex < SamplesPerPixelLocal; ++SampleIndex)
+	{
+		RayDesc Ray;
+		float RayPDF;
+		GenerateCosineNormalRay(PixelCoord, WorldPosition, WorldNormal, GeometricNormal, RandSequence, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPDF);
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+
+		//if (dot(WorldNormal, Ray.Direction) <= 0.0) // TODO(Denoiser): does it needs to be handled by the denoiser?
+		//	continue;
+
+		uint RayFlags = 0;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW;
+
+#if !ENABLE_MATERIALS
+		RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+#endif
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+		#if CONFIG_SHOOT_WITH_GEOMETRIC_NORMAL
+			float RayWeight = max(dot(WorldNormal, Ray.Direction), 0.05) / max(RayPDF, 0.05);
+		#else
+			float RayWeight = 1.0;
+		#endif
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			Ray);
+
+		RayCount += RayWeight;
+		Visibility += RayWeight * (MinimalPayload.IsMiss() ? 1.0 : (1.0 - IntensityLocal));
+		if (MinimalPayload.IsHit())
+		{
+			ClosestRayHitDistance = min(ClosestRayHitDistance, MinimalPayload.HitT);
+		}
+	}
+
+	// Output.
+	{
+		float2 RawOutput = 1;
+
+		if (SamplesPerPixelLocal == 0)
+		{
+			RawOutput.x = 1;
+			RawOutput.y = -2;
+		}
+		else if (RayCount == 0)
+		{
+			RawOutput.x = 1;
+			RawOutput.y = -1;
+		}
+		else
+		{
+			RawOutput.x = ShadingDotGeometric * (Visibility / RayCount);
+			RawOutput.y = ClosestRayHitDistance;
+		}
+
+		RWAmbientOcclusionMaskUAV[PixelCoord] = RawOutput.x;
+		RWAmbientOcclusionHitDistanceUAV[PixelCoord] = RawOutput.y;
+	}
+}

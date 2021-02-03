@@ -1,0 +1,727 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+
+#pragma once
+
+#include "CapsuleLight.ush"
+#include "MonteCarlo.ush"
+
+#ifndef USE_SOURCE_TEXTURE
+#define USE_SOURCE_TEXTURE 1
+#endif
+
+#ifndef USE_SOURCE_TEXTURE_ARRAY 
+#define USE_SOURCE_TEXTURE_ARRAY 0
+#endif
+
+struct FRect
+{
+	float3		Origin;
+	float3x3	Axis;
+	float2		Extent;
+	float2		FullExtent;
+	float2		Offset;
+};
+
+
+struct FRectTexture
+{
+#if COMPILER_HLSLCC
+	uint Dummy;
+#else
+#if USE_SOURCE_TEXTURE_ARRAY
+	Texture2D SourceTexture0;
+	Texture2D SourceTexture1;
+	Texture2D SourceTexture2;
+	Texture2D SourceTexture3;
+	Texture2D SourceTexture4;
+	Texture2D SourceTexture5;
+	Texture2D SourceTexture6;
+	Texture2D SourceTexture7;
+	uint SourceTextureIndex; 
+#elif USE_SOURCE_TEXTURE
+	Texture2D SourceTexture;
+#else
+	uint Dummy;
+#endif
+#endif	// COMPILER_HLSLCC
+};
+
+FRectTexture InitRectTexture(Texture2D SourceTexture)
+{
+	FRectTexture Output;
+#if COMPILER_HLSLCC
+	uint Dummy;
+#else
+#if USE_SOURCE_TEXTURE_ARRAY
+	Output.SourceTexture0 = SourceTexture;
+	Output.SourceTexture1 = SourceTexture;
+	Output.SourceTexture2 = SourceTexture;
+	Output.SourceTexture3 = SourceTexture;
+	Output.SourceTexture4 = SourceTexture;
+	Output.SourceTexture5 = SourceTexture;
+	Output.SourceTexture6 = SourceTexture;
+	Output.SourceTexture7 = SourceTexture;
+	Output.SourceTextureIndex   = 99;
+#elif USE_SOURCE_TEXTURE
+	Output.SourceTexture = SourceTexture;
+#else
+	Output.Dummy = 0;
+#endif
+#endif	// COMPILER_HLSLCC
+	return Output;
+}
+
+float3 SampleRectTextureInternal(Texture2D RectSourceTexture, float2 RectUV, float Level, bool bIsReference)
+{
+	float2 TextureSize;
+	RectSourceTexture.GetDimensions( TextureSize.x, TextureSize.y );	// TODO optimize
+    Level += log2(max(TextureSize.x, TextureSize.y)) - 2;
+	return RectSourceTexture.SampleLevel( View.SharedTrilinearClampedSampler, RectUV, bIsReference ? 0 : Level ).rgb;
+}
+
+// Simple workaround while we don't have bindless support
+float3 SampleRectTexture(FRectTexture RectTexture, float2 RectUV, float Level, bool bIsReference=false)
+{
+#if COMPILER_HLSLCC
+	return 1;
+#else
+#if USE_SOURCE_TEXTURE_ARRAY
+    if (RectTexture.SourceTextureIndex == 0)    { return SampleRectTextureInternal(RectTexture.SourceTexture0, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 1)    { return SampleRectTextureInternal(RectTexture.SourceTexture1, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 2)    { return SampleRectTextureInternal(RectTexture.SourceTexture2, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 3)    { return SampleRectTextureInternal(RectTexture.SourceTexture3, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 4)    { return SampleRectTextureInternal(RectTexture.SourceTexture4, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 5)    { return SampleRectTextureInternal(RectTexture.SourceTexture5, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 6)    { return SampleRectTextureInternal(RectTexture.SourceTexture6, RectUV, Level, bIsReference); }
+	if (RectTexture.SourceTextureIndex == 7)    { return SampleRectTextureInternal(RectTexture.SourceTexture7, RectUV, Level, bIsReference); }   
+	return 1;
+#elif USE_SOURCE_TEXTURE
+	return SampleRectTextureInternal(RectTexture.SourceTexture, RectUV, Level, bIsReference);
+#else
+	return 1;
+#endif
+#endif	// COMPILER_HLSLCC
+}
+
+// Optimized Lambert
+float3 RectIrradianceLambert( float3 N, FRect Rect, out float BaseIrradiance, out float NoL )
+{
+#if 0
+	float3 L0 = normalize( Rect.Origin - Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y );	//  8 mad, 4 mul, 1 rsqrt
+	float3 L1 = normalize( Rect.Origin + Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y );	//  8 mad, 4 mul, 1 rsqrt
+	float3 L2 = normalize( Rect.Origin + Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y );	//  8 mad, 4 mul, 1 rsqrt
+	float3 L3 = normalize( Rect.Origin - Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y );	//  8 mad, 4 mul, 1 rsqrt
+	// 48 alu, 4 rsqrt
+#else
+	float3 LocalPosition;
+	LocalPosition.x = dot( Rect.Axis[0], Rect.Origin );		// 1 mul, 2 mad
+	LocalPosition.y = dot( Rect.Axis[1], Rect.Origin );		// 1 mul, 2 mad
+	LocalPosition.z = dot( Rect.Axis[2], Rect.Origin );		// 1 mul, 2 mad
+	// 9 alu
+
+	float x0 = LocalPosition.x - Rect.Extent.x;
+	float x1 = LocalPosition.x + Rect.Extent.x;
+	float y0 = LocalPosition.y - Rect.Extent.y;
+	float y1 = LocalPosition.y + Rect.Extent.y;
+	float z0 = LocalPosition.z;
+	float z0Sqr = z0 * z0;
+	// 5 alu
+
+	float3 v0 = float3( x0, y0, z0 );
+	float3 v1 = float3( x1, y0, z0 );
+	float3 v2 = float3( x1, y1, z0 );
+	float3 v3 = float3( x0, y1, z0 );
+
+	float3 L0 = v0 * rsqrt( dot( v0.xy, v0.xy ) + z0Sqr );	//  2 mad, 3 mul, 1 rsqrt
+	float3 L1 = v1 * rsqrt( dot( v1.xy, v1.xy ) + z0Sqr );	//  2 mad, 3 mul, 1 rsqrt
+	float3 L2 = v2 * rsqrt( dot( v2.xy, v2.xy ) + z0Sqr );	//  2 mad, 3 mul, 1 rsqrt
+	float3 L3 = v3 * rsqrt( dot( v3.xy, v3.xy ) + z0Sqr );	//  2 mad, 3 mul, 1 rsqrt
+	// 20 alu, 4 rsqrt
+
+	// total 34 alu, 4 rsqrt
+#endif
+
+#if 0
+	float3 L;
+	L  = acos( dot( L0, L1 ) ) * normalize( cross( L0, L1 ) );
+	L += acos( dot( L1, L2 ) ) * normalize( cross( L1, L2 ) );
+	L += acos( dot( L2, L3 ) ) * normalize( cross( L2, L3 ) );
+	L += acos( dot( L3, L0 ) ) * normalize( cross( L3, L0 ) );
+#else
+	float c01 = dot( L0, L1 );
+	float c12 = dot( L1, L2 );
+	float c23 = dot( L2, L3 );
+	float c30 = dot( L3, L0 );
+	// 9 alu
+
+#if 0
+	float w01 = 1.5708 + (-0.879406 + 0.308609 * abs(c01) ) * abs(c01);
+	float w12 = 1.5708 + (-0.879406 + 0.308609 * abs(c12) ) * abs(c12);
+	float w23 = 1.5708 + (-0.879406 + 0.308609 * abs(c23) ) * abs(c23);
+	float w30 = 1.5708 + (-0.879406 + 0.308609 * abs(c30) ) * abs(c30);
+
+	w01 = c01 > 0 ? w01 : PI * rsqrt( 1 - c01 * c01 ) - w01;
+	w12 = c12 > 0 ? w12 : PI * rsqrt( 1 - c12 * c12 ) - w12;
+	w23 = c23 > 0 ? w23 : PI * rsqrt( 1 - c23 * c23 ) - w23;
+	w30 = c30 > 0 ? w30 : PI * rsqrt( 1 - c30 * c30 ) - w30;
+#else
+	// normalize( cross( L0, L1 ) ) = cross( L0, L1 ) * rsqrt( 1 - dot( L0, L1 )^2 )
+	// acos( x ) ~= sqrt(1 - x) * (1.5708 - 0.175 * x)
+
+	float w01 = ( 1.5708 - 0.175 * c01 ) * rsqrt( c01 + 1 );	// 1 mad, 1 add, 1 rsqrt
+	float w12 = ( 1.5708 - 0.175 * c12 ) * rsqrt( c12 + 1 );	// 1 mad, 1 add, 1 rsqrt
+	float w23 = ( 1.5708 - 0.175 * c23 ) * rsqrt( c23 + 1 );	// 1 mad, 1 add, 1 rsqrt
+	float w30 = ( 1.5708 - 0.175 * c30 ) * rsqrt( c30 + 1 );	// 1 mad, 1 add, 1 rsqrt
+	// 8 alu, 4 rsqrt
+#endif
+
+#if 0
+	float3 L;
+	L  = w01 * cross( L0, L1 );	// 6 mul, 3 mad
+	L += w12 * cross( L1, L2 );	// 3 mul, 6 mad
+	L += w23 * cross( L2, L3 );	// 3 mul, 6 mad
+	L += w30 * cross( L3, L0 );	// 3 mul, 6 mad
+#else
+	float3 L;
+	L  = cross( L1, -w01 * L0 +  w12 * L2 );	// 6 mul, 6 mad
+	L += cross( L3,  w30 * L0 + -w23 * L2 );	// 3 mul, 9 mad
+#endif
+#endif
+
+	// Vector irradiance
+	L = L.x * Rect.Axis[0] + L.y * Rect.Axis[1] + L.z * Rect.Axis[2];	// 3 mul, 6 mad
+
+	float LengthSqr = dot( L, L );
+	float InvLength = rsqrt( LengthSqr );
+	float Length = LengthSqr * InvLength;
+
+	// Mean light direction
+	L *= InvLength;
+
+	BaseIrradiance = 0.5 * Length;
+
+	// Solid angle of sphere		= 2*PI * ( 1 - sqrt(1 - r^2 / d^2 ) )
+	// Cosine weighted integration	= PI * r^2 / d^2
+	// SinAlphaSqr = r^2 / d^2;
+	float SinAlphaSqr = BaseIrradiance * (1.0 / PI);
+
+	NoL = SphereHorizonCosWrap( dot( N, L ), SinAlphaSqr );
+
+	return L;
+}
+
+float3 RectIrradianceApproxKaris( float3 N, FRect Rect, out float BaseIrradiance, out float NoL )
+{
+	float2 RectLocal;
+	RectLocal.x = SmoothClamp( dot( Rect.Axis[0], -Rect.Origin ), -Rect.Extent.x, Rect.Extent.x, 16 );
+	RectLocal.y = SmoothClamp( dot( Rect.Axis[1], -Rect.Origin ), -Rect.Extent.y, Rect.Extent.y, 16 );
+
+	float3 ClosestPoint = Rect.Origin;
+	ClosestPoint += Rect.Axis[0] * RectLocal.x;
+	ClosestPoint += Rect.Axis[1] * RectLocal.y;
+
+	float3 OppositePoint = 2 * Rect.Origin - ClosestPoint;
+	
+	float3 L0 = normalize( ClosestPoint );
+	float3 L1 = normalize( OppositePoint );
+	float3 L  = normalize( L0 + L1 );
+
+	// Intersect ray with plane
+	float Distance = dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], L );
+	float DistanceSqr = Distance * Distance;
+
+	// right pyramid solid angle cosine weighted approx
+	//float Irradiance = 4 * RectExtent.x * RectExtent.y * rsqrt( ( Square( RectExtent.x ) + DistanceSqr ) * ( Square( RectExtent.y ) + DistanceSqr ) );
+	BaseIrradiance = 4 * Rect.Extent.x * Rect.Extent.y * rsqrt( ( (4 / PI) * Square( Rect.Extent.x ) + DistanceSqr ) * ( (4 / PI) * Square( Rect.Extent.y ) + DistanceSqr ) );
+	BaseIrradiance *= saturate( dot( Rect.Axis[2], L ) );
+
+	// Solid angle of sphere		= 2*PI * ( 1 - sqrt(1 - r^2 / d^2 ) )
+	// Cosine weighted integration	= PI * r^2 / d^2
+	// SinAlphaSqr = r^2 / d^2;
+	float SinAlphaSqr = BaseIrradiance * (1.0 / PI);
+
+	NoL = SphereHorizonCosWrap( dot( N, L ), SinAlphaSqr );
+
+	return L;
+}
+
+float3 RectIrradianceApproxLagarde( float3 N, FRect Rect, out float BaseIrradiance, out float NoL )
+{
+	float3 L = normalize( Rect.Origin );
+
+	float3 v0 = Rect.Origin - Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	float3 v1 = Rect.Origin + Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	float3 v2 = Rect.Origin + Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+	float3 v3 = Rect.Origin - Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+
+	float3 n0 = normalize( cross( v0, v1 ) );
+	float3 n1 = normalize( cross( v1, v2 ) );
+	float3 n2 = normalize( cross( v2, v3 ) );
+	float3 n3 = normalize( cross( v3, v0 ) );
+
+	float g0 = acos( dot( n0, n1 ) );
+	float g1 = acos( dot( n1, n2 ) );
+	float g2 = acos( dot( n2, n3 ) );
+	float g3 = acos( dot( n3, n0 ) );
+
+	// Solid angle
+	BaseIrradiance = g0 + g1 + g2 + g3 - 2*PI;
+
+	NoL = 0.2 * ( saturate( dot( N, L ) ) +
+		saturate( dot( N, normalize(v0) ) ) +
+		saturate( dot( N, normalize(v1) ) ) +
+		saturate( dot( N, normalize(v2) ) ) +
+		saturate( dot( N, normalize(v3) ) ) );
+
+	return L;
+}
+
+float3 RectIrradianceApproxDrobot( float3 N, FRect Rect, out float BaseIrradiance, out float NoL )
+{
+#if 0
+	// Drobot complex
+	float3 d0 = Rect.Origin;
+	d0 += RectX * clamp( dot( Rect.Axis[0], -Rect.Origin ), -Rect.Extent.x, Rect.Extent.x );
+	d0 += RectY * clamp( dot( Rect.Axis[1], -Rect.Origin ), -Rect.Extent.y, Rect.Extent.y );
+
+	float3 d1 = N - Rect.Axis[2] * saturate( 0.001 + dot( Rect.Axis[2], N ) );
+
+	d0 = normalize( d0 );
+	d1 = normalize( d1 );
+	float3 dh = normalize( d0 + d1 );
+#else
+	// Drobot simple
+	float clampCosAngle = 0.001 + saturate( dot( N, Rect.Axis[2] ) );
+	// clamp d0 to the positive hemisphere of surface normal
+	float3 d0 = normalize( -Rect.Axis[2] + N * clampCosAngle );
+	// clamp d1 to the negative hemisphere of light plane normal
+	float3 d1 = normalize( N - Rect.Axis[2] * clampCosAngle );
+	float3 dh = normalize( d0 + d1 );
+#endif
+
+	// Intersect ray with plane
+	float3 PointOnPlane = dh * ( dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], dh ) );
+
+	float3 ClosestPoint = Rect.Origin;
+	ClosestPoint += Rect.Axis[0] * clamp( dot( Rect.Axis[0], PointOnPlane - Rect.Origin ), -Rect.Extent.x, Rect.Extent.x );
+	ClosestPoint += Rect.Axis[1] * clamp( dot( Rect.Axis[1], PointOnPlane - Rect.Origin ), -Rect.Extent.y, Rect.Extent.y );
+
+	float3 v0 = Rect.Origin - Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	float3 v1 = Rect.Origin + Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	float3 v2 = Rect.Origin + Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+	float3 v3 = Rect.Origin - Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+#if 1
+	float3 n0 = normalize( cross( v0, v1 ) );
+	float3 n1 = normalize( cross( v1, v2 ) );
+	float3 n2 = normalize( cross( v2, v3 ) );
+	float3 n3 = normalize( cross( v3, v0 ) );
+
+	float g0 = acos( dot( n0, n1 ) );
+	float g1 = acos( dot( n1, n2 ) );
+	float g2 = acos( dot( n2, n3 ) );
+	float g3 = acos( dot( n3, n0 ) );
+
+	float SolidAngle = g0 + g1 + g2 + g3 - 2*PI;
+
+	float3 L = normalize( ClosestPoint );
+#else
+	float DistanceSqr = dot( RectOrigin, RectOrigin );
+	float3 L = RectOrigin * rsqrt( DistanceSqr );
+
+	DistanceSqr = dot( ClosestPoint, ClosestPoint );
+	L = ClosestPoint * rsqrt( DistanceSqr );
+
+	float SolidAngle = PI / ( DistanceSqr / ( (4 / PI) * Rect.Extent.x * Rect.Extent.y ) + 1 );
+	//float SolidAngle = 4 * asin( RectExtent.x * RectExtent.y / sqrt( ( Square( RectExtent.x ) + DistanceSqr ) * ( Square(RectExtent.y) + DistanceSqr ) ) );
+	SolidAngle *= saturate( dot( -Rect.Axis[2], L ) );
+#endif
+
+	BaseIrradiance = SolidAngle;
+	NoL = saturate( dot( N, L ) );
+
+	return L;
+}
+
+
+float3 SampleSourceTexture( float3 L, FRect Rect, FRectTexture RectTexture)
+{
+#if USE_SOURCE_TEXTURE
+	// Force to point at plane
+	L += Rect.Axis[2] * saturate( 0.001 - dot( Rect.Axis[2], L ) );
+
+	// Intersect ray with plane
+	float DistToPlane = dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], L );
+	float3 PointOnPlane = L * DistToPlane;
+
+	float2 PointInRect;
+	PointInRect.x = dot( Rect.Axis[0], PointOnPlane - Rect.Origin );
+	PointInRect.y = dot( Rect.Axis[1], PointOnPlane - Rect.Origin );
+
+	// Compute UV on the original rect (i.e. unoccluded rect)
+    float2 RectUV = (PointInRect + Rect.Offset) / Rect.FullExtent * float2(0.5, -0.5) + 0.5;
+	
+	float Level = log2( DistToPlane * rsqrt( Rect.FullExtent.x * Rect.FullExtent.y ) );
+
+    return SampleRectTexture(RectTexture, RectUV, Level);
+#else
+	return 1;
+#endif
+}
+
+float IntegrateEdge( float3 L0, float3 L1 )
+{
+	float c01 = dot( L0, L1 );
+	//float w01 = ( 1.5708 - 0.175 * c01 ) * rsqrt( c01 + 1 );	// 1 mad, 1 mul, 1 add, 1 rsqrt
+	//float w01 = 1.5708 + (-0.879406 + 0.308609 * abs(c01) ) * abs(c01);
+
+	//return acos( c01 ) * rsqrt( 1 - c01 * c01 );
+
+#if 0
+	// [ Hill et al. 2016, "Real-Time Area Lighting: a Journey from Research to Production" ]
+	float w01 = ( 5.42031 + (3.12829 + 0.0902326 * abs(c01)) * abs(c01) ) /
+				( 3.45068 + (4.18814 + abs(c01)) * abs(c01) );
+
+	w01 = c01 > 0 ? w01 : PI * rsqrt( 1 - c01 * c01 ) - w01;
+#else
+	float w01 = ( 0.8543985 + (0.4965155 + 0.0145206 * abs(c01)) * abs(c01) ) /
+				( 3.4175940 + (4.1616724 + abs(c01)) * abs(c01) );
+	
+	w01 = c01 > 0 ? w01 : 0.5 * rsqrt( 1 - c01 * c01 ) - w01;
+#endif
+
+	return w01;
+}
+
+// Optimized Lambert poly irradiance
+float3 PolygonIrradiance( float3 Poly[4] )
+{
+	float3 L0 = normalize( Poly[0] );	//  2 mad, 4 mul, 1 rsqrt
+	float3 L1 = normalize( Poly[1] );	//  2 mad, 4 mul, 1 rsqrt
+	float3 L2 = normalize( Poly[2] );	//  2 mad, 4 mul, 1 rsqrt
+	float3 L3 = normalize( Poly[3] );	//  2 mad, 4 mul, 1 rsqrt
+	// 24 alu, 4 rsqrt
+
+#if 0
+	float3 L;
+	L  = acos( dot( L0, L1 ) ) * normalize( cross( L0, L1 ) );
+	L += acos( dot( L1, L2 ) ) * normalize( cross( L1, L2 ) );
+	L += acos( dot( L2, L3 ) ) * normalize( cross( L2, L3 ) );
+	L += acos( dot( L3, L0 ) ) * normalize( cross( L3, L0 ) );
+#else
+	float w01 = IntegrateEdge( L0, L1 );
+	float w12 = IntegrateEdge( L1, L2 );
+	float w23 = IntegrateEdge( L2, L3 );
+	float w30 = IntegrateEdge( L3, L0 );
+
+#if 0
+	float3 L;
+	L  = w01 * cross( L0, L1 );	// 6 mul, 3 mad
+	L += w12 * cross( L1, L2 );	// 3 mul, 6 mad
+	L += w23 * cross( L2, L3 );	// 3 mul, 6 mad
+	L += w30 * cross( L3, L0 );	// 3 mul, 6 mad
+#else
+	float3 L;
+	L  = cross( L1, -w01 * L0 +  w12 * L2 );	// 6 mul, 6 mad
+	L += cross( L3,  w30 * L0 + -w23 * L2 );	// 3 mul, 9 mad
+#endif
+#endif
+
+	// Vector irradiance
+	return L;
+}
+
+#ifndef LTCMatTexture
+Texture2D		LTCMatTexture;
+SamplerState	LTCMatSampler;
+Texture2D		LTCAmpTexture;
+SamplerState	LTCAmpSampler;
+#endif
+
+// [ Heitz et al. 2016, "Real-Time Polygonal-Light Shading with Linearly Transformed Cosines" ]
+float3 RectGGXApproxLTC( float Roughness, float3 SpecularColor, half3 N, float3 V, FRect Rect, FRectTexture RectTexture )
+{
+	// No visibile rect light due to barn door occlusion
+	if (Rect.Extent.x == 0 || Rect.Extent.y == 0) return 0;
+
+	float NoV = saturate( abs( dot(N, V) ) + 1e-5 );
+
+	float2 UV = float2( Roughness, sqrt( 1 - NoV ) );
+	UV = UV * (63.0 / 64.0) + (0.5 / 64.0);
+   
+	float4 LTCMat = LTCMatTexture.SampleLevel( LTCMatSampler, UV, 0 );
+	float4 LTCAmp = LTCAmpTexture.SampleLevel( LTCAmpSampler, UV, 0 );
+
+	float3x3 LTC = {
+		float3( LTCMat.x, 0, LTCMat.z ),
+		float3(        0, 1,        0 ),
+		float3( LTCMat.y, 0, LTCMat.w )
+	};
+
+	float LTCDet = LTCMat.x * LTCMat.w - LTCMat.y * LTCMat.z;
+
+	float4 InvLTCMat = LTCMat / LTCDet;
+	float3x3 InvLTC = {
+		float3( InvLTCMat.w, 0,-InvLTCMat.z ),
+		float3(	          0, 1,           0 ),
+		float3(-InvLTCMat.y, 0, InvLTCMat.x )
+	};
+
+	// Rotate to tangent space
+	float3 T1 = normalize( V - N * dot( N, V ) );
+	float3 T2 = cross( N, T1 );
+	float3x3 TangentBasis = float3x3( T1, T2, N );
+
+	LTC = mul( LTC, TangentBasis );
+	InvLTC = mul( transpose( TangentBasis ), InvLTC );
+
+	float3 Poly[4];
+	Poly[0] = mul( LTC, Rect.Origin - Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y );
+	Poly[1] = mul( LTC, Rect.Origin + Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y );
+	Poly[2] = mul( LTC, Rect.Origin + Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y );
+	Poly[3] = mul( LTC, Rect.Origin - Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y );
+
+	// Vector irradiance
+	float3 L = PolygonIrradiance( Poly );
+
+	float LengthSqr = dot( L, L );
+	float InvLength = rsqrt( LengthSqr );
+	float Length = LengthSqr * InvLength;
+
+	// Mean light direction
+	L *= InvLength;
+
+	// Solid angle of sphere		= 2*PI * ( 1 - sqrt(1 - r^2 / d^2 ) )
+	// Cosine weighted integration	= PI * r^2 / d^2
+	// SinAlphaSqr = r^2 / d^2;
+	float SinAlphaSqr = Length;
+
+	float NoL = SphereHorizonCosWrap( L.z, SinAlphaSqr );
+	float Irradiance = SinAlphaSqr * NoL;
+
+	// Kill negative and NaN
+	Irradiance = -min(-Irradiance, 0.0);
+
+#if 0
+	float NoL;
+	float Falloff;
+	RectIrradianceLambert( N, Rect, Falloff, NoL );
+
+	float a2 = Pow4( Roughness );
+	Irradiance = Irradiance * ( 1 - a2*a2 ) + a2 * Falloff * NoL;
+#endif
+	
+	SpecularColor = LTCAmp.y + ( LTCAmp.x - LTCAmp.y ) * SpecularColor;
+	
+	// Transform to world space
+	L = mul( InvLTC, L );
+
+	float3 LightColor = SampleSourceTexture( L, Rect, RectTexture );
+	
+	return LightColor * Irradiance * SpecularColor;
+}
+
+
+// Rectangle projected to a sphere
+// [Urena et al. 2013, "An Area-Preserving Parametrization for Spherical Rectangles"]
+struct FSphericalRect
+{
+	float3x3	Axis;
+
+	float		x0;
+	float		x1;
+	float		y0;
+	float		y1;
+	float		z0;
+
+	float		b0;
+	float		b1;
+	float		k;
+	float		SolidAngle;
+};
+
+// RectZ must face origin
+FSphericalRect BuildSphericalRect( FRect Rect )
+{
+	FSphericalRect SphericalRect;
+
+	SphericalRect.Axis = Rect.Axis;
+
+	float3 LocalPosition;
+	LocalPosition.x = dot( Rect.Axis[0], Rect.Origin );
+	LocalPosition.y = dot( Rect.Axis[1], Rect.Origin );
+	LocalPosition.z = dot( Rect.Axis[2], Rect.Origin );
+
+	SphericalRect.x0 = LocalPosition.x - Rect.Extent.x;
+	SphericalRect.x1 = LocalPosition.x + Rect.Extent.x;
+	SphericalRect.y0 = LocalPosition.y - Rect.Extent.y;
+	SphericalRect.y1 = LocalPosition.y + Rect.Extent.y;
+	SphericalRect.z0 = -abs( LocalPosition.z );
+
+	SphericalRect.Axis[2] *= LocalPosition.z > 0 ? -1 : 1;
+
+	float3 v0 = float3( SphericalRect.x0, SphericalRect.y0, SphericalRect.z0 );
+	float3 v1 = float3( SphericalRect.x1, SphericalRect.y0, SphericalRect.z0 );
+	float3 v2 = float3( SphericalRect.x1, SphericalRect.y1, SphericalRect.z0 );
+	float3 v3 = float3( SphericalRect.x0, SphericalRect.y1, SphericalRect.z0 );
+
+	float3 n0 = normalize( cross( v0, v1 ) );
+	float3 n1 = normalize( cross( v1, v2 ) );
+	float3 n2 = normalize( cross( v2, v3 ) );
+	float3 n3 = normalize( cross( v3, v0 ) );
+
+	float g0 = acos( -dot( n0, n1 ) );
+	float g1 = acos( -dot( n1, n2 ) );
+	float g2 = acos( -dot( n2, n3 ) );
+	float g3 = acos( -dot( n3, n0 ) );
+
+	SphericalRect.b0 = n0.z;
+	SphericalRect.b1 = n2.z;
+
+	SphericalRect.k = 2*PI - g2 - g3;
+	SphericalRect.SolidAngle = g0 + g1 - SphericalRect.k;
+
+	return SphericalRect;
+}
+
+float3 UniformSampleSphericalRect( float2 E, FSphericalRect Rect )
+{
+	float au = E.x * Rect.SolidAngle + Rect.k;
+	float fu = ( cos(au) * Rect.b0 - Rect.b1 ) / sin(au);
+	float cu = rsqrt( fu*fu + Rect.b0 * Rect.b0 ) * ( fu > 0 ? 1 : -1 );
+	cu = clamp(cu, -1, 1);				// avoid NaNs
+
+	float xu = -(cu * Rect.z0) * rsqrt(1 - cu*cu);
+	xu = clamp( xu, Rect.x0, Rect.x1 );	// avoid Infs
+
+	float d = sqrt( xu*xu + Rect.z0 * Rect.z0 );
+	float h0 = Rect.y0 * rsqrt( d*d + Rect.y0 * Rect.y0 );
+	float h1 = Rect.y1 * rsqrt( d*d + Rect.y1 * Rect.y1 );
+	float hv = h0 + E.y * (h1 - h0);
+	float yv = (hv*hv < 1 - 1e-6) ? (hv * d) * rsqrt( 1 - hv*hv ) : Rect.y1;
+
+	return mul( float3( xu, yv, Rect.z0 ), Rect.Axis );
+}
+
+float3 RectIrradianceRef( float3 N, FRect Rect, out float BaseIrradiance, out float NoL )
+{
+	FSphericalRect SphericalRect = BuildSphericalRect( Rect );
+
+	const uint NumSamples = 32;
+
+	float3 L = 0;
+	NoL = 0;
+
+	LOOP
+	for( uint i = 0; i < NumSamples; i++ )
+	{
+		float2 E = Hammersley( i, NumSamples, 0 );
+		float3 Ls = normalize( UniformSampleSphericalRect( E, SphericalRect ) );
+
+		L   += Ls;
+		NoL += saturate( dot(N, Ls) );
+	}
+
+	BaseIrradiance = SphericalRect.SolidAngle;
+	NoL /= NumSamples;
+
+	return normalize(L);
+}
+
+FRect GetRect(
+	float3 ToLight, 
+	float3 LightDataDirection, 
+	float3 LightDataTangent, 
+	float LightDataSourceRadius, 
+	float LightDataSourceLength, 
+	float LightDataRectLightBarnCosAngle, 
+	float LightDataRectLightBarnLength,
+	bool bComputeVisibleRect)
+{
+	// Is blocked by barn doors
+	FRect Rect;
+	Rect.Origin = ToLight;
+	Rect.Axis[1] = LightDataTangent;
+	Rect.Axis[2] = LightDataDirection;
+	Rect.Axis[0] = cross( Rect.Axis[1], Rect.Axis[2] );
+	Rect.Extent = float2(LightDataSourceRadius, LightDataSourceLength);
+	Rect.FullExtent = Rect.Extent;
+	Rect.Offset = 0;
+
+	// Compute the visible rectangle from the current shading point. 
+	// The new rectangle will have reduced width/height, and a shifted origin
+	//
+	// Common setup for occlusion computation
+	// Notes: Barn angle & length are identical for all sides
+	//					D_B
+	//					<-->
+	//							D_S
+	//						<--------------->     O         +X
+	//					   -------------.--------------->------       ^
+	//					  /        .          |                \      |
+	//					 /   .                |					\     |  BarnDepth
+	//				   ./                     |					 \    v
+	//		     .      C                     v +Z
+	//		.  
+	// .
+	// S
+	//
+	// Only compute the occluded rect if the barn door has an angle less 
+	// than 88 degrees
+	if (bComputeVisibleRect && LightDataRectLightBarnCosAngle > 0.035f)
+	{	
+		const float3 LightNormal	=-Rect.Axis[2];
+		const float3 LightdPdv		=-Rect.Axis[1];
+		const float3 LightdPdu		=-Rect.Axis[0];
+		const float2 LightExtent	= float2(LightDataSourceRadius, LightDataSourceLength);
+		const float BarnLength		= LightDataRectLightBarnLength;
+	
+		// Project shading point S into light space
+		const float3 S_World = -ToLight;
+		float3 S_Light = float3(dot(S_World, LightdPdu), dot(S_World, LightdPdv), dot(S_World, LightNormal));
+		
+		// Compute barn door projection (D_B). Clamp the projection to the shading point if it is closer 
+		// to the light than the actual barn door
+		// Theta is the angle between the Z axis and the barn door
+		const float CosTheta = LightDataRectLightBarnCosAngle;
+		const float SinTheta = sqrt(1 - max(0, CosTheta * CosTheta));
+		const float BarnDepth = min(S_Light.z, CosTheta * BarnLength);
+		const float S_ratio = BarnDepth / (CosTheta * BarnLength);
+		const float D_B	= SinTheta * BarnLength * S_ratio;
+		
+		// Clamp shading point onto the closest edge, if it is inside the rect light
+		const float2 SignS = sign(S_Light.xy);
+		S_Light.xy = float2(SignS.x, SignS.y) * max(abs(S_Light.xy), LightExtent + D_B.xx);
+		
+		// Compute the closest rect lignt corner, offset by the barn door size
+		const float3 C = float3(SignS.x * (LightExtent.x + D_B), SignS.y * (LightExtent.y + D_B), BarnDepth);
+			
+		// Compute projected distance (D_S) of barn door onto the rect light
+		// Eta is the angle between the Z axis and the direction vector (S-C)
+		const float3 SProj  = S_Light - C;
+		const float  CosEta = max(SProj.z, 0);
+		const float2 SinEta = abs(SProj.xy);
+		const float2 TanEta	= CosEta > 0.001f ? abs(SProj.xy)/CosEta : 10000.f;
+		const float2 D_S = BarnDepth * TanEta;
+
+		// Equivalent to (e.g., X axis):
+		//  if (SignS.x < 0) MinMaxX.x += D_S - D_B;
+		//  if (SignS.x > 0) MinMaxX.y -= D_S - D_B;
+		float2 MinMaxX = float2(-LightExtent.x, LightExtent.x);
+		float2 MinMaxY = float2(-LightExtent.y, LightExtent.y);
+		MinMaxX += (D_S.x - D_B) * float2(max(0, -SignS.x), -max(0, SignS.x));
+		MinMaxY += (D_S.y - D_B) * float2(max(0, -SignS.y), -max(0, SignS.y));
+		MinMaxX = clamp(MinMaxX, -LightExtent.x, LightExtent.x);
+		MinMaxY = clamp(MinMaxY, -LightExtent.y, LightExtent.y);
+		
+		const float2 RectOffset = 0.5f * float2(MinMaxX.x + MinMaxX.y, MinMaxY.x + MinMaxY.y);
+
+		Rect.Extent = 0.5f * float2(MinMaxX.y - MinMaxX.x, MinMaxY.y - MinMaxY.x);
+		Rect.Origin = Rect.Origin +  LightdPdu * RectOffset.x + LightdPdv * RectOffset.y;
+		Rect.Offset = -RectOffset;
+		Rect.FullExtent = LightExtent;
+	}
+
+	return Rect;
+}
+

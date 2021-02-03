@@ -1,0 +1,80 @@
+#version 410 or 460
+/**
+  \file data-files/shader/Light/Light_vsmFilter.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+
+#expect KERNEL_RADIUS      "Half the width, plus 0.5"
+#expect LOG_DOWNSAMPLE_X   "Bits to shift coordinates right in X, e.g., for downsampling output"
+#expect LOG_DOWNSAMPLE_Y   "Bits to shift coordinates right in X, e.g., for downsampling output"
+const int2 shift = int2(LOG_DOWNSAMPLE_X, LOG_DOWNSAMPLE_Y);
+
+uniform sampler2D source;
+uniform int2      direction;
+uniform float     farPlaneZ;
+out vec2 result;
+
+ivec2 maxCoord = textureSize(source, 0).xy - ivec2(1);
+
+void addTap(in int tap, in int texOffset, in int2 P, inout float2 sum, inout float infinityWeight, inout float minFiniteZ) {
+    float2 v = texelFetch(source, clamp(texOffset * direction + P, ivec2(0), maxCoord), 0).xy;
+    if (v.x <= farPlaneZ) {
+        infinityWeight += gaussCoef[tap];
+    } else {
+        minFiniteZ = min(minFiniteZ, v.x);
+        sum += v * gaussCoef[tap];
+    }
+}
+
+
+void main() {
+ 
+#   ifdef NVIDIA_361_WORKAROUND
+        NVIDIA_361_WORKAROUND();
+#   endif
+    int2   P = int2(gl_FragCoord.xy) << shift; 
+
+    float2 sum = float2(0.0, 0.0);
+    float infinityWeight = 0.0;
+
+    // Smallest finite depth value we've observed
+    float minFiniteZ = 0.0;
+    
+    addTap(KERNEL_RADIUS - 1, 0, P, sum, infinityWeight, minFiniteZ);
+
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        addTap(tap, (KERNEL_RADIUS - 1 - tap), P, sum, infinityWeight, minFiniteZ);
+    }
+
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        addTap(tap, -(KERNEL_RADIUS - 1 - tap), P, sum, infinityWeight, minFiniteZ);
+    }
+
+    // Choose a Z value to use for "infinity" that isn't too extreme
+    float infinityZ = farPlaneZ;
+    if (minFiniteZ < 0) {
+        // In the cas where there are some finite taps, choose the closer to zero of the finite taps and infinity.
+        // The multiplier on minFiniteZ controls how opaque these edge transparent elements are for shadows.
+        // Higher multiplier = more transparent.
+        infinityZ = max(infinityZ, minFiniteZ * 1.4 - 1.0);
+    }
+
+    // Weigh the accumulated infinite taps
+    sum += float2(infinityZ, infinityZ * infinityZ) * infinityWeight;
+
+    if (sum.x <= farPlaneZ * 0.999) {
+        // This pixel is exclusively at the far plane. Force it *really* 
+        // far away. This is different from pixels that mix finite and infinite
+        // values, where we don't want them blended together because it would 
+        // be biased towards infinity.
+        sum = float2(-1e5, -1e10);
+    }
+
+    result = sum;    
+}
+

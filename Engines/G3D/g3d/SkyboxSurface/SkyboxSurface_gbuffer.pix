@@ -1,0 +1,138 @@
+#version 410
+/**
+  \file data-files/shader/SkyboxSurface/SkyboxSurface_gbuffer.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <UniversalMaterial/UniversalMaterial_writeToGBuffer.glsl>
+
+uniform vec2            lowerCoord, upperCoord;
+
+#expect HAS_ALPHA "0 or 1"
+in vec3  wsVertex;
+
+#ifdef GBUFFER_HAS_EMISSIVE
+    uniform float alpha;
+
+#   ifdef texture0_notNull
+#       ifdef texture0_2DSpherical
+            // Use a 2D spherical-coordinate map
+            uniform sampler2D   texture0_buffer;
+#       else
+            uniform samplerCube texture0_buffer;
+#       endif
+        uniform vec4        texture0_readMultiplyFirst;
+        uniform vec4        texture0_readAddSecond;
+#   endif
+
+#   ifdef texture1_notNull
+#       ifdef texture1_2DSpherical
+            // Use a 2D spherical-coordinate map
+            uniform sampler2D   texture1_buffer;
+#       else
+            uniform samplerCube texture1_buffer;
+#       endif
+        uniform vec4        texture1_readMultiplyFirst;
+        uniform vec4        texture1_readAddSecond;
+#   endif
+#endif
+    
+#if defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    // We reproject per-pixel so that csPrevPosition can be interpolated
+    // linearly in the current frame's 3D; projecting the previous position
+    // in the vertex shader would result in a previous homogeneous value
+    // being linearly in the current time frame.
+    uniform mat4 ProjectToScreenMatrix;
+    uniform mat4 PreviousProjectToScreenMatrix;
+#else
+    mat4 ProjectToScreenMatrix;
+    mat4 PreviousProjectToScreenMatrix;
+#endif
+
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    uniform mat4x3  PreviousObjectToCameraMatrix;
+#endif
+
+
+void main() {
+    // When forced to provide a distance to the skybox, use this
+    const float FAR_DISTANCE = 1e5;
+
+    // Check the color rect bounds
+    if ((gl_FragCoord.x < lowerCoord.x) ||
+        (gl_FragCoord.y < lowerCoord.y) ||
+        (gl_FragCoord.x > upperCoord.x) ||
+        (gl_FragCoord.y > upperCoord.y)) {
+
+        // Don't bother looking up attributes, just let the depth write straight through 
+        return;
+    }
+
+    Point3 cameraOrigin = g3d_CameraToWorldMatrix[3].xyz;
+    Vector3 wsDirection = normalize(wsVertex);
+
+    UniversalMaterialSample materialSample;
+    materialSample.lambertianReflectivity = Color3(0);
+    materialSample.coverage = 1;
+    materialSample.fresnelReflectionAtNormalIncidence = Color3(0);
+    materialSample.smoothness = 0;
+    materialSample.transmissionCoefficient = Color3(0);
+    materialSample.lightMapRadiance = Color3(0);
+    materialSample.etaRatio = 1;
+
+    materialSample.geometricNormal = -wsDirection;
+    materialSample.shadingNormal = -wsDirection;
+    materialSample.glossyShadingNormal = -wsDirection;
+    materialSample.tsNormal = Vector3(0,0,1);
+    materialSample.position = FAR_DISTANCE * wsDirection + cameraOrigin;
+
+#   if defined(texture0_2DSpherical) || defined(texture1_2DSpherical)
+        // Vertical angle, 0 = north pole
+        float theta = acos(wsDirection.y);
+        // Horizontal angle, 0 = +x
+        float phi   = atan(wsDirection.z, wsDirection.x);
+
+        vec2 sphereCoord = vec2(phi / (2 * pi), theta / pi);
+        materialSample.offsetTexCoord = sphereCoord;
+#   else
+        materialSample.offsetTexCoord = vec2(0);
+#   endif
+
+    materialSample.emissive = vec3(0.0);
+
+#   ifdef texture0_notNull
+        materialSample.emissive += (
+#               ifdef texture0_2DSpherical
+                    texture(texture0_buffer, sphereCoord).rgb 
+#               else
+                    texture(texture0_buffer, wsDirection).rgb 
+#               endif
+            * texture0_readMultiplyFirst.rgb + texture0_readAddSecond.rgb) * (1.0 - alpha);
+#   endif
+
+#   ifdef texture1_notNull
+        materialSample.emissive += (
+#               ifdef texture0_2DSpherical
+                    texture(texture1_buffer, sphereCoord).rgb 
+#               else
+                    texture(texture1_buffer, wsDirection).rgb 
+#               endif
+            * texture1_readMultiplyFirst.rgb + texture1_readAddSecond.rgb) * alpha;
+#   endif
+
+    writeToGBuffer
+        (materialSample, 
+        ProjectToScreenMatrix, 
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+        // Technically, we're using the old camera position to compute the origin, but that
+        // is going to give a very small error since the skybox is nearly at infinity.
+        (PreviousObjectToCameraMatrix * Vector4(materialSample.position, 1.0)).xyz, 
+#else
+        (g3d_ObjectToCameraMatrix * Vector4(materialSample.position, 1.0)).xyz, 
+#endif
+        PreviousProjectToScreenMatrix);
+
+}

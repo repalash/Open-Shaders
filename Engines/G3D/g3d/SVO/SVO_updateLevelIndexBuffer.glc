@@ -1,0 +1,31 @@
+#version 420 or 430
+/**
+  \file data-files/shader/SVO/SVO_updateLevelIndexBuffer.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+
+/** Number of nodes allocated; indices are number * 8 */
+layout(r32ui) uniform uimageBuffer   srcBuffer;
+
+writeonly uniform uimageBuffer       dstBuffer;
+
+
+uniform int                          dstIndex;
+uniform int                          srcIndex;
+
+uniform int                          mulFactor;
+uniform int                          divFactor;
+
+void main() {
+    imageStore(dstBuffer, dstIndex, imageLoad(srcBuffer, srcIndex) * mulFactor / divFactor);
+}

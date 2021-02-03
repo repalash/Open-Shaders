@@ -1,0 +1,27 @@
+#version 420
+/**
+  \file data-files/shader/PointSurface/PointSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <g3dmath.glsl>
+#include "PointSurface_vertex.glsl"
+
+
+void main() {
+
+#   if (LOD > 0) 
+        if ((gl_VertexID & ((1 << LOD) - 1)) != 0) {
+            // Move behind the camera to cull it
+            gl_Position = vec4(0, 0, -100, 1);
+            gl_PointSize = 0;
+            return;
+        }
+#   endif
+
+    PointSurface_transform();
+  }

@@ -1,0 +1,20 @@
+#version 420
+
+#extension GL_NV_gpu_shader5 : enable
+#extension GL_EXT_shader_image_load_store : enable
+#extension GL_EXT_bindable_uniform : enable
+#extension GL_NV_shader_buffer_load : enable
+
+attribute vec4 g3d_Vertex;
+
+out vec3 svoPos;
+
+void main() {
+	svoPos = g3d_Vertex.xyz;
+
+#if 1
+	gl_Position   = g3d_Vertex;
+#else
+	gl_Position = g3d_ModelViewProjectionMatrix * g3d_Vertex;
+#endif
+}

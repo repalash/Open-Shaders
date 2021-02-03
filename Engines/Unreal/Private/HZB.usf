@@ -1,0 +1,196 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "SceneTextureParameters.ush"
+#include "ReductionCommon.ush"
+#include "/Engine/Public/WaveBroadcastIntrinsics.ush"
+
+
+#define MAX_MIP_BATCH_SIZE 4
+#define GROUP_TILE_SIZE 8
+
+
+float4 DispatchThreadIdToBufferUV;
+float2 InvSize;
+float2 InputViewportMaxBound;
+
+Texture2D		ParentTextureMip;
+SamplerState	ParentTextureMipSampler;
+
+
+float4 Gather4(Texture2D Texture, SamplerState TextureSampler, float2 BufferUV)
+#if COMPILER_GLSL || FEATURE_LEVEL < FEATURE_LEVEL_SM5
+{
+	float2 UV[4];
+	
+	// min(..., InputViewportMaxBound) because we don't want to sample outside of the viewport
+	// when the view size has odd dimensions on X/Y axis.
+	UV[0] = min(BufferUV + float2(-0.25f, -0.25f) * InvSize, InputViewportMaxBound);
+	UV[1] = min(BufferUV + float2( 0.25f, -0.25f) * InvSize, InputViewportMaxBound);
+	UV[2] = min(BufferUV + float2(-0.25f,  0.25f) * InvSize, InputViewportMaxBound);
+	UV[3] = min(BufferUV + float2( 0.25f,  0.25f) * InvSize, InputViewportMaxBound);
+
+	float4 Out;
+	Out.x = Texture.SampleLevel(TextureSampler, UV[0], 0 ).r;
+	Out.y = Texture.SampleLevel(TextureSampler, UV[1], 0 ).r;
+	Out.z = Texture.SampleLevel(TextureSampler, UV[2], 0 ).r;
+	Out.w = Texture.SampleLevel(TextureSampler, UV[3], 0 ).r;
+
+	return Out;
+}
+#else
+{
+	float2 UV = min(BufferUV + float2(-0.25f, -0.25f) * InvSize, InputViewportMaxBound - InvSize);
+	return Texture.GatherRed(TextureSampler, UV, 0);
+}
+#endif
+
+
+#if COMPUTESHADER
+
+RWTexture2D<float> FurthestHZBOutput_0;
+RWTexture2D<float> FurthestHZBOutput_1;
+RWTexture2D<float> FurthestHZBOutput_2;
+RWTexture2D<float> FurthestHZBOutput_3;
+
+RWTexture2D<float> ClosestHZBOutput_0;
+RWTexture2D<float> ClosestHZBOutput_1;
+RWTexture2D<float> ClosestHZBOutput_2;
+RWTexture2D<float> ClosestHZBOutput_3;
+
+groupshared float SharedFurthestDeviceZ[GROUP_TILE_SIZE * GROUP_TILE_SIZE];
+groupshared float SharedClosestDeviceZ[GROUP_TILE_SIZE * GROUP_TILE_SIZE];
+
+void OutputMipLevel(uint MipLevel, uint2 OutputPixelPos, float FurthestDeviceZ, float ClosestDeviceZ)
+{
+	#if DIM_MIP_LEVEL_COUNT >= 2
+	if (MipLevel == 1)
+	{
+		#if DIM_FURTHEST
+			FurthestHZBOutput_1[OutputPixelPos] = FurthestDeviceZ;
+		#endif
+		#if DIM_CLOSEST
+			ClosestHZBOutput_1[OutputPixelPos] = ClosestDeviceZ;
+		#endif
+	}
+	#endif
+	#if DIM_MIP_LEVEL_COUNT >= 3
+	else if (MipLevel == 2)
+	{
+		#if DIM_FURTHEST
+			FurthestHZBOutput_2[OutputPixelPos] = FurthestDeviceZ;
+		#endif
+		#if DIM_CLOSEST
+			ClosestHZBOutput_2[OutputPixelPos] = ClosestDeviceZ;
+		#endif
+	}
+	#endif
+	#if DIM_MIP_LEVEL_COUNT >= 4
+	else if (MipLevel == 3)
+	{
+		#if DIM_FURTHEST
+			FurthestHZBOutput_3[OutputPixelPos] = FurthestDeviceZ;
+		#endif
+		#if DIM_CLOSEST
+			ClosestHZBOutput_3[OutputPixelPos] = ClosestDeviceZ;
+		#endif
+	}		
+	#endif
+}
+
+[numthreads(GROUP_TILE_SIZE, GROUP_TILE_SIZE, 1)]
+void HZBBuildCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	#if DIM_MIP_LEVEL_COUNT == 1
+		uint2 GroupThreadId = uint2(GroupThreadIndex % GROUP_TILE_SIZE, GroupThreadIndex / GROUP_TILE_SIZE);
+	#else
+		uint2 GroupThreadId = InitialTilePixelPositionForReduction2x2(MAX_MIP_BATCH_SIZE - 1, GroupThreadIndex);
+	#endif
+
+	uint2 DispatchThreadId = GROUP_TILE_SIZE * GroupId + GroupThreadId;
+
+	float2 BufferUV = (DispatchThreadId + 0.5) * DispatchThreadIdToBufferUV.xy + DispatchThreadIdToBufferUV.zw;
+	float4 DeviceZ = Gather4(ParentTextureMip, ParentTextureMipSampler, BufferUV);
+
+	float FurthestDeviceZ = min(min(DeviceZ.x, DeviceZ.y), min(DeviceZ.z, DeviceZ.w));
+	float ClosestDeviceZ = max(max(DeviceZ.x, DeviceZ.y), max(DeviceZ.z, DeviceZ.w));
+	
+	uint2 OutputPixelPos = DispatchThreadId;
+	
+	#if DIM_FURTHEST
+		FurthestHZBOutput_0[OutputPixelPos] = FurthestDeviceZ;
+	#endif
+	
+	#if DIM_CLOSEST
+		ClosestHZBOutput_0[OutputPixelPos] = ClosestDeviceZ;
+	#endif
+
+	#if DIM_MIP_LEVEL_COUNT == 1
+	{
+		// NOP
+	}
+	#else
+	{
+		SharedFurthestDeviceZ[GroupThreadIndex] = FurthestDeviceZ;
+		SharedClosestDeviceZ[GroupThreadIndex] = ClosestDeviceZ;
+	
+		UNROLL
+		for (uint MipLevel = 1; MipLevel < DIM_MIP_LEVEL_COUNT; MipLevel++)
+		{
+			const uint TileSize = GROUP_TILE_SIZE / (1 << MipLevel);
+			const uint ReduceBankSize = TileSize * TileSize;
+			
+			// LDS has been written before.
+			if (MipLevel == 1)
+				GroupMemoryBarrierWithGroupSync();
+
+			BRANCH
+			if (GroupThreadIndex < ReduceBankSize)
+			{
+				float4 ParentFurthestDeviceZ;
+				float4 ParentClosestDeviceZ;
+				ParentFurthestDeviceZ[0] = FurthestDeviceZ;
+				ParentClosestDeviceZ[0] = ClosestDeviceZ;
+
+				UNROLL
+				for (uint i = 1; i < 4; i++)
+				{
+					uint LDSIndex = GroupThreadIndex + i * ReduceBankSize;
+					ParentFurthestDeviceZ[i] = SharedFurthestDeviceZ[LDSIndex];
+					ParentClosestDeviceZ[i] = SharedClosestDeviceZ[LDSIndex];
+				}
+				
+				FurthestDeviceZ = min(min(ParentFurthestDeviceZ.x, ParentFurthestDeviceZ.y), min(ParentFurthestDeviceZ.z, ParentFurthestDeviceZ.w));
+				ClosestDeviceZ =  max(max(ParentClosestDeviceZ.x,  ParentClosestDeviceZ.y),  max(ParentClosestDeviceZ.z,  ParentClosestDeviceZ.w));
+	
+				OutputPixelPos = OutputPixelPos >> 1;
+				OutputMipLevel(MipLevel, OutputPixelPos, FurthestDeviceZ, ClosestDeviceZ);
+				
+				SharedFurthestDeviceZ[GroupThreadIndex] = FurthestDeviceZ;
+				SharedClosestDeviceZ[GroupThreadIndex] = ClosestDeviceZ;
+			}
+		} // for (uint MipLevel = 1; MipLevel < DIM_MIP_LEVEL_COUNT; MipLevel++)
+	}
+	#endif
+} // HZBBuildCS
+
+
+#elif PIXELSHADER
+
+void HZBBuildPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 BufferUV = SvPosition.xy * DispatchThreadIdToBufferUV.xy + DispatchThreadIdToBufferUV.zw;
+	float4 DeviceZ = Gather4(ParentTextureMip, ParentTextureMipSampler, BufferUV);
+
+	float FurthestDeviceZ = min(min(DeviceZ.x, DeviceZ.y), min(DeviceZ.z, DeviceZ.w));
+
+	OutColor = FurthestDeviceZ;
+}
+
+
+#else
+	#error Unknown shader frequency
+
+#endif

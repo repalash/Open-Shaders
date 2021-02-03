@@ -1,0 +1,123 @@
+#version 440
+/**
+  \file data-files/shader/SVO/SVO_writeVoxelFragValues.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#extension GL_NV_shader_atomic_fp16_vector : enable
+#extension GL_NV_gpu_shader5 : enable
+#extension GL_ARB_bindless_texture : enable
+
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+
+/**
+  Requires BUFFER_WIDTH = width, BUFFER_WIDTH_MASK = width - 1 and BUFFER_WIDTH_SHIFT = log_2(width) to be
+  passed, where width is a power of 2.
+
+  Requires WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y
+*/
+
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+
+#include <compatibility.glsl>
+#include <GBuffer/GBuffer.glsl>
+
+#include <SVO/SVO.glsl>
+
+#include <SVO/SVO_sampling.glsl>
+
+DECLARE_GBUFFER(fragBuffer)
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+layout(r32ui) uniform uimageBuffer   fragmentCount;
+
+
+/** Pointers *to* this level are being written. */
+uniform int                          level;
+
+#ifdef SVO_USE_BRICKS
+#undef SVO_USE_BRICKS
+#endif
+#define SVO_USE_BRICKS	0
+
+void main() {
+    // Coordinate in the buffer to read properties of this fragment
+    ivec2 coord = ivec2(WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y) * ivec2(gl_WorkGroupID.xy) + ivec2(gl_LocalInvocationID.xy);
+
+    if (coord.x + coord.y * GBUFFER_WIDTH(fragBuffer) >= imageLoad(fragmentCount, 0).r) {
+        // Off the end of the fragment list
+        return;
+    }
+
+
+	GBUFFER_LOAD_GLOBAL_VARS(fragBuffer, coord);
+
+    // Normalized oct tree-space position on [0, 1]
+    vec3 S = GBUFFER_GLOBAL_VAR(fragBuffer, SVO_POSITION).xyz;
+
+    // Traverse the tree to level - 1
+    int nodeIndex = (int)svoGetRootLocation(SVO_CUR_SVO_ID);
+
+	int levelRes=1<<(level +SVO_OCTREE_BIAS);
+	vec3 targetPosF=S*float(levelRes);
+	ivec3	targetCoords = ivec3(targetPosF);
+
+	nodeIndex = svoGetNodeIndex(SVO_LEVEL_VAR_TYPE(level), (targetCoords >>SVO_OCTREE_BIAS) );
+	{
+
+#if SVO_USE_BRICKS
+		ivec3 brickOffset=targetCoords & (SVO_BRICK_RES/2-1);
+#else
+		ivec3 brickOffset=ivec3(0);
+#endif
+		ivec3 outCoord = svoGBufferCoordsFromNodeIdx(nodeIndex, brickOffset );
+
+# ifdef GBUFFER_CHANNEL_fragBuffer_WS_NORMAL
+
+#  if 1
+		//GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz = (GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz*2.0f-1.0);
+		///GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz = normalize(GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz*2.0f-1.0);	//For path tracing version
+
+		//GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz = vec3(1.0f, 0.0, 0.0);
+
+#  else
+		GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).xyz = GBUFFER_GLOBAL_VAR(fragBuffer, SVO_POSITION).xyz;
+#  endif
+
+
+		GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).w=GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).w; //OK !
+		
+		//Use it as the counter for accumulation
+		GBUFFER_GLOBAL_VAR(fragBuffer, WS_NORMAL).w=1.0f;
+
+
+# endif
+
+#if 0
+		GBUFFER_STORE_VARS(fragBuffer, svo, outCoord);
+#else //Accum
+
+		//Removed : (WS_FACE_NORMAL, faceNormal),
+#   foreach (NAME, name) in (WS_NORMAL, normal), (CS_NORMAL, csNormal), (CS_FACE_NORMAL, csFaceNormal), (WS_POSITION, wsPosition), (CS_POSITION, csPosition), (LAMBERTIAN, lambertian), (GLOSSY, glossy), (TRANSMISSIVE, transmissive), (EMISSIVE, emissive), (CS_POSITION_CHANGE, csPosChange), (SS_POSITION_CHANGE, ssPosChange), (CS_Z, csZ), (DEPTH_AND_STENCIL, depthStencil), (TS_NORMAL, tsNormal), (SVO_POSITION, svoPos), (SVO_COVARIANCE_MAT1, cov1), (SVO_COVARIANCE_MAT2, cov2)
+#       ifdef GBUFFER_CHANNEL_svo_$(NAME)
+
+
+		imageAtomicAdd( GBUFFER_IMAGE(svo, $(NAME)), GBUFFER_COORDS(svo, outCoord), 
+			f16vec4( GBUFFER_VALUE_WRITE( GBUFFER_GLOBAL_VAR(fragBuffer, $(NAME)) ) ) 
+			); 
+
+#       endif
+#   endforeach
+#endif
+	}
+}

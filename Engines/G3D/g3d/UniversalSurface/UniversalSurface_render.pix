@@ -1,0 +1,166 @@
+#version 410 or 460
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#if __VERSION__ > 440
+// Disabled because by the specification, this causes depth to write even when the fragment discards
+//layout(early_fragment_tests) in;
+
+#endif
+
+#expect ALPHA_HINT              "AlphaFilter (int) value"
+#expect HAS_EMISSIVE            "Boolean"
+#expect INFER_AMBIENT_OCCLUSION_AT_TRANSPARENT_PIXELS "Boolean"
+#expect HAS_TRANSMISSIVE        "Boolean"
+#expect UNBLENDED_PASS          "Boolean triggering discard for non-unit coverage"
+#expect HAS_VERTEX_COLOR        "Boolean"
+#expect HAS_NORMAL_BUMP_MAP     "Boolean"
+#expect PARALLAXSTEPS           "int"
+#expect NUM_LIGHTMAP_DIRECTIONS "0, 1, or 3"
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <LightingEnvironment/LightingEnvironment_uniforms.glsl>
+#include <UniversalMaterial/UniversalMaterial.glsl>
+#include <AlphaFilter.glsl>
+#include <AmbientOcclusion/AmbientOcclusion_sample.glsl>
+
+///////////////////////////////////////////////////
+// Arguments for screen-space refraction
+
+/** Image of the background plane */
+uniform sampler2D   background;
+uniform float2      backgroundMinCoord, backgroundMaxCoord;
+
+/** Camera space z position of the background plane; Negative number */
+uniform float       backgroundZ;
+
+/** The depth buffer for the current framebuffer. It is not safe to read from
+    this if the current pass is also writing to the depth buffer */
+uniform sampler2D   depthBuffer;
+
+/** For the current camera. Only has a defined value when rendering
+    a partial coverage surface in a blended pass. */
+uniform vec3        clipInfo;
+
+uniform vec2        backSizeMeters;
+
+uniform sampler2D   ambientOcclusion_buffer;
+uniform vec3        ambientOcclusion_size;
+uniform ivec2       ambientOcclusion_offset;
+
+// Must appear after other globals
+#include <UniversalMaterial/UniversalMaterial_shade.glsl>
+
+uniform float       etaRatio;
+
+///////////////////////////////////////////////////
+
+uniform UniversalMaterial2D material;
+
+float backside = (gl_FrontFacing == g3d_InvertY) ? 1.0 : -1.0;
+
+
+#if NUM_LIGHTMAP_DIRECTIONS > 0
+    varying vec2 lightMapCoord;
+#else
+    vec2 lightMapCoord = vec2(0, 0);
+#endif
+
+/** Surface position in world space */
+in Point3           wsPosition;
+
+/** Surface position in camera space */
+in Point3           csPosition;
+
+in vec2             texCoord;
+in vec3             tan_Z;
+
+#if HAS_NORMAL_BUMP_MAP
+#   if (PARALLAXSTEPS > 0)
+        /** Un-normalized (interpolated) tangent space eye vector */
+        in vec3     _tsE;
+#   else
+        const vec3 _tsE = vec3(0, 0, 0);
+#   endif    
+    in vec3         tan_X, tan_Y;
+#else
+    const vec3 _tsE  = vec3(0, 0, 0);
+    const vec3 tan_X = vec3(0, 0, 0);
+    const vec3 tan_Y = vec3(0, 0, 0);
+#endif
+
+// This must appear after UniversalMaterial and after the definition of tan_Z and backside because they use macros
+#include <Light/Light.glsl>
+
+#if HAS_VERTEX_COLOR
+    in vec4 vertexColor;
+#else
+    const Color4 vertexColor = Color4(0,0,0,0);
+#endif
+    
+#ifdef WRITE_PIXEL_FILENAME
+#   include WRITE_PIXEL_FILENAME
+#else
+    // Default
+    out float4 _result; void writePixel(Radiance3 premultipliedReflectionAndEmission, float coverage, Color3 transmissionCoefficient, float smoothness, float etaRatio, Point3 csPosition, Vector3 csNormal) { _result = vec4(premultipliedReflectionAndEmission, coverage); }
+#endif
+
+
+void main() {    
+    vec3 wsEyePos = g3d_CameraToWorldMatrix[3].xyz;
+
+    // or... (tangentToWorld * vec4(tsE, 0.0)).xyz;
+    const bool discardIfFullCoverage = (UNBLENDED_PASS == 0);
+    const bool discardIfZeroCoverage = true;
+    UniversalMaterialSample materialSample = sampleUniversalMaterial2D(material, wsPosition, texCoord, lightMapCoord, tan_X, tan_Y, tan_Z, normalize(_tsE), backside, discardIfZeroCoverage, discardIfFullCoverage,
+        vertexColor, ALPHA_HINT, PARALLAXSTEPS, bool(HAS_NORMAL_BUMP_MAP), bool(HAS_VERTEX_COLOR), bool(HAS_ALPHA), bool(HAS_TRANSMISSIVE), bool(HAS_EMISSIVE), NUM_LIGHTMAP_DIRECTIONS);
+
+#   ifdef REFRACTION
+        if (gl_FrontFacing != g3d_InvertY) {
+            // Backface
+            materialSample.etaRatio = 1.0 / materialSample.etaRatio;
+        }
+#   endif
+
+#   if UNBLENDED_PASS && HAS_TRANSMISSIVE && ! defined(REFRACTION)
+        if (materialSample.transmissionCoefficient.r + materialSample.transmissionCoefficient.g + materialSample.transmissionCoefficient.b != 0) {
+            // This pixel needs blending. Remove it from this unblended pass.
+            discard;
+        }
+#   endif
+
+    Radiance3 L_o;
+    Color3 transmissionCoefficient;
+    // This csNormal computation compiles away if not using refraction
+    Vector3 csNormal = normalize(g3d_WorldToCameraNormalMatrix * materialSample.shadingNormal);
+    UniversalMaterial_shade(materialSample, wsEyePos, csPosition, csNormal, L_o, transmissionCoefficient, UNBLENDED_PASS != 0, INFER_AMBIENT_OCCLUSION_AT_TRANSPARENT_PIXELS != 0, HAS_TRANSMISSIVE != 0, 
+#       ifdef REFRACTION
+            true
+#       else
+            false
+#       endif
+    );
+
+    // Keep preprocessor commands out of the call to writePixel(), since writePixel may be a macro.
+    float collimation = 
+#       if HAS_TRANSMISSIVE
+            materialSample.smoothness;
+#       else
+            1.0;
+#       endif
+
+    float etaRatio =
+#       ifdef REFRACTION
+            materialSample.etaRatio;
+#       else
+            1.0;
+#       endif
+
+    writePixel(L_o * materialSample.coverage, materialSample.coverage, transmissionCoefficient, collimation, etaRatio, csPosition, csNormal);
+}

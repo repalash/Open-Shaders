@@ -1,0 +1,13 @@
+// -*- c++ -*-
+#ifdef EMISSIVE
+    varying vec3 direction;
+#endif
+    attribute vec4 g3d_Vertex;
+
+void main() {
+#   ifdef EMISSIVE
+        direction = g3d_Vertex.xyz;
+#   endif
+
+    gl_Position = gl_ModelViewProjectionMatrix * g3d_Vertex;
+}

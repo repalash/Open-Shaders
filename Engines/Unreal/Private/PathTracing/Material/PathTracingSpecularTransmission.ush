@@ -1,0 +1,65 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+PathTracingSpecularTransmission.usf: Pure specular transmission BTDF sampling functions
+===============================================================================================*/
+
+#pragma once
+
+void SpecularRefraction_SampleMaterial(
+	float3 RayDirection,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	out float3 OutDirection,
+	out float3 OutThroughput,
+	out float OutPdf,
+	out float OutPositionBiasSign)
+{
+	// NOTE: IsFrontFace() determines polygon orientation, because the normal is always flipped towards in the incoming ray
+	bool bIsEntering = Payload.IsFrontFace();
+	float3 WorldNormal = GetWorldNormal(Payload);
+
+	// #dxr_todo: Maintain a refraction stack on the path tracing payload
+	// #dxr_todo Determine if parameterization from Specular is still the proper path forward
+	//float Ior = Payload.Ior;
+	float Ior = DielectricF0ToIor(DielectricSpecularToF0(Payload.Specular));
+	float N1 = bIsEntering ? 1.0 : Ior;
+	float N2 = bIsEntering ? Ior : 1.0;
+	float Fr = bIsEntering ? FresnelDielectric(dot(-RayDirection, WorldNormal), N1, N2) : 0.0;
+
+	// Stochastically choose to reflect/refract based on Fresnel term
+	float ProbReflect = bIsEntering ? Fr : 0.0;
+	if (RandSample.x < ProbReflect)
+	{
+		OutDirection = reflect(RayDirection, WorldNormal);
+		OutThroughput = Fr;
+		OutPdf = ProbReflect;
+		OutPositionBiasSign = 1.0;
+	}
+	else
+	{
+		float Eta = N1 / N2;
+		OutThroughput = 1.0 - Fr;
+		OutPdf = 1.0 - ProbReflect;
+		OutDirection = refract(RayDirection, WorldNormal, Eta);
+		OutPositionBiasSign = -1.0;
+
+		// Total internal reflection
+		if (!any(OutDirection))
+		{
+			OutDirection = reflect(RayDirection, WorldNormal);
+			OutPositionBiasSign = 1.0;
+		}
+	}
+} 
+
+float SpecularTransmission_Pdf()
+{
+	return 0.0;
+}
+
+void SpecularTransmission_EvalMaterial(out float3 OutThroughput, out float OutPdf)
+{
+	OutThroughput = float3(0.0, 0.0, 0.0);
+	OutPdf = SpecularTransmission_Pdf();
+}

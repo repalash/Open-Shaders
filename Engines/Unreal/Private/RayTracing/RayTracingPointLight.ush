@@ -1,0 +1,26 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+bool GeneratePointLightOcclusionRay(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax
+)
+{
+	float3 LightDirection = LightParameters.Position - WorldPosition;
+	float RayLength = length(LightDirection);
+	LightDirection /= RayLength;
+
+	// Apply normal perturbation when defining ray
+	RayOrigin = WorldPosition;
+	RayDirection = LightDirection;
+	RayTMin = 0.0;
+	RayTMax = RayLength;
+	return true;
+}

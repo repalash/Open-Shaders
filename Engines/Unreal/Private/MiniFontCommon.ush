@@ -1,0 +1,149 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MiniFontCommon.usf: TinyFont shared functions and structures.
+=============================================================================*/
+
+#pragma once
+
+Texture2D MiniFontTexture;
+
+// CharacterIDs for the MiniFont
+#define _0_ 0
+#define _1_ 1
+#define _2_ 2
+#define _3_ 3
+#define _4_ 4
+#define _5_ 5
+#define _6_ 6
+#define _7_ 7
+#define _8_ 8
+#define _9_ 9
+#define _A_ 10
+#define _B_ 11
+#define _C_ 12
+#define _D_ 13
+#define _E_ 14
+#define _F_ 15
+#define _G_ 16
+#define _H_ 17
+#define _I_ 18
+#define _J_ 19
+#define _K_ 20
+#define _L_ 21
+#define _M_ 22
+#define _N_ 23
+#define _O_ 24
+#define _P_ 25
+#define _Q_ 26
+#define _R_ 27
+#define _S_ 28
+#define _T_ 29
+#define _U_ 30
+#define _V_ 31
+#define _W_ 32
+#define _X_ 33
+#define _Y_ 34
+#define _Z_ 35
+#define _MINUS_ 59
+#define _COMMA_ 60
+#define _DOT_ 61
+#define _PLUS_ 62
+#define _SPC_ 63
+
+// sample from the MiniFont texture
+// @param CharacterID - the character to print
+// @param Position - the position within the 8x8 character
+float SampleMiniFont(int CharacterID, uint2 Position)
+{
+	return MiniFontTexture.Load(int3(CharacterID * 8 + Position.x, Position.y, 0)).r;
+}
+
+// for printf debugging in the shader
+// @param LeftTop - is advanced, in pixels
+void PrintCharacter(int2 PixelPos, inout float3 OutColor, float3 FontColor, inout int2 LeftTop, int CharacterID)
+{
+	uint2 Rel = (uint2)(PixelPos - LeftTop);
+
+	FLATTEN if (Rel.x < 8 && Rel.y < 8)
+	{
+		OutColor = lerp(OutColor, FontColor, SampleMiniFont(CharacterID, Rel));
+	}
+
+	LeftTop.x += 8;
+}
+
+// only for positive numbers
+// @param DigitValue - e.g. 1 for frist digit before period, 10 for second, 0.1 for first digit behind period
+uint ExtractDigitFromFloat(float Number, float DigitValue)
+{
+	uint Temp = (uint)(Number / DigitValue);
+	return Temp % 10;
+}
+
+// for printf debugging in the shader, has to be positive
+// outputs a float number in the form: xxx.yyy
+// @param LeftTop - in pixels
+void PrintFloat(int2 PixelPos, inout float3 OutColor, float3 FontColor, int2 LeftTop, float Number)
+{
+	int2 Cursor = LeftTop;
+
+	// before period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 100));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1));
+	// period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, _DOT_);
+	// after period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 0.1));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 0.01));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 0.001));
+}
+
+// for printf debugging in the shader, has to be positive
+// outputs a float number in the form: xxx.yyy
+// @param LeftTop - in pixels
+void PrintFloatNoFraction(int2 PixelPos, inout float3 OutColor, float3 FontColor, int2 LeftTop, float Number)
+{
+	int2 Cursor = LeftTop;
+
+	// before period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10000));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1000));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 100));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1));
+}
+void PrintFloatNoFractionLarge(int2 PixelPos, inout float3 OutColor, float3 FontColor, int2 LeftTop, float Number)
+{
+	int2 Cursor = LeftTop;
+
+	// before period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 100000));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10000));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1000));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 100));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10));
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1));
+}
+
+// for printf debugging in the shader, has to be positive (other abs is taken)
+// outputs a float number in the form: xx.yy
+// @param LeftTop - in pixels
+void PrintSmallFloat(int2 PixelPos, inout float3 OutColor, float3 FontColor, int2 LeftTop, float Number)
+{
+	Number = abs(Number) + 0.05; // Round up first digit
+	int2 Cursor = LeftTop;
+
+	// before period
+	FLATTEN
+	if (Number >= 10)
+	{
+		PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 10));
+	}
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 1));
+	// period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, _DOT_);
+	// after period
+	PrintCharacter(PixelPos, OutColor, FontColor, Cursor, ExtractDigitFromFloat(Number, 0.1));
+}

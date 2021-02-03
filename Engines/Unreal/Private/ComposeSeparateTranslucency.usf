@@ -1,0 +1,38 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+float4 SeparateTranslucencyBilinearUVMinMax;
+
+
+Texture2D SceneColor;
+SamplerState SceneColorSampler;
+
+Texture2D SeparateTranslucency;
+SamplerState SeparateTranslucencySampler;
+
+Texture2D SeparateModulation;
+SamplerState SeparateModulationSampler;
+
+void MainPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	float2 BufferUV = SvPosition.xy * View.BufferSizeAndInvSize.zw;
+	
+	float4 SceneColorSample = SceneColor.SampleLevel(SceneColorSampler, BufferUV, 0);
+
+
+	float2 SeparateTranslucencyBufferUV = clamp(BufferUV, SeparateTranslucencyBilinearUVMinMax.xy, SeparateTranslucencyBilinearUVMinMax.zw);
+
+
+	float4 SeparateTranslucencySample = SeparateTranslucency.SampleLevel(SeparateTranslucencySampler, SeparateTranslucencyBufferUV, 0);
+	float4 SeparateModulationSample = SeparateModulation.SampleLevel(SeparateModulationSampler, SeparateTranslucencyBufferUV, 0);
+
+	OutColor.rgb = SceneColorSample.rgb * SeparateTranslucencySample.a * SeparateModulationSample.rgb + SeparateTranslucencySample.rgb;
+	OutColor.a = SceneColorSample.a * SeparateTranslucencySample.a;
+	
+#if !POST_PROCESS_ALPHA
+	OutColor.a = 0;
+#endif
+}

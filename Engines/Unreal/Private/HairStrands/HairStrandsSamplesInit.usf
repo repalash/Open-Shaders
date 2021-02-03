@@ -1,0 +1,127 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#include "../Common.ush"
+
+#ifndef MAX_SECTION_COUNT
+#error MAX_SECTION_COUNT needs to be defined
+#endif
+
+uint PassSectionCount;
+
+uint SectionVertexCount[MAX_SECTION_COUNT];
+uint SectionVertexOffset[MAX_SECTION_COUNT];
+uint SectionBufferIndex[MAX_SECTION_COUNT];
+
+#if PERMUTATION_POSITION_TYPE == 0
+Buffer<float> VertexPositionsBuffer0;
+Buffer<float> VertexPositionsBuffer1;
+Buffer<float> VertexPositionsBuffer2;
+Buffer<float> VertexPositionsBuffer3;
+Buffer<float> VertexPositionsBuffer4;
+Buffer<float> VertexPositionsBuffer5;
+Buffer<float> VertexPositionsBuffer6;
+Buffer<float> VertexPositionsBuffer7;
+#elif PERMUTATION_POSITION_TYPE == 1
+Buffer<float> RDGVertexPositionsBuffer0;
+Buffer<float> RDGVertexPositionsBuffer1;
+Buffer<float> RDGVertexPositionsBuffer2;
+Buffer<float> RDGVertexPositionsBuffer3;
+Buffer<float> RDGVertexPositionsBuffer4;
+Buffer<float> RDGVertexPositionsBuffer5;
+Buffer<float> RDGVertexPositionsBuffer6;
+Buffer<float> RDGVertexPositionsBuffer7;
+
+#define VertexPositionsBuffer0 RDGVertexPositionsBuffer0
+#define VertexPositionsBuffer1 RDGVertexPositionsBuffer1
+#define VertexPositionsBuffer2 RDGVertexPositionsBuffer2
+#define VertexPositionsBuffer3 RDGVertexPositionsBuffer3
+#define VertexPositionsBuffer4 RDGVertexPositionsBuffer4
+#define VertexPositionsBuffer5 RDGVertexPositionsBuffer5
+#define VertexPositionsBuffer6 RDGVertexPositionsBuffer6
+#define VertexPositionsBuffer7 RDGVertexPositionsBuffer7
+#endif
+
+uint MaxVertexCount;
+uint MaxSampleCount;
+Buffer<uint> SampleIndicesBuffer;
+RWBuffer<float4> OutSamplePositionsBuffer;
+
+[numthreads(128, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{ 
+	const uint SampleIndex = DispatchThreadId.x;
+	if (SampleIndex >= MaxSampleCount) 
+		return;
+
+	const uint VertexIndex = SampleIndicesBuffer[SampleIndex];
+	if (VertexIndex >= MaxVertexCount) 
+		return;
+	
+	bool bValid = false;  
+	uint SectionIndex = 0;
+	for (uint It = 0; It < PassSectionCount; ++It)
+	{
+		if ((VertexIndex >= SectionVertexOffset[It]) && (VertexIndex < (SectionVertexOffset[It] + SectionVertexCount[It])))
+		{
+			SectionIndex = It;
+			bValid = true;
+			break;
+		}
+	}
+	
+	if (!bValid)
+		return;
+
+	float3 SamplePosition = float3(0,0,0);
+	const uint BufferIndex = SectionBufferIndex[ SectionIndex];
+	const int LocalIndex = VertexIndex;
+	if (BufferIndex == 0)
+	{
+		SamplePosition.x = VertexPositionsBuffer0.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer0.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer0.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 1)
+	{
+		SamplePosition.x = VertexPositionsBuffer1.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer1.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer1.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 2)
+	{
+		SamplePosition.x = VertexPositionsBuffer2.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer2.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer2.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 3)
+	{
+		SamplePosition.x = VertexPositionsBuffer3.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer3.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer3.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 4)
+	{
+		SamplePosition.x = VertexPositionsBuffer4.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer4.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer4.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 5)
+	{
+		SamplePosition.x = VertexPositionsBuffer5.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer5.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer5.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 6)
+	{
+		SamplePosition.x = VertexPositionsBuffer6.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer6.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer6.Load(LocalIndex * 3 + 2);
+	}
+	else if (BufferIndex == 7)
+	{
+		SamplePosition.x = VertexPositionsBuffer7.Load(LocalIndex * 3 + 0);
+		SamplePosition.y = VertexPositionsBuffer7.Load(LocalIndex * 3 + 1);
+		SamplePosition.z = VertexPositionsBuffer7.Load(LocalIndex * 3 + 2);
+	}
+
+	OutSamplePositionsBuffer[SampleIndex] = float4(SamplePosition,1);
+}

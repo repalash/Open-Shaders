@@ -1,0 +1,36 @@
+#version 420
+/**
+  \file data-files/shader/VoxelSurface/VoxelSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+//get rid of LOD, constant radius gl_pointSize is radius of 2d box in pixels
+//CFrame from G3D -> mat3x4 in glsl, uniform variable set once per draw call, from this compute voxel coordinate system
+//The above is referring to the cameraToWorldMatrix, as set in App.cpp in G3D rayMarch.
+
+
+#include <g3dmath.glsl>
+//#include "PointSurface_vertex.glsl"
+//#include <D:\zander\raybox\code\gpu\data-files\shader\our.glsl>
+
+in Point3       position;
+
+// in sRGB values
+in Radiance4    color;
+
+// in meters
+uniform float   voxelRadius;
+uniform float   invVoxelRadius;
+
+// Box to world
+out Point3      boxCenter;
+
+out Color3      voxelLambertian;
+
+void main() {
+    computeVertexShaderOutputs(color, position, voxelRadius, gl_Position, gl_PointSize, voxelLambertian);
+}

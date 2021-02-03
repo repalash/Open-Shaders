@@ -1,0 +1,71 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingTestGenerateWiSamples.usf: BRDF tests 
+===============================================================================================*/
+
+#include "../../Montecarlo.ush"
+#include "../PathTracingDefinitions.ush"
+#include "PathTracingMaterialSampling.ush"
+#include "../Utilities/PathTracingRandomSequence.ush"
+
+
+RWStructuredBuffer<float3> WisBinDistributionResultsBuffer;
+uint  BrdfType;
+float3 Wo;
+uint  NumSamples;
+uint  NumThetaSteps;
+uint  NumPhiSteps;
+
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+
+void TestGenerateWiSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint LinearIndex = DispatchThreadId.x;
+	if (LinearIndex >= NumSamples)
+	{
+		return;
+	}
+
+	// Inputs
+	FMaterialClosestHitPayload Payload = (FMaterialClosestHitPayload)0;
+	Payload.WorldNormal = float3(0.0, 0.0, 1.0);
+	Payload.DiffuseColor = float3(0.37, 0.37, 0.37);
+	Payload.SpecularColor = float3(0.37, 0.37, 0.37);
+	Payload.Roughness = 0.1;
+
+	RandomSequence RandSequence;
+	RandomSequence_Initialize(RandSequence, LinearIndex, 0);
+	uint DummyVariable;
+
+	float2 E = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+	float3 Wo = UniformSampleHemisphere(E).xyz;
+
+	// Outputs
+	float3 Wi;
+	float3 SampledBRDF;
+	float SampledPDF;
+
+	float4 RandSample = RandomSequence_GenerateSample4D(RandSequence, DummyVariable);
+
+	if (BrdfType == 0)
+	{
+		Lambert_SampleMaterial(Payload, RandSample, Wi, SampledBRDF, SampledPDF);
+	}
+	else if (BrdfType == 1)
+	{
+		Glossy_SampleMaterial(Wo, Payload, RandSample, Wi, SampledBRDF, SampledPDF);
+	}
+	else
+	{
+		// Should never be here, generate invalid outgoing to trigger an error
+		Wi = float3(0.0, 0.0, 0.0); 
+	}
+
+	WisBinDistributionResultsBuffer[LinearIndex] = Wi;
+}
+

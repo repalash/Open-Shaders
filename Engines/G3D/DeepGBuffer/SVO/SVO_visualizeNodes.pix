@@ -1,0 +1,11 @@
+#version 420
+
+uniform vec4 color;
+
+in vec4 vertColor;
+out vec4 outColor;
+
+void main() {
+	outColor = vertColor;
+    //outColor = color;
+}

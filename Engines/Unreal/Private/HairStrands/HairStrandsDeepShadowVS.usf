@@ -1,0 +1,181 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsVoxelPageCommonStruct.ush"
+#include "HairStrandsDeepShadowCommonStruct.ush"
+
+#include "../Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+#include "HairStrandsVisibilityCommon.ush"
+
+#define MESH_RENDER_DEPTH 0
+#define MESH_RENDER_DOM   1
+#define MESH_RENDER_VOXEL 2
+
+#ifndef SUPPORT_TANGENT_PROPERTY
+#define SUPPORT_TANGENT_PROPERTY 0
+#endif
+
+#ifndef SUPPORT_MATERIAL_PROPERTY
+#define SUPPORT_MATERIAL_PROPERTY 0
+#endif
+
+struct FDeepShadowAccumulateVSToPS
+{
+#if SUPPORT_TANGENT_PROPERTY == 1 || SUPPORT_MATERIAL_PROPERTY == 1
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+#endif
+	float4 Position : SV_POSITION;
+#if MESH_RENDER_MODE == MESH_RENDER_VOXEL
+	float4 WorldPositon_Coverage : TEXCOORD6;
+#endif
+#if MESH_RENDER_MODE == MESH_RENDER_DOM
+	float HairCoverage : CUSTOM_COVERAGE;
+#endif
+};
+
+#define VS_OUTPUT_TYPE FDeepShadowAccumulateVSToPS
+#define SUPPORT_WPO 0
+
+#if VERTEXSHADER 
+
+/** transform mesh as normal */
+void Main(
+	FVertexFactoryInput Input,
+	OPTIONAL_VertexID
+	out VS_OUTPUT_TYPE Output
+)
+#if defined(VF_STRAND_HAIR) && MESH_RENDER_MODE == MESH_RENDER_VOXEL && SUPPORT_TANGENT_PROPERTY == 0 && SUPPORT_MATERIAL_PROPERTY == 0
+{
+	ResolvedView = ResolveView();
+	
+	const FHairRenderInfo HairRenderInfo = GetHairRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits);
+
+	FHairViewInfo HairViewInfo;
+	HairViewInfo.TranslatedWorldCameraOrigin = ResolvedView.TranslatedWorldCameraOrigin;
+	HairViewInfo.RadiusAtDepth1 = HairRenderInfo.RadiusAtDepth1Primary;
+	HairViewInfo.bIsOrthoView = true;
+	HairViewInfo.ViewForward = ResolvedView.ViewForward;
+
+	float2 ViewportScale;
+	float4x4 WorldToClipMatrix = VoxelRasterPass.WorldToClipMatrix;
+	if (HairRenderInfo.bIsGPUDriven)
+	{
+		const uint MacroGroupId = VoxelRasterPass.MacroGroupId;
+		FVoxelizationViewInfo VoxelizationViewInfo = VoxelRasterPass.VoxelizationViewInfoBuffer[MacroGroupId];
+		WorldToClipMatrix = VoxelizationViewInfo.WorldToClip;
+		ViewportScale = VoxelizationViewInfo.RasterResolution / float2(VoxelRasterPass.ViewportResolution);
+		HairViewInfo.ViewForward = VoxelizationViewInfo.ViewForward;
+	}
+
+	float HairWorldRadius = 0;
+	float HairDensity = 0;
+	float4 WorldPosition = VertexFactoryGetWorldPosition_Voxelization(Input, HairViewInfo, HairWorldRadius, HairDensity);
+
+	WorldPosition.xyz -= ResolvedView.PreViewTranslation.xyz; // Remove the camera relative position (todo move this into matrix transform)
+
+	Output.Position = mul(WorldPosition, WorldToClipMatrix);
+
+	if (HairRenderInfo.bIsGPUDriven)
+	{
+		Output.Position.xy += float2(1, 1);
+		Output.Position.xy *= ViewportScale;
+		Output.Position.xy -= float2(1, 1);
+	}
+
+	const float PixelRadius = HairRenderInfo.RadiusAtDepth1Primary;
+	const float Coverage = HairWorldRadius / max(HairWorldRadius, PixelRadius);
+	Output.WorldPositon_Coverage = float4(WorldPosition.xyz, Coverage * HairDensity);
+}
+#else // SPARSE VOXELIZAITON SPECIALIZATION
+{
+	ResolvedView = ResolveView();
+
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+
+#if MESH_RENDER_MODE == MESH_RENDER_VOXEL
+	float4x4 WorldToClipMatrix = VoxelRasterPass.WorldToClipMatrix;
+#elif MESH_RENDER_MODE == MESH_RENDER_DEPTH || MESH_RENDER_MODE == MESH_RENDER_DOM
+	float4x4 WorldToClipMatrix = DeepRasterPass.CPU_WorldToClipMatrix;
+#endif
+
+#ifdef VF_STRAND_HAIR	
+	const FHairRenderInfo HairRenderInfo = GetHairRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits);
+
+	FHairViewInfo HairViewInfo;
+	HairViewInfo.TranslatedWorldCameraOrigin = ResolvedView.TranslatedWorldCameraOrigin;
+	HairViewInfo.ViewForward = ResolvedView.ViewForward;
+	HairViewInfo.RadiusAtDepth1 = HairRenderInfo.RadiusAtDepth1Primary;
+	HairViewInfo.bIsOrthoView = HairRenderInfo.bIsOrthoView;
+
+	#if MESH_RENDER_MODE == MESH_RENDER_VOXEL
+	float2 ViewportScale;
+	if (HairRenderInfo.bIsGPUDriven)
+	{
+		const uint MacroGroupId = VoxelRasterPass.MacroGroupId;
+		FVoxelizationViewInfo VoxelizationViewInfo = VoxelRasterPass.VoxelizationViewInfoBuffer[MacroGroupId];
+		WorldToClipMatrix			= VoxelizationViewInfo.WorldToClip;
+		HairViewInfo.ViewForward	= VoxelizationViewInfo.ViewForward;
+		ViewportScale				= VoxelizationViewInfo.RasterResolution / float2(VoxelRasterPass.ViewportResolution);
+	}
+	#endif
+
+	#if MESH_RENDER_MODE == MESH_RENDER_DEPTH || MESH_RENDER_MODE == MESH_RENDER_DOM
+	if (HairRenderInfo.bIsGPUDriven)
+	{
+		const uint AtlasSlotIndex = DeepRasterPass.AtlasSlotIndex;
+		FDeepShadowViewInfo DeepShadowViewInfo = DeepRasterPass.DeepShadowViewInfoBuffer[AtlasSlotIndex];
+		WorldToClipMatrix			= DeepShadowViewInfo.WorldToClip;
+		HairViewInfo.ViewForward	= DeepShadowViewInfo.ViewForward;
+		HairViewInfo.RadiusAtDepth1 = DeepShadowViewInfo.MinRadiusAtDepth1;
+	}
+	#endif
+
+	float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates, HairViewInfo);
+#else
+	float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+#endif
+	WorldPosition.xyz -= ResolvedView.PreViewTranslation.xyz; // Remove the camera relative position (todo move this into matrix transform)
+
+	Output.Position = mul(WorldPosition, WorldToClipMatrix);
+
+#if MESH_RENDER_MODE == MESH_RENDER_VOXEL && defined(VF_STRAND_HAIR)
+	if (HairRenderInfo.bIsGPUDriven)
+	{
+		Output.Position.xy += float2(1, 1);
+		Output.Position.xy *= ViewportScale;
+		Output.Position.xy -= float2(1, 1);
+	}
+
+	Output.WorldPositon_Coverage.xyz = WorldPosition;
+
+  #if SUPPORT_TANGENT_PROPERTY == 1 || SUPPORT_MATERIAL_PROPERTY == 1
+	float3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPosition.xyz, TangentToLocal);
+	Output.Interpolants = VertexFactoryGetInterpolantsVSToPS(Input, VFIntermediates, VertexParameters);
+  #endif
+#endif
+
+	float HairCoverage = 1;
+  #ifdef VF_STRAND_HAIR	
+	const float CurrentDepth = Output.Position.z / Output.Position.w;
+	const float PixelRadius = HairRenderInfo.bIsOrthoView ? HairRenderInfo.RadiusAtDepth1Primary : (CurrentDepth * HairRenderInfo.RadiusAtDepth1Primary);
+	const float StrandRealRadius = VFIntermediates.HairDimensions.y;
+	const float Coverage = StrandRealRadius / max(StrandRealRadius, PixelRadius);
+	HairCoverage = Coverage * VFIntermediates.HairDensity;
+  #endif
+
+  #if MESH_RENDER_MODE == MESH_RENDER_DOM
+	Output.HairCoverage = HairCoverage;
+  #endif
+
+  #if MESH_RENDER_MODE == MESH_RENDER_VOXEL
+	Output.WorldPositon_Coverage.w = HairCoverage;
+  #endif
+
+	OutputVertexID( Output );
+}
+#endif // SPARSE VOXELIZAITON SPECIALIZATION
+
+#endif // VERTEXSHADER

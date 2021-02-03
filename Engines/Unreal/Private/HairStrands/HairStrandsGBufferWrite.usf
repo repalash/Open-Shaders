@@ -1,0 +1,114 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+// Workaround for DeferredShadingCommon.ush requiring SceneTexturesStruct resources which is not available, 
+// since we are writing into Gbuffer textures within this pass
+#if SHADING_PATH_DEFERRED
+	#undef SHADING_PATH_DEFERRED
+	#define SHADING_PATH_DEFERRED 0
+#endif
+#include "../DeferredShadingCommon.ush"
+#include "HairStrandsGBufferCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+uint bWriteDummyData;
+Texture2D<uint4> CategorizationTexture;
+Texture2D<uint>	 NodeIndex;
+StructuredBuffer<FPackedHairSample> NodeData;
+
+void MainPS(
+	in float2 UV : TEXCOORD
+	, in float4 SvPosition: SV_Position
+	, out float4 OutGBufferA : SV_Target0
+	, out float4 OutGBufferB : SV_Target1
+#if PERMUTATION_OUTPUT_TYPE == 1
+	, out float4 OutGBufferC : SV_Target2
+	, out float4 OutGBufferD : SV_Target3
+	, out float4 OutGBufferE : SV_Target4
+	, out float  OutDepth    : SV_DEPTH
+#endif
+)
+{
+	ResolvedView = ResolveView();
+	OutGBufferA = 0;
+	OutGBufferB = 0;
+#if PERMUTATION_OUTPUT_TYPE == 0
+	float4 OutGBufferC = 0;
+	float4 OutGBufferD = 0;
+	float4 OutGBufferE = 0;
+	float  OutDepth = 0;
+#endif
+
+	const uint3 PixelCoord = uint3(floor(SvPosition.xy), 0);
+	FNodeDesc NodeDesc = DecodeNodeDesc(NodeIndex.Load(PixelCoord));
+	if (NodeDesc.Count == 0)
+	{
+		discard;
+	}
+
+	const FCategorizationData CatData = DecodeCategorizationData(CategorizationTexture.Load(PixelCoord));
+	const float PixelCoverage = min(CatData.PixelCoverage, 1);
+	if (PixelCoverage == 0)
+	{
+		discard;
+	}
+
+	if (bWriteDummyData > 0)
+	{
+		const float3 Tangent = float3(0, 0, 1);
+		OutGBufferA = float4(Tangent, 0);
+		OutGBufferB = float4(0, 0, 0, EncodeShadingModelIdAndSelectiveOutputMask(SHADINGMODELID_HAIR, 0));
+	}
+	else
+	{
+		float3 Samples_Tangent = 0;
+		float  Samples_Specular = 0;
+		float3 Samples_BaseColor = 0;
+		float  Samples_Roughnesss = 0;
+		uint   Samples_LightChannelMask = 0;
+		float  Samples_Backlit = 0;
+		float  Samples_Depth = 0;
+		LOOP
+		for (uint NodeIt = 0; NodeIt < NodeDesc.Count; ++NodeIt)
+		{
+			const uint NodeOffset = NodeDesc.Offset + NodeIt;
+			const FPackedHairSample Data = NodeData[NodeOffset];
+			const FHairSample Sample = UnpackHairSample(Data);
+
+			Samples_Tangent		+= Sample.Tangent;
+			Samples_Specular	+= Sample.Specular;
+			Samples_BaseColor	+= Sample.BaseColor;
+			Samples_Roughnesss	+= Sample.Roughness;
+			Samples_Backlit		+= Sample.Tangent;
+			if (NodeIt == 0)
+			{
+				Samples_LightChannelMask = Sample.LightChannelMask;
+			}
+		}
+		Samples_Depth = CatData.ClosestDepth;
+
+		const float InvSampleCount = 1.f / max(1u, NodeDesc.Count);
+		Samples_Tangent		 = normalize(Samples_Tangent);
+		Samples_Specular	*= InvSampleCount;
+		Samples_BaseColor	*= InvSampleCount;
+		Samples_Roughnesss	*= InvSampleCount;
+		Samples_Backlit		*= InvSampleCount;
+		Samples_Depth		*= InvSampleCount;
+
+		WriteGBuffer(
+			Samples_Tangent,
+			Samples_Specular,
+			Samples_BaseColor,
+			Samples_Roughnesss,
+			Samples_LightChannelMask,
+			Samples_Backlit,
+			Samples_Depth,
+			OutGBufferA,
+			OutGBufferB,
+			OutGBufferC,
+			OutGBufferD,
+			OutGBufferE,
+			OutDepth);
+	}
+}

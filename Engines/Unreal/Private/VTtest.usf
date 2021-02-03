@@ -1,0 +1,11 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+void VirtualTextureTestPS(
+	noperspective float4 UVAndScreenPos : TEXCOORD0,
+	out float4 OutColor : SV_Target0
+	)
+{
+	OutColor = 0;
+}

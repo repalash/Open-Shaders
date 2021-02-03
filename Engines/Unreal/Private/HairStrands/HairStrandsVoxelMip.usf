@@ -1,0 +1,196 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+#include "HairStrandsVoxelPageCommon.ush"
+
+uint ComputeMipDensity(
+	const uint RawDensity0,
+	const uint RawDensity1,
+	const uint RawDensity2,
+	const uint RawDensity3,
+	const uint RawDensity4,
+	const uint RawDensity5,
+	const uint RawDensity6,
+	const uint RawDensity7)
+{
+	const float TotalOpaque =
+		((RawDensity0 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity1 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity2 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity3 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity4 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity5 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity6 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT) +
+		((RawDensity7 & VOXEL_OPAQUE_MASK) >> VOXEL_OPAQUE_SHIFT);
+	const uint OutTotalOpaque = uint(clamp(TotalOpaque / 8.f, TotalOpaque > 0 ? 1 : 0, 0xFF)) << VOXEL_OPAQUE_SHIFT;
+
+	uint TotalHair = 
+		(RawDensity0 & VOXEL_HAIR_MASK) +
+		(RawDensity1 & VOXEL_HAIR_MASK) +
+		(RawDensity2 & VOXEL_HAIR_MASK) +
+		(RawDensity3 & VOXEL_HAIR_MASK) +
+		(RawDensity4 & VOXEL_HAIR_MASK) +
+		(RawDensity5 & VOXEL_HAIR_MASK) +
+		(RawDensity6 & VOXEL_HAIR_MASK) +
+		(RawDensity7 & VOXEL_HAIR_MASK);
+	TotalHair /= 8;
+
+	return min(uint(VOXEL_HAIR_MASK), TotalHair) | OutTotalOpaque;
+}
+
+#if SHADER_MIP_VIRTUALVOXEL
+int3 PageCountResolution;
+uint PageResolution;
+uint SourceMip;
+uint TargetMip;
+
+Texture3D<uint>   InDensityTexture;
+RWTexture3D<uint> OutDensityTexture;
+
+[numthreads(1, 1, 64)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint  MaxDispatchCountPerDim = 65535;
+	const uint  PageIndex = DispatchThreadId.x + DispatchThreadId.y * MaxDispatchCountPerDim;
+	const uint3 PageCoord = IndexToCoord(PageIndex, PageCountResolution);
+
+	const uint  InPageResolution = PageResolution >> SourceMip;
+	const uint OutPageResolution = PageResolution >> TargetMip;
+	const uint TotalVoxelPerOutPageResolution = OutPageResolution * OutPageResolution * OutPageResolution;
+	const uint VoxelIndex = DispatchThreadId.z;
+	if (VoxelIndex >= TotalVoxelPerOutPageResolution)
+		return;
+
+	const uint3 OutVoxelCoordOffset = IndexToCoord(VoxelIndex, OutPageResolution);
+	const uint3  InVoxelCoordOffset = OutVoxelCoordOffset << 1;
+
+	const uint3 OutVoxelCoord = PageCoord * OutPageResolution + OutVoxelCoordOffset;
+	const uint3  InVoxelCoord = PageCoord *  InPageResolution +  InVoxelCoordOffset;
+
+	const uint3 InVoxelCoord0 = InVoxelCoord;
+	const uint3 InVoxelCoord1 = InVoxelCoord0 + uint3(1, 0, 0);
+	const uint3 InVoxelCoord2 = InVoxelCoord0 + uint3(0, 1, 0);
+	const uint3 InVoxelCoord3 = InVoxelCoord0 + uint3(1, 1, 0);
+	const uint3 InVoxelCoord4 = InVoxelCoord0 + uint3(0, 0, 1);
+	const uint3 InVoxelCoord5 = InVoxelCoord0 + uint3(1, 0, 1);
+	const uint3 InVoxelCoord6 = InVoxelCoord0 + uint3(0, 1, 1);
+	const uint3 InVoxelCoord7 = InVoxelCoord0 + uint3(1, 1, 1);
+
+	const uint RawDensity0 = InDensityTexture[InVoxelCoord0];
+	const uint RawDensity1 = InDensityTexture[InVoxelCoord1];
+	const uint RawDensity2 = InDensityTexture[InVoxelCoord2];
+	const uint RawDensity3 = InDensityTexture[InVoxelCoord3];
+	const uint RawDensity4 = InDensityTexture[InVoxelCoord4];
+	const uint RawDensity5 = InDensityTexture[InVoxelCoord5];
+	const uint RawDensity6 = InDensityTexture[InVoxelCoord6];
+	const uint RawDensity7 = InDensityTexture[InVoxelCoord7];
+
+	const uint Total = ComputeMipDensity(
+		RawDensity0,
+		RawDensity1,
+		RawDensity2,
+		RawDensity3,
+		RawDensity4,
+		RawDensity5,
+		RawDensity6,
+		RawDensity7);
+
+	OutDensityTexture[OutVoxelCoord] = Total;
+}
+#endif
+
+#if SHADER_MIP_INDIRECTARGS
+#include "HairStrandsVoxelPageCommon.ush"
+
+uint PageResolution;
+uint TargetMipIndex;
+uint DispatchGroupSize;
+
+Buffer<uint>   InIndirectArgs;
+RWBuffer<uint> OutIndirectArgs;
+
+[numthreads(1, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint MacroGroupId = DispatchThreadId.x;
+
+	const uint TargetPageResolution = PageResolution >> TargetMipIndex;
+	const uint TotalVoxelCount = TargetPageResolution * TargetPageResolution * TargetPageResolution;
+	const uint DispatchZ = ceil(TotalVoxelCount / float(DispatchGroupSize));
+
+	OutIndirectArgs[0] = InIndirectArgs[0];
+	OutIndirectArgs[1] = InIndirectArgs[1];
+	OutIndirectArgs[2] = DispatchZ;
+}
+
+#endif
+
+#if SHADER_UPDATE_PAGEINDEX
+int3 PageCountResolution;
+uint PageResolution;
+uint MipIt;
+
+Buffer<uint>	  PageIndexGlobalCounter; // Allocated page counter
+Texture3D<uint>	  DensityTexture;
+Buffer<uint>	  PageToPageIndexBuffer;
+RWBuffer<uint>	  OutPageIndexBuffer;
+RWBuffer<uint2>	  OutPageIndexOccupancyBuffer;
+
+[numthreads(1, 1, 64)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint  MaxDispatchCountPerDim = 65535;
+	const uint  PageIndex = DispatchThreadId.x + DispatchThreadId.y * MaxDispatchCountPerDim;
+	const uint3 PageCoord = IndexToCoord(PageIndex, PageCountResolution);
+
+	const uint AllocatedPageCount = PageIndexGlobalCounter[0];
+	if (PageIndex >= AllocatedPageCount)
+		return;
+
+	const uint OutPageResolution = PageResolution >> MipIt;
+	const uint TotalVoxelPerOutPageResolution = OutPageResolution * OutPageResolution * OutPageResolution;
+	const uint VoxelIndex = DispatchThreadId.z;
+	if (VoxelIndex >= TotalVoxelPerOutPageResolution)
+		return;
+
+	{
+		const uint3 OutVoxelCoordOffset = IndexToCoord(VoxelIndex, OutPageResolution);
+		const uint3 OutVoxelCoord = PageCoord * OutPageResolution + OutVoxelCoordOffset;
+
+		const uint Density = DensityTexture.Load(uint4(OutVoxelCoord, MipIt));
+		// Update the page index with invalid page index if the voxel does not contain any data.
+		// This allow to save tracing cost when evaluating the transmittance.
+		if (Density == 0)
+		{
+			const uint PageIndexOffset = PageToPageIndexBuffer[PageIndex];
+			OutPageIndexBuffer[PageIndexOffset] = INVALID_VOXEL_PAGE_INDEX;
+		}
+	}
+
+	// Fill in the occupancy table
+	{
+		const uint OccMipIt = 3; // A voxel at this mip has a size of 8x8x8
+		const uint OccPageResolution = PageResolution >> OccMipIt;
+		uint2 Occupancy = 0;
+		uint BitIndex = 0;
+		for (uint z = 0; z < 4; ++z)
+		for (uint y = 0; y < 4; ++y)
+		for (uint x = 0; x < 4; ++x)
+		{
+			const uint3 OutVoxelCoord = PageCoord * OccPageResolution + uint3(x,y,z);
+			const uint Density = DensityTexture.Load(uint4(OutVoxelCoord, OccMipIt));
+			if (Density > 0)
+			{
+				if (BitIndex < 32)
+					Occupancy.x = Occupancy.x | (1 << BitIndex);
+				else
+					Occupancy.y = Occupancy.y | (1 << (BitIndex-32));
+			}
+			++BitIndex;
+		}
+		const uint PageIndexOffset = PageToPageIndexBuffer[PageIndex];
+		OutPageIndexOccupancyBuffer[PageIndexOffset] = Occupancy;
+	}
+}
+#endif
+

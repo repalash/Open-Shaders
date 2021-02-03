@@ -1,0 +1,146 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DBufferDecalShared.ush: Common definitions for DBuffer decals
+=============================================================================*/
+
+// all values that are output by the forward rendering pass
+struct FDBufferData
+{
+	// 0..1, premultiplied with ColorOpacity
+	float3 PreMulColor;
+	// 0:opaque ..1:see through
+	float ColorOpacity;
+
+	// -1..1, premultiplied with NormalOpacity
+	float3 PreMulWorldNormal;
+	// 0:opaque ..1:see through
+	float NormalOpacity;
+
+	// 0..1, premultiplied with RoughnessOpacity
+	float PreMulRoughness;
+	// 0..1, premultiplied with RoughnessOpacity
+	float PreMulMetallic;
+	// 0..1, premultiplied with RoughnessOpacity
+	float PreMulSpecular;
+	// 0:opaque ..1:see through
+	float RoughnessOpacity;
+};
+
+/** Populates DBufferA, DBufferB, DBufferC as float4 and puts opacity in alpha for frame buffer blending */
+// @param MultiOpacity .x: Color, .y:Normal, .z:Roughness/Metallic/Specular
+void EncodeDBufferData(FGBufferData GBufferData, float3 MultiOpacity,
+	out float4 DBufferA,
+	out float4 DBufferB,
+	out float4 DBufferC)
+{
+	// UNORM 4 channel
+	DBufferA = float4(GBufferData.BaseColor, MultiOpacity.x);
+
+	// UNORM 4 channel, 128/255 represents 0
+	DBufferB = float4(GBufferData.WorldNormal * 0.5f + 128.0f/255.0f, MultiOpacity.y);
+
+	// UNORM 4 channel
+	DBufferC = float4(GBufferData.Metallic, GBufferData.Specular, GBufferData.Roughness, MultiOpacity.z);
+
+	// no need to output any data if the channel isn't used anyway (for DX10 we don't adjust the FrameBufferBlend state - it doesn't support different blend modes for different MRT)
+	{
+#if !MATERIAL_DBUFFERA
+		DBufferA = 0;
+#endif
+#if !MATERIAL_DBUFFERB
+		DBufferB = 0;
+#endif
+#if !MATERIAL_DBUFFERC
+		DBufferC = 0;
+#endif
+	}
+}
+
+/** Populates FDBufferData */
+FDBufferData DecodeDBufferData(
+	float4 DBufferA,
+	float4 DBufferB,
+	float4 DBufferC)
+{
+	FDBufferData ret;
+
+	// UNORM 4 channel
+	ret.PreMulColor = DBufferA.rgb;
+	ret.ColorOpacity = DBufferA.a;
+
+	// UNORM 4 channel, 128/255 represents 0
+	ret.PreMulWorldNormal = DBufferB.rgb * 2 - (256.0 / 255.0);
+	ret.NormalOpacity = DBufferB.a;
+
+	// UNORM 4 channel
+	ret.PreMulMetallic = DBufferC.r;
+	ret.PreMulSpecular = DBufferC.g;
+	ret.PreMulRoughness = DBufferC.b;
+	ret.RoughnessOpacity = DBufferC.a;
+
+	return ret;
+}
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+	// Share samplers to give artists more
+	#define OpaqueBasePassDBufferATextureSampler OpaqueBasePass.DBufferATextureSampler
+	#define OpaqueBasePassDBufferBTextureSampler OpaqueBasePass.DBufferATextureSampler
+	#define OpaqueBasePassDBufferCTextureSampler OpaqueBasePass.DBufferATextureSampler
+#else
+	#define OpaqueBasePassDBufferATextureSampler OpaqueBasePass.DBufferATextureSampler
+	#define OpaqueBasePassDBufferBTextureSampler OpaqueBasePass.DBufferBTextureSampler
+	#define OpaqueBasePassDBufferCTextureSampler OpaqueBasePass.DBufferCTextureSampler
+#endif
+
+#if MATERIALDECALRESPONSEMASK
+// @param UV - UV space in the DBuffer textures (BufferSize resolution)
+FDBufferData GetDBufferData(float2 UV, uint RTWriteMaskBit)
+{
+	float4 DBufferA = float4(0.0, 0.0, 0.0, 1.0);
+	float4 DBufferB = float4(0.5, 0.5, 0.5, 1.0);
+	float4 DBufferC = float4(0.0, 0.0, 0.0, 1.0);
+
+	if ((MATERIALDECALRESPONSEMASK & 0x1) && (RTWriteMaskBit & 0x1))
+	{
+		DBufferA = Texture2DSampleLevel(OpaqueBasePass.DBufferATexture, OpaqueBasePassDBufferATextureSampler, UV, 0);
+	}
+
+	if ((MATERIALDECALRESPONSEMASK & 0x2) && (RTWriteMaskBit & 0x2))
+	{
+		DBufferB = Texture2DSampleLevel(OpaqueBasePass.DBufferBTexture, OpaqueBasePassDBufferBTextureSampler, UV, 0);
+	}
+
+	if ((MATERIALDECALRESPONSEMASK & 0x4) && (RTWriteMaskBit & 0x4))
+	{
+		DBufferC = Texture2DSampleLevel(OpaqueBasePass.DBufferCTexture, OpaqueBasePassDBufferCTextureSampler, UV, 0);
+	}
+	
+	return DecodeDBufferData(DBufferA, DBufferB, DBufferC);
+}
+#endif
+
+/** Populates DBufferA, DBufferB, DBufferC as float4 and puts opacity in alpha for frame buffer blending */
+void ApplyDBufferData(
+	FDBufferData DBufferData, inout float3 WorldNormal, inout float3 SubsurfaceColor, inout float Roughness, 
+	inout float3 BaseColor, inout float Metallic, inout float Specular )
+{
+	// We normalise the normal to get smoother visual result (it helps to avoid having D_GGX explodes toward infinity, and matches DecodeGBufferData)
+	WorldNormal = normalize(WorldNormal * DBufferData.NormalOpacity + DBufferData.PreMulWorldNormal);
+
+	Roughness = Roughness * DBufferData.RoughnessOpacity + DBufferData.PreMulRoughness;
+
+	Metallic = Metallic * DBufferData.RoughnessOpacity + DBufferData.PreMulMetallic;
+	Specular = Specular * DBufferData.RoughnessOpacity + DBufferData.PreMulSpecular;
+
+	SubsurfaceColor *= DBufferData.ColorOpacity;
+
+	BaseColor = BaseColor * DBufferData.ColorOpacity + DBufferData.PreMulColor;
+}
+
+uint GetDBufferMask(in float2 ScreenPosition, in Texture2D<uint> DBufferMaskTexture)
+{
+	int2 PixelPos = int2(ScreenPosition.xy);
+	uint Mask = DBufferMaskTexture.Load( int3(PixelPos, 0) );
+	return Mask > 0 ? 0x07 : 0x00;
+}

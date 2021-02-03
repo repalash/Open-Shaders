@@ -1,0 +1,90 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+uint MurmurAdd( uint Hash, uint Element )
+{
+	Element *= 0xcc9e2d51;
+	Element = ( Element << 15 ) | ( Element >> (32 - 15) );
+	Element *= 0x1b873593;
+    
+	Hash ^= Element;
+	Hash = ( Hash << 13 ) | ( Hash >> (32 - 13) );
+	Hash = Hash * 5 + 0xe6546b64;
+	return Hash;
+}
+
+uint MurmurMix( uint Hash )
+{
+	Hash ^= Hash >> 16;
+	Hash *= 0x85ebca6b;
+	Hash ^= Hash >> 13;
+	Hash *= 0xc2b2ae35;
+	Hash ^= Hash >> 16;
+	return Hash;
+}
+
+// Linear probing hash table
+StructuredBuffer< uint >	HashTable;
+RWStructuredBuffer< uint >	RWHashTable;
+uint						HashTableSize;
+
+// Returns true if key is added for the first time.
+// Index output is the hash table bucket this key is stored in.
+bool HashTableAdd( uint Key, out uint Index )
+{
+	// Zero is reserved as invalid
+	Key++;
+
+	LOOP
+	for( Index = MurmurMix( Key );; Index++ )
+	{
+		//Index &= HashTableSize - 1;
+		Index = Index % HashTableSize;
+
+		uint StoredKey = RWHashTable[ Index ];
+		if( StoredKey != Key )
+		{
+			if( StoredKey != 0 )
+				continue;
+
+			uint PrevKey;
+			InterlockedCompareExchange( RWHashTable[ Index ], 0, Key, PrevKey );
+			
+			if( PrevKey == 0 )
+				return true;
+			else if( PrevKey != Key )
+				continue;
+		}
+
+		break;
+	}
+
+	return false;
+}
+
+// Returns true if key is found.
+// Index output is the hash table bucket this key is stored in if found.
+bool HashTableFind( uint Key, out uint Index )
+{
+	// Zero is reserved as invalid
+	Key++;
+
+	LOOP
+	for( Index = MurmurMix( Key );; Index++ )
+	{
+		//Index &= HashTableSize - 1;
+		Index = Index % HashTableSize;
+
+		uint StoredKey = HashTable[ Index ];
+		if( StoredKey != Key )
+		{
+			if( StoredKey != 0 )
+				continue;
+
+			return true;
+		}
+
+		break;
+	}
+
+	return false;
+}

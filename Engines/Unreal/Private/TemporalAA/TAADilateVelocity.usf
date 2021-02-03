@@ -1,0 +1,116 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define TILE_SIZE 8
+
+#define AA_CROSS 1
+
+
+//------------------------------------------------------- PARAMETERS
+
+Texture2D SceneDepthTexture;
+Texture2D SceneVelocityTexture;
+
+RWTexture2D<float2> DilatedVelocityOutput;
+RWTexture2D<float> ClosestDepthOutput;
+RWTexture2D<uint> PrevUseCountOutput;
+RWTexture2D<uint> PrevClosestDepthOutput;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 InputPixelPos = InputInfo_ViewportMin + DispatchThreadId;
+	
+	float2 ViewportUV = (float2(DispatchThreadId) + 0.5f) * InputInfo_ViewportSizeInverse;
+	float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+	float2 InputBufferUV = (InputPixelPos + 0.5) * InputInfo_ExtentInverse;
+
+	float DeviceZ = SceneDepthTexture[InputPixelPos].r;
+
+	float ClosestDeviceZ = DeviceZ;
+	float2 VelocityPixelOffset = float2(0.0, 0.0);
+	#if AA_CROSS
+	{
+		FindClosestDepthOffset(SceneDepthTexture, InputPixelPos, DeviceZ, AA_CROSS, /* out */ VelocityPixelOffset, /* out */ ClosestDeviceZ);
+	}
+	#endif	// AA_CROSS
+	
+	// Camera motion for pixel.
+	float2 FinalScreenVelocity = 0.0;
+
+	// Compute final screen vecocity.
+	#if 1
+	{
+		FinalScreenVelocity = ComputeStaticVelocity(ScreenPos, ClosestDeviceZ);
+
+		#if 1
+		{
+			float4 EncodedVelocity = SceneVelocityTexture[uint2(InputBufferUV * InputInfo_Extent + VelocityPixelOffset)];
+			if (EncodedVelocity.x > 0.0)
+			{
+				FinalScreenVelocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
+			}
+		}
+		#endif
+	}
+	#endif
+
+	// Scatter parallax rejection
+	#if 1
+	if (all(InputPixelPos < InputInfo_ViewportMax))
+	{
+		float2 PrevScreenPos = ScreenPos - FinalScreenVelocity;
+		float2 PrevInputBufferUV = (InputInfo_ScreenPosToViewportScale * PrevScreenPos + InputInfo_ScreenPosToViewportBias) * InputInfo_ExtentInverse;
+
+		FBilinearSampleInfos BilinearInter = GetBilinearSampleLevelInfos(PrevInputBufferUV, InputInfo_Extent, InputInfo_ExtentInverse);
+
+		UNROLL_N(4)
+		for (uint i = 0; i < 4; i++)
+		{
+			float Weight = GetSampleWeight(BilinearInter, i);
+			uint2 PixelPos = GetSamplePixelCoord(BilinearInter, i);
+
+			uint FinalAdd = uint(round(Weight * 256));
+			
+			if (all(PixelPos >= InputInfo_ViewportMin && PixelPos < InputInfo_ViewportMax))
+			{
+				InterlockedAdd(PrevUseCountOutput[PixelPos], FinalAdd);
+
+				if (FinalAdd > 0)
+				{
+					InterlockedMax(PrevClosestDepthOutput[PixelPos], f32tof16(ClosestDeviceZ));
+				}
+			}
+		}
+	}
+	#endif
+
+	Debug.rg = VelocityPixelOffset * 0.5 + 0.5;
+
+	if (all(InputPixelPos < InputInfo_ViewportMax))
+	{
+		DilatedVelocityOutput[InputPixelPos] = EncodeVelocityToTexture(float3(FinalScreenVelocity, 0.0)).xy;
+		ClosestDepthOutput[InputPixelPos] = ClosestDeviceZ;
+
+		#if DEBUG_OUTPUT
+		{
+			DebugOutput[InputPixelPos] = Debug;
+		}
+		#endif
+	}
+}

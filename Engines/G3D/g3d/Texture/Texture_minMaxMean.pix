@@ -1,0 +1,37 @@
+#version 330
+/**
+  \file data-files/shader/Texture/Texture_minMaxMean.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#expect FOUR_COMPONENTS
+uniform sampler2D   source;
+uniform int         width;
+
+
+layout(location = 0) out vec4 mn;
+layout(location = 1) out vec4 mx;
+layout(location = 2) out vec4 mean;
+
+void main() {
+    int y = int(gl_FragCoord.x);
+    mn = vec4(1.0);
+#if FOUR_COMPONENTS
+    mx = vec4(0.0); 
+#else
+    mx = vec4(0.0, 0.0, 0.0, 1.0); 
+#endif
+    mean = vec4(0.0);
+    for(int x = 0; x < width; ++x) {
+        vec4 t = texelFetch(source, ivec2(x, y), 0);
+        mean += t;
+        mx = max(mx, t);
+        mn = min(mn, t);
+    }
+    mean /= float(width);
+}
+

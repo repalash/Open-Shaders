@@ -1,0 +1,143 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+LightCommon.usf: Common utility functions for light sampling
+===============================================================================================*/
+
+#pragma once
+
+int GetLightId(FMaterialClosestHitPayload RayHitInfo)
+{
+	return -1;
+}
+
+bool IsEnvironmentLight(int LightId)
+{
+	return SceneLightsData.Type[LightId] == 0;
+}
+
+bool IsPointLight(int LightId)
+{
+	return SceneLightsData.Type[LightId] == 1;
+}
+
+bool IsDirectionalLight(int LightId)
+{
+	return SceneLightsData.Type[LightId] == 2;
+}
+
+bool IsRectLight(int LightId)
+{
+	return SceneLightsData.Type[LightId] == 3;
+}
+
+bool IsSpotLight(int LightId)
+{
+	return SceneLightsData.Type[LightId] == 4;
+}
+
+// A light is a physical light if it can be intersected by a ray.
+bool IsPhysicalLight(int LightId)
+{
+	return IsEnvironmentLight(LightId);
+}
+
+float3 GetLightUV(int LightId, RayDesc Ray, FMaterialClosestHitPayload RayHitInfo)
+{
+	float3 LightUV = 0.0;
+	if (IsEnvironmentLight(LightId))
+	{
+		LightUV = Ray.Direction;
+	}
+	return LightUV;
+}
+
+float3 GetPosition(int LightId)
+{
+	return SceneLightsData.Position[LightId];
+}
+
+float3 GetNormal(int LightId)
+{
+	return SceneLightsData.Normal[LightId];
+}
+
+float3 GetdPdu(int LightId)
+{
+	return SceneLightsData.dPdu[LightId];
+}
+
+float3 GetdPdv(int LightId)
+{
+	return SceneLightsData.dPdv[LightId];
+}
+
+float GetWidth(int LightId)
+{
+	return SceneLightsData.Dimensions[LightId].x;
+}
+
+float GetHeight(int LightId)
+{
+	return SceneLightsData.Dimensions[LightId].y;
+}
+
+float GetDepth(int LightId)
+{
+	return SceneLightsData.Dimensions[LightId].z;
+}
+
+float2 GetCosConeAngles(int LightId)
+{
+	return SceneLightsData.Dimensions[LightId].xy;
+}
+
+float3 GetColor(int LightId)
+{
+	return SceneLightsData.Color[LightId];
+}
+
+float GetRadius(int LightId)
+{
+	return SceneLightsData.Dimensions[LightId].z;
+}
+
+float GetAttenuation(int LightId)
+{
+	return SceneLightsData.Attenuation[LightId];
+}
+
+float GetRectLightBarnCosAngle(int LightId)
+{
+	return SceneLightsData.RectLightBarnCosAngle[LightId];
+}
+
+float GetRectLightBarnLength(int LightId)
+{
+	return SceneLightsData.RectLightBarnLength[LightId];
+}
+
+#ifndef USE_ATTENUATION_TERM
+	#define USE_ATTENUATION_TERM 0
+#endif
+
+float ComputeAttenuationFalloff(float Distance, float Attenuation)
+{
+#if USE_ATTENUATION_TERM
+	// Mirrors GetLocalLightAttenuation() custom attenuation controls
+	// #dxr_todo: UE-72508: encapsulate this function in a shared space
+	return Square(saturate(1.0 - Square(Square(Distance) / Square(Attenuation))));
+#else
+	return 1.0;
+#endif
+}
+
+bool HasTransmission(int LightId)
+{
+	return SceneLightsData.Flags[LightId] & 0x01;
+}
+
+uint GetLightingChannelMask(int LightId)
+{
+	return (SceneLightsData.Flags[LightId] >> 1) & 0x7;
+}

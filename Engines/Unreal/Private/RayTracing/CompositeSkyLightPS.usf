@@ -1,0 +1,21 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+
+Texture2D<float4> SkyLightTexture;
+SamplerState SkyLightTextureSampler;
+
+void CompositeSkyLightPS(
+	in noperspective float2 UV : TEXCOORD0,
+	out float4 OutColor : SV_Target0
+)
+{
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+	float3 Albedo = GBufferData.StoredBaseColor - GBufferData.StoredBaseColor * GBufferData.Metallic;
+	float4 SkyLight = SkyLightTexture.Sample(SkyLightTextureSampler, UV);
+	// Apply albedo after denoising
+	SkyLight.rgb *= Albedo;
+	OutColor = SkyLight;
+}

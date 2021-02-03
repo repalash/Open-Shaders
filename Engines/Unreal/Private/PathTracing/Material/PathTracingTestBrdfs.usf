@@ -1,0 +1,147 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingTestBrdfs.usf: BRDF tests 
+===============================================================================================*/
+
+#include "../../Montecarlo.ush"
+#include "../PathTracingDefinitions.ush"
+#include "PathTracingMaterialSampling.ush"
+#include "../Utilities/PathTracingRandomSequence.ush"
+
+
+RWStructuredBuffer<uint> ResultsBuffer;
+RWStructuredBuffer<float> FloatResultsBuffer;
+
+uint  SamplesCount;
+uint  BrdfType;
+
+
+#define TEST_NEGATIVE_BRDF_INDEX					0
+#define TEST_SAMPLED_VS_EVAL_BRDF_MISMATCH_INDEX	1
+#define TEST_NEGATIVE_PDF_INDEX						2
+#define TEST_SAMPLED_VS_PDF_MISMATCH_INDEX			3
+#define TEST_SAMPLED_VS_EVAL_PDF_MISMATCH_INDEX		4
+#define TEST_NON_SYMMETRIC_BRDF						5
+#define TEST_BRDF_AND_PDF_OK						6
+
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+
+void TestBrdfIntegrityCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint LinearIndex = DispatchThreadId.x;
+	if (LinearIndex >= SamplesCount)
+	{
+		return;
+	}
+
+	// Inputs
+	FMaterialClosestHitPayload Payload = (FMaterialClosestHitPayload) 0;
+	Payload.WorldNormal = float3(0.0, 0.0, 1.0);
+	Payload.DiffuseColor = float3(0.37, 0.37, 0.37);
+	Payload.SpecularColor = float3(0.37, 0.37, 0.37);
+	Payload.Roughness = 0.1;
+
+	RandomSequence RandSequence;
+	RandomSequence_Initialize(RandSequence, LinearIndex, 0);
+	uint DummyVariable;
+
+	float2 E = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+	float3 Wo = UniformSampleHemisphere(E).xyz;
+
+	// Outputs
+	float3 Wi;
+	float3 SampledBRDF;
+	float SampledPDF;
+	float3 EvalBRDF;
+	float3 EvalReversedBRDF;
+	float EvalPDF;
+	float PDF;
+
+	float4 RandSample = RandomSequence_GenerateSample4D(RandSequence, DummyVariable);
+
+	if (BrdfType == 0) 
+	{
+		Lambert_SampleMaterial(Payload, RandSample, Wi, SampledBRDF, SampledPDF);
+		Lambert_EvalMaterial(Wi, Payload, EvalBRDF, EvalPDF);
+		EvalReversedBRDF = EvalPDF; // Lamberts are always symmetrical, no dependent on Wi
+		PDF = Lambert_Pdf(Wi, Payload);	
+	}
+	else if (BrdfType == 1)
+	{
+		Glossy_SampleMaterial(Wo, Payload, RandSample, Wi, SampledBRDF, SampledPDF);
+		Glossy_EvalMaterial(Wo, Wi, Payload, EvalBRDF, EvalPDF);
+		Glossy_EvalMaterial(Wi, Wo, Payload, EvalReversedBRDF, EvalPDF);
+		PDF = Glossy_Pdf(Wo, Wi, Payload);
+	}
+	else
+	{
+		// Should never be here, generate invalid outgoing to trigger an error
+		Wi = float3(0.0, 0.0, 0.0); 
+		SampledBRDF = float3(0.0, 0.0, -1.0);
+		SampledPDF = float3(0.0, 0.0, -1.0);
+		EvalBRDF = float3(0.0, 0.0, -1.0);
+		EvalReversedBRDF = float3(0.0, 0.0, -1.0);
+		EvalPDF = -1.0;
+		PDF = -1.0;
+	}
+
+	float BrdfThreshold = 0.05;
+	float PdfThreshold = 0.05;
+	bool SampleOK = true;
+
+	if (any(SampledBRDF < 0.0))
+	{
+		InterlockedAdd(ResultsBuffer[TEST_NEGATIVE_BRDF_INDEX], 1);
+		SampleOK = false;
+	}
+	
+	if (any(abs(SampledBRDF - EvalBRDF) > BrdfThreshold))
+	{
+		InterlockedAdd(ResultsBuffer[TEST_SAMPLED_VS_EVAL_BRDF_MISMATCH_INDEX], 1);
+		SampleOK = false;
+	}
+
+	if (SampledPDF <= 0)
+	{
+		InterlockedAdd(ResultsBuffer[TEST_NEGATIVE_PDF_INDEX], 1);
+		SampleOK = false;
+	}
+	
+	if (abs(SampledPDF - PDF) > PdfThreshold)
+	{
+		InterlockedAdd(ResultsBuffer[TEST_SAMPLED_VS_PDF_MISMATCH_INDEX], 1);
+		SampleOK = false;
+	}
+	
+	if (abs(SampledPDF - EvalPDF) > PdfThreshold)
+	{
+		InterlockedAdd(ResultsBuffer[TEST_SAMPLED_VS_EVAL_PDF_MISMATCH_INDEX], 1);
+		SampleOK = false;
+	}
+	
+	if (any(abs(EvalBRDF - EvalReversedBRDF) > BrdfThreshold))
+	{
+		InterlockedAdd(ResultsBuffer[TEST_NON_SYMMETRIC_BRDF], 1);
+		SampleOK = false;
+	}
+	
+	if( SampleOK )
+	{
+		InterlockedAdd(ResultsBuffer[TEST_BRDF_AND_PDF_OK], 1);
+	}
+
+#if 0
+	//// Debugging
+	//if (DispatchThreadId.x == 0 && DispatchThreadId.y == 0)
+	//{
+	//	FloatResultsBuffer[0] = SampledBRDF.x;
+	//	FloatResultsBuffer[3] = EvalBRDF;
+	//}
+#endif
+}
+

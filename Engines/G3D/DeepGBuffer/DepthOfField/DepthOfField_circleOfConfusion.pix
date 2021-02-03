@@ -1,0 +1,140 @@
+/** \file DepthOfField_circleOfConfusion.pix
+
+    Stores a signed, scaled circle of confusion radius
+    into the output buffer, reading from a depth buffer or linear camera
+    space Z buffer.  Optionally packs the color buffer into the RGB channels.
+
+    Code to bind the args:
+
+    \code
+        
+    args.set("COLOR_buffer",     color);
+    args.set("DEPTH_buffer",     depth);
+    args.set("clipInfo",         camera->projection().reconstructFromDepthClipInfo());
+    args.setUniform("trimBandThickness", trimBandThickness);
+
+    args.set("nearBlurryPlaneZ", camera-nearBlurryPlaneZ());
+    args.set("nearSharpPlaneZ",  camera->nearSharpPlaneZ());
+    args.set("farSharpPlaneZ",   camera->farSharpPlaneZ());
+    args.set("farBlurryPlaneZ",  camera->farBlurryPlaneZ());
+
+    if (camera->depthOfFieldSettings().model() == DepthOfFieldModel::ARTIST) {
+
+        args.setUniform("nearBlurryPlaneZ", camera->depthOfFieldSettings().nearBlurryPlaneZ());
+        args.setUniform("nearSharpPlaneZ",  camera->depthOfFieldSettings().nearSharpPlaneZ());
+        args.setUniform("farSharpPlaneZ",   camera->depthOfFieldSettings().farSharpPlaneZ());
+        args.setUniform("farBlurryPlaneZ",  camera->depthOfFieldSettings().farBlurryPlaneZ());
+
+        const float maxRadiusFraction = 
+            max(max(camera->depthOfFieldSettings().nearBlurRadiusFraction(), camera->depthOfFieldSettings().farBlurRadiusFraction()), 0.001f);
+
+        // This is a positive number
+        const float nearNormalize =             
+            (1.0f / (camera->depthOfFieldSettings().nearBlurryPlaneZ() - camera->depthOfFieldSettings().nearSharpPlaneZ())) *
+            (camera->depthOfFieldSettings().nearBlurRadiusFraction() / maxRadiusFraction);
+        alwaysAssertM(nearNormalize >= 0.0f, "Near normalization must be a non-negative factor");
+        args.setUniform("nearNormalize", nearNormalize); 
+
+        // This is a positive number
+        const float farNormalize =             
+            (1.0f / (camera->depthOfFieldSettings().farSharpPlaneZ() - camera->depthOfFieldSettings().farBlurryPlaneZ())) *
+            (camera->depthOfFieldSettings().farBlurRadiusFraction() / maxRadiusFraction);
+        alwaysAssertM(farNormalize >= 0.0f, "Far normalization must be a non-negative factor");
+        args.setUniform("farNormalize", farNormalize);
+
+    } else {
+        const float scale = 
+            camera->imagePlanePixelsPerMeter(rd->viewport()) * camera->depthOfFieldSettings().lensRadius() / 
+            (camera->depthOfFieldSettings().focusPlaneZ() * camera->maxCircleOfConfusionRadiusPixels(color->rect2DBounds()));
+        args.setUniform("focusPlaneZ", camera->depthOfFieldSettings().focusPlaneZ());
+        args.setUniform("scale", scale);
+
+    }
+    \endcode
+*/
+#version 120 or 420 compatibility
+#include <compatibility.glsl>
+#include <reconstructFromDepth.glsl>
+
+#expect MODEL "PHYSICAL, ARTIST, or NONE"
+#expect PACK_WITH_COLOR "0 = no color buffer, 1 = read a color buffer and combine the two in the output"
+
+#define NONE 0
+#define PHYSICAL 1
+#define ARTIST 2
+
+#if MODEL != NONE
+#   ifdef CS_Z
+        uniform sampler2D   CS_Z_buffer;
+        uniform sampler2D   CS_Z_readScaleBias;
+#   else 
+        uniform sampler2D   DEPTH_buffer;
+        uniform float3      clipInfo;
+#   endif
+#endif
+
+#if PACK_WITH_COLOR
+    uniform sampler2D       COLOR_buffer;
+#endif
+
+uniform float2          writeScaleBias;
+
+/** Trim this many pixels off all sides */
+uniform int2            trimBandThickness;
+
+#if MODEL == PHYSICAL
+    uniform float       focusPlaneZ;
+    uniform float       scale;
+#elif MODEL == ARTIST
+    uniform float       nearBlurryPlaneZ;
+    uniform float       nearSharpPlaneZ;
+    uniform float       farSharpPlaneZ;
+    uniform float       farBlurryPlaneZ;
+
+    /** Scales the near-field z distance to the fraction of the maximum
+        blur radius in either field. */
+    uniform float       nearScale;
+
+    /** Scales the far-field z distance to the fraction of the maximum
+        blur radius in either field. */
+    uniform float       farScale;
+#endif
+
+#if PACK_WITH_COLOR
+#    define color        gl_FragColor.rgb
+#    define radius       gl_FragColor.a
+#else
+#    define radius       gl_FragColor.r
+#endif
+
+void main() {
+    int2 coord = int2(gl_FragCoord.xy) + trimBandThickness;
+
+#   if PACK_WITH_COLOR
+        color = texelFetch(COLOR_buffer, coord, 0).rgb;
+#   endif
+
+    float z;
+#   ifdef CS_Z
+        z = texelFetch(CS_Z_buffer, coord, 0).r * CS_Z_readScaleBias.x + CS_Z_readScaleBias.y;
+#   else
+        z = reconstructCSZ(texelFetch(DEPTH_buffer, coord, 0).r, clipInfo);
+#   endif
+
+#   if MODEL == PHYSICAL
+        radius = (z - focusPlaneZ) * scale;
+#   elif MODEL == ARTIST
+        if (z > nearSharpPlaneZ) {
+            radius    = (min(z, nearBlurryPlaneZ) - nearSharpPlaneZ) * nearScale;
+        } else if (z > farSharpPlaneZ) {
+            // In the focus field
+            radius    = 0.0;
+        } else {
+            // Produce a negative value
+            radius    = (max(z, farBlurryPlaneZ) - farSharpPlaneZ) * farScale;
+        }
+#   else
+        radius = 0.0;
+#   endif
+    radius = radius * writeScaleBias.x + writeScaleBias.y;
+}

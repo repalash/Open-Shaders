@@ -1,0 +1,43 @@
+#version 120 or 130
+/**
+  \file GuiTextureBox_2D.pix
+  \author Morgan McGuire, http://graphics.cs.williams.edu, Michael Mara
+ */
+#include <compatibility.glsl>
+#if IS_GL_TEXTURE_RECTANGLE == 1
+#extension GL_ARB_texture_rectangle : enable
+    uniform sampler2DRect tex;
+    uniform vec4          g3d_sz2D_tex;
+#else
+#   if IS_2D_ARRAY
+        uniform float layer;
+        uniform sampler2DArray tex;
+#   else
+        uniform sampler2D tex;
+#   endif
+#endif
+uniform float     adjustGamma;
+uniform mat4      colorShift;
+uniform float     bias;
+uniform float     scale;
+uniform bool      invertIntensity;
+uniform float     mipLevel;
+
+void main(void) {
+#if IS_GL_TEXTURE_RECTANGLE == 1
+    vec4 c = texture2DRect(tex, vec2(gl_TexCoord[0].xy * g3d_sz2D_tex.xy - vec2(0.5) ));
+#else
+#   if IS_2D_ARRAY        
+        vec4 c = textureLod(tex, vec3(gl_TexCoord[0].xy, layer), mipLevel);
+#   else
+        vec4 c = textureLod(tex, gl_TexCoord[0].xy, mipLevel);
+#   endif
+    
+#endif
+    c = (c + bias) * scale;
+    c = invertIntensity ? vec4(1.0 - c) : c;
+    c = colorShift * c;
+    c = max(c, vec4(0.0));
+    gl_FragColor.rgb = pow(c.rgb, vec3(adjustGamma));
+    gl_FragColor.a = 1.0;
+}

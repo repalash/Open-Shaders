@@ -1,0 +1,20 @@
+// -*- c++ -*-
+// This is the bloom input.  It is not used if there is no bloom.
+#version 120 or 420 compatibility
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include "Film_toneMap.glsl"
+
+uniform sampler2D  sourceTexture;
+uniform float4     g3d_sz2D_sourceTexture;
+uniform float      sensitivity;
+uniform int2       guardBandSize;
+
+uniform sampler2D  toneCurve;
+
+void main(void) {
+    float3 radiance = texelFetch(sourceTexture, int2(gl_TexCoord[0].st * g3d_FragCoordExtent) + guardBandSize, 0).rgb;
+    radiance = toneMap(radiance, sensitivity, toneCurve) * 2.0;
+    radiance *= smoothstep(1.5, 4.0, maxComponent(radiance));
+    gl_FragColor.rgb = radiance;
+}

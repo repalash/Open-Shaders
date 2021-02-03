@@ -1,0 +1,134 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+VisualizeSkyLightCdfPixelShader.usf: Interactive visualization of SkyLight CDFs.
+===============================================================================================*/
+
+#include "../Common.ush"
+
+uint3 Dimensions;
+Buffer<float> RowCdf;
+Buffer<float> ColumnCdf;
+Buffer<float> CubeFaceCdf;
+
+uint LinearRowCdfCoordinate(uint3 GridCoordinate)
+{
+	uint CubefaceOffset = GridCoordinate.z * Dimensions.x * Dimensions.y;
+	uint RowOffset = GridCoordinate.y * Dimensions.x;
+	return CubefaceOffset + RowOffset + GridCoordinate.x;
+}
+
+uint LinearColumnCdfCoordinate(uint2 TextureCoordinate)
+{
+	uint RowOffset = TextureCoordinate.y * Dimensions.y;
+	return RowOffset + TextureCoordinate.x;
+}
+
+// Determines regions for visualization placement
+// ---------------------------------------------
+// |          |          |    +Z    |          |
+// ---------------------------------------------
+// |    -Y    |    +Y    |    -X    |    +X    |
+// ---------------------------------------------
+// |  column  | cubeface |    -Z    |          |
+// ---------------------------------------------
+
+int GetCubeFaceFromTextureCubeRegion(int2 Region)
+{
+	if (Region.x == 3 && Region.y == 1)
+	{
+		return 0;
+	}
+	else if (Region.x == 2 && Region.y == 1)
+	{
+		return 1;
+	}
+	else if (Region.x == 1 && Region.y == 1)
+	{
+		return 2;
+	}
+	else if (Region.x == 0 && Region.y == 1)
+	{
+		return 3;
+	}
+	else if (Region.x == 2 && Region.y == 0)
+	{
+		return 4;
+	}
+	else if (Region.x == 2 && Region.y == 2)
+	{
+		return 5;
+	}
+	else
+	{
+		return -1;
+	}
+}
+
+float2 GetTextureCubeRegion(float2 UV)
+{
+	float2 Partitions = float2(4, 3);
+	return UV * Partitions;
+}
+
+void VisualizeRowCdfAsTextureCube(float2 UV, out float3 OutColor)
+{
+	float Value = 0.0;
+
+	float2 Region = GetTextureCubeRegion(UV);
+	int CubeFace = GetCubeFaceFromTextureCubeRegion(Region);
+	if (CubeFace >= 0)
+	{
+		float2 Residual = Region - uint2(Region);
+		uint3 GridCoordinate = uint3(Residual * Dimensions.xy, CubeFace);
+		Value = RowCdf[LinearRowCdfCoordinate(GridCoordinate)];
+	}
+
+	OutColor = Value;
+}
+
+void VisualizeColumnCdfAsTexture2D(float2 UV, out float3 OutColor)
+{
+	float Value = 0.0;
+
+	// Visualize in region (0, 2)
+	uint2 Region = GetTextureCubeRegion(UV);
+	if (Region.x == 0 && Region.y == 2)
+	{
+		float2 TextureCoordinate = (UV - float2(0, 0.6666)) * float2(4, 3);
+		Value = ColumnCdf[LinearColumnCdfCoordinate(TextureCoordinate * uint2(Dimensions.y, Dimensions.z))];
+	}
+	OutColor = Value;
+}
+
+void VisualizeCubeFaceCdfAsTexture2D(float2 UV, out float3 OutColor)
+{
+	float Value = 0.0;
+
+	// Visualize in region (3, 2)
+	uint2 Region = GetTextureCubeRegion(UV);
+	if (Region.x == 1 && Region.y == 2)
+	{
+		float2 TextureCoordinate = (UV - float2(0.25, 0.6666)) * float2(4, 3);
+		Value = CubeFaceCdf[TextureCoordinate.x * Dimensions.z];
+	}
+	OutColor = Value;
+}
+
+void VisualizeSkyLightCdfPS(
+	in noperspective float2 UV : TEXCOORD0,
+	out float4 OutColor : SV_Target0
+)
+{
+	float3 RowCdfColor = 0;
+	VisualizeRowCdfAsTextureCube(UV, RowCdfColor);
+
+	float3 ColumnCdfColor = 0;
+	VisualizeColumnCdfAsTexture2D(UV, ColumnCdfColor);
+
+	float3 CubeFaceCdfColor = 0;
+	VisualizeCubeFaceCdfAsTexture2D(UV, CubeFaceCdfColor);
+
+	OutColor.rgb = RowCdfColor + ColumnCdfColor + CubeFaceCdfColor;
+	OutColor.a = 1.0;
+}

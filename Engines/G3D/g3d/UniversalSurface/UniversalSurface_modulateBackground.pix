@@ -1,0 +1,71 @@
+#version 410 or 420 compatibility
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_modulateBackground.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <UniversalMaterial/UniversalMaterial.glsl>
+#include <UniversalMaterial/UniversalMaterial_sample.glsl>
+
+uniform UniversalMaterial2D material;
+	
+/** Surface position in world space */
+in vec3        wsPosition;
+
+in vec2        texCoord;
+in vec3        tan_Z;
+
+float backside = (gl_FrontFacing == g3d_InvertY) ? 1.0 : -1.0;
+
+#if HAS_NORMAL_BUMP_MAP
+#   if (PARALLAXSTEPS > 0)
+        /** Un-normalized (interpolated) tangent space eye vector */
+        in vec3     _tsE;
+#   else
+        const vec3 _tsE = vec3(0, 0, 0);
+#   endif    
+    in vec3         tan_X, tan_Y;
+#else
+    const vec3 _tsE  = vec3(0, 0, 0);
+    const vec3 tan_X = vec3(0, 0, 0);
+    const vec3 tan_Y = vec3(0, 0, 0);
+#endif
+
+#if HAS_VERTEX_COLOR
+    in Color4 vertexColor;
+#   else
+    const Color4 vertexColor = Color4(1.0);
+#endif
+
+#include <BumpMap/BumpMap.glsl>
+
+out Color3 result;
+
+void main() {
+    Vector3 wsEyePos = g3d_CameraToWorldMatrix[3].xyz;
+
+    // Eye vector
+    vec3 wsE = normalize(wsEyePos - wsPosition);
+
+    // or... (tangentToWorld * vec4(tsE, 0.0)).xyz;
+    const bool discardIfFullCoverage = false;
+    const bool discardIfZeroCoverage = true;
+    Point2 lightMapCoord = Point2(0, 0);
+    UniversalMaterialSample materialSample = sampleUniversalMaterial2D(material, wsPosition, texCoord, lightMapCoord, tan_X, tan_Y, tan_Z, normalize(_tsE), backside, discardIfZeroCoverage, discardIfFullCoverage,
+        vertexColor, ALPHA_HINT, PARALLAXSTEPS, bool(HAS_NORMAL_BUMP_MAP), bool(HAS_VERTEX_COLOR), bool(HAS_ALPHA), bool(HAS_TRANSMISSIVE), bool(HAS_EMISSIVE), NUM_LIGHTMAP_DIRECTIONS);
+
+
+    float cos_o = dot(materialSample.glossyShadingNormal, wsE);
+    Color3 F = schlickFresnel(materialSample.fresnelReflectionAtNormalIncidence, max(0.0, cos_o), materialSample.smoothness);
+    Color3 lambertianCoefficient = (1.0 - F) * materialSample.lambertianReflectivity * invPi;
+    Color3 transmissionCoefficient = materialSample.transmissionCoefficient * (Color3(1.0) - F) * (Color3(1.0) - lambertianCoefficient);
+
+    result = lerp(Color3(1.0), transmissionCoefficient, materialSample.coverage);
+}
+
+

@@ -1,0 +1,31 @@
+#version 410
+/**
+  \file data-files/shader/PointSurface/PointSurface_depthPeel.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <depthPeel.glsl>
+
+/** Need not be at the same resolution as the current depth buffer. 
+    For samples to be written, they must be at greater gl_FragCoord.z values
+    than those in this buffer.*/
+uniform sampler2D previousDepthBuffer;
+/**
+ textureSize(previousDepthBuffer) / textureSize(currentDepthBuffer)
+ */
+uniform float2    currentToPreviousScale;
+/** Minimum z distance that new faces 
+    must be beyond previousDepthBuffer to be written. */
+uniform float     minZSeparation;
+
+uniform float3    clipInfo;
+
+void main() {
+    if (isDepthPeeled(previousDepthBuffer, currentToPreviousScale, minZSeparation, gl_FragCoord.xyz, clipInfo)) {
+        discard;
+    }
+}

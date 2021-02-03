@@ -1,0 +1,189 @@
+#version 410 or 460
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_gbuffer.pix
+
+  This shader expects a prefix (GBuffer::macros() or SVO::macros()) to be attached
+  at runtime using Shader::setPremable.
+  
+  Requires BUFFER_WIDTH_MASK = width - 1 and BUFFER_WIDTH_SHIFT = log_2(width) to be
+  passed, where width is a power of 2.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+// Needed to make UniversalMaterial_sample reject zero-coverage (or partial coverage)
+// pixels
+#define UNBLENDED_PASS 1
+#if __VERSION__ > 440
+// Disabled because by the specification, this causes depth to write even when the fragment discards
+//layout(early_fragment_tests) in;
+#endif
+
+#include <compatibility.glsl>
+#include <UniversalMaterial/UniversalMaterial_writeToGBuffer.glsl>
+#include <AlphaFilter.glsl>
+
+#expect USE_DEPTH_PEEL "1 or 0"
+#expect HAS_ALPHA "1 or 0"
+#expect NUM_LIGHTMAP_DIRECTIONS "0, 1, or 3"
+#expect HAS_EMISSIVE "Boolean"
+#expect HAS_TRANSMISSIVE "Boolean"
+#expect ALPHA_HINT
+#expect HAS_NORMAL_BUMP_MAP "Boolean"
+#expect PARALLAXSTEPS "int"
+
+// Fix some problems on AMD Radeon and Intel GPUs [try MacBook Pro 2016 Windows 10]
+#if __VERSION__ < 420 || defined(G3D_INTEL)
+#   define layout(ignore)
+#endif
+
+uniform UniversalMaterial2D material;
+
+/** Do not read color attributes (except LAMBERTIAN, if an alpha test is required)
+    outside of this rectangle.  Used to implement the trim band outside of which
+    only depth is recorded. */
+uniform Point2           lowerCoord, upperCoord;
+
+#if defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    // We reproject per-pixel so that csPrevPosition can be interpolated
+    // linearly in the current frame's 3D; projecting the previous position
+    // in the vertex shader would result in a previous homogeneous value
+    // being linearly in the current time frame.
+    uniform mat4 ProjectToScreenMatrix;
+    uniform mat4 PreviousProjectToScreenMatrix;
+#else
+    mat4 ProjectToScreenMatrix;
+    mat4 PreviousProjectToScreenMatrix;
+#endif
+
+float backside = (gl_FrontFacing == g3d_InvertY) ?  1.0 : -1.0;
+
+/** Index of refraction / 24.0 */
+uniform float                           normalizedIndexOfRefraction;
+
+#if (USE_DEPTH_PEEL != 0)
+#   include <depthPeel.glsl>
+
+    /** Need not be at the same resolution as the current depth buffer. 
+        For samples to be written, they must be at greater gl_FragCoord.z values
+        than those in this buffer.*/
+    uniform sampler2D previousDepthBuffer;
+
+    /**
+     textureSize(previousDepthBuffer) / textureSize(currentDepthBuffer)
+     */
+    uniform float2    currentToPreviousScale;
+
+    /** Minimum depth buffer value distance (on [0,1]) that new faces 
+        must be beyond previousDepthBuffer to be written. */
+    uniform float     minZSeparation;
+
+    uniform float3    clipInfo;
+#endif
+
+
+/** Texture coordinate */
+layout(location=0) in Point2 texCoord;
+
+layout(location=1) in Point3 wsPosition;
+
+layout(location=2) in Vector3 tan_Z;
+
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    layout(location=7) in Point3 csPrevPosition;
+#else
+    Point3 csPrevPosition;
+#endif
+
+#if HAS_NORMAL_BUMP_MAP
+#   if (PARALLAXSTEPS > 0)
+        /** Un-normalized (interpolated) tangent space eye vector */
+        layout(location=6) in vec3     _tsE;
+#   else
+        const vec3 _tsE = vec3(0.0, 0.0, 0.0);
+#   endif    
+
+    layout(location=4)   in vec3       tan_X;
+    layout(location=5)   in vec3       tan_Y;
+
+#   include <BumpMap/BumpMap.glsl>
+
+#else
+    const vec3 tan_X = vec3(0.0, 0.0, 0.0);
+    const vec3 tan_Y = vec3(0.0, 0.0, 0.0);
+    const vec3 _tsE  = vec3(0.0, 0.0, 0.0);
+#endif
+    
+#if HAS_VERTEX_COLOR
+    layout(location=10) in vec4         vertexColor;
+#else
+    const vec4  vertexColor = vec4(0.0,0.0,0.0,0.0);
+#endif
+
+#ifdef SVO_POSITION
+    layout(location=8) in vec3          svoPosition;
+    layout(location=9) flat in  int	triangleAxis;
+#endif
+        
+
+void main() {
+    // No Lightmap support for deferred shading.
+    vec2 lightMapCoord = vec2(0.0);
+
+#   if (USE_DEPTH_PEEL != 0)
+        if (isDepthPeeled(previousDepthBuffer, currentToPreviousScale, minZSeparation, gl_FragCoord.xyz, clipInfo)) {
+            // We have to discard here to avoid writing to z, even though it causes us to lose early z tests on 2013-era hardware
+            discard;
+        }
+#   endif
+
+    // Check the color rect bounds
+    if ((gl_FragCoord.x < lowerCoord.x) ||
+        (gl_FragCoord.y < lowerCoord.y) ||
+        (gl_FragCoord.x > upperCoord.x) ||
+        (gl_FragCoord.y > upperCoord.y)) {
+        // Outside of bounds, in the guard band. Perform a fast, non-parallax alpha test if required.
+
+#       if HAS_ALPHA
+            // Don't bother with parallax--we're in a guard band
+            float alpha = texture(material.lambertian.sampler, texCoord).a * material.lambertian.readMultiplyFirst.a + material.lambertian.readAddSecond.a;
+#           if HAS_VERTEX_COLOR
+                alpha *= vertexColor.a;
+#           endif
+
+            if (alpha < 1.0) {
+                discard;
+            }
+#       endif
+
+        // Don't bother looking up attributes, just let the depth (and normal) write straight through 
+#       if defined(GBUFFER_HAS_SS_POSITION_CHANGE) || defined(GBUFFER_HAS_CS_NORMAL) || defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_WS_NORMAL)
+            UniversalMaterialSample materialSample = sampleUniversalMaterial2D(material, wsPosition, texCoord, lightMapCoord, tan_X, tan_Y, tan_Z, normalize(_tsE), backside, false, false,
+               vertexColor, ALPHA_HINT, PARALLAXSTEPS, bool(HAS_NORMAL_BUMP_MAP), false, false, false, false, NUM_LIGHTMAP_DIRECTIONS);
+
+            writeToGBuffer(materialSample, ProjectToScreenMatrix, csPrevPosition, PreviousProjectToScreenMatrix);
+#       endif
+
+        return;
+    }
+    //////////////////////// MATERIAL //////////////////////////////
+
+    bool discardIfFullCoverage = false;
+    bool discardIfZeroCoverage = true;       
+
+    UniversalMaterialSample materialSample = sampleUniversalMaterial2D(material, wsPosition, texCoord, lightMapCoord, tan_X, tan_Y, tan_Z, normalize(_tsE), backside, discardIfZeroCoverage, discardIfFullCoverage,
+        vertexColor, ALPHA_HINT, PARALLAXSTEPS, bool(HAS_NORMAL_BUMP_MAP), bool(HAS_VERTEX_COLOR), bool(HAS_ALPHA), bool(HAS_TRANSMISSIVE), bool(HAS_EMISSIVE), NUM_LIGHTMAP_DIRECTIONS);
+        
+/* TODO: take this into account here
+#       if HAS_NORMAL_BUMP_MAP
+            // normal variance -> glossy coefficient to resolve aliasing
+            if (materialSample.smoothness > 1.0) {
+                materialSample.glossy = blinnPhongExponentToSmoothness(computeToksvigGlossyExponent(smoothnessToBlinnPhongExponent(materialSample.smoothness), rawNormalLength));
+            }
+#       endif
+*/
+    writeToGBuffer(materialSample, ProjectToScreenMatrix, csPrevPosition, PreviousProjectToScreenMatrix);
+}

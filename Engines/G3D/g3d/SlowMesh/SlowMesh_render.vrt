@@ -1,0 +1,40 @@
+#version 330
+/**
+  \file data-files/shader/SlowMesh/SlowMesh_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+in vec4 g3d_Vertex;
+in vec3 g3d_Normal;
+in vec2 g3d_TexCoord0;
+in vec4 g3d_Color;
+
+out vec4 color;
+#if HAS_TEXTURE
+    out vec2             texCoord;
+#endif
+
+uniform float pointSize;
+out vec3 csNormal;
+out vec3 csPosition;
+
+void main() {
+    #if HAS_TEXTURE
+        texCoord = g3d_TexCoord0;
+    #endif
+    color         = g3d_Color;
+    gl_Position   = g3d_Vertex * g3d_ObjectToScreenMatrixTranspose;
+    csNormal      = g3d_ObjectToCameraNormalMatrix * g3d_Normal;
+    csPosition    = (g3d_ObjectToCameraMatrix * g3d_Vertex).xyz;
+
+    gl_PointSize  = pointSize / 
+#   if IS_PROJECTION    
+        max(gl_Position.z, 0.001);
+#   else
+        1;
+#   endif
+}

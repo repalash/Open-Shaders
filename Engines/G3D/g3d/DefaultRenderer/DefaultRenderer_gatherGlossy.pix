@@ -1,0 +1,53 @@
+#version 410 // -*- c++ -*-
+/** \file GIRenderer_gatherGlossy.pix */
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <reconstructFromDepth.glsl>
+
+uniform_GBuffer(gbuffer_);
+
+// Must be after GBuffer declaration
+#include <deferredHelpers.glsl>
+
+uniform sampler2D blurredReflections;
+
+uniform vec2      reflectedPositionScale;
+uniform sampler2D reflectedPosition;
+
+uniform int       mipLimit;
+
+out Radiance3     glossy;
+
+void main() {
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    Vector3 w_o;
+    UniversalMaterialSample surfel;
+    float mipLevel = 0;
+    if (readUniversalMaterialSampleFromGBuffer(C, false, true, w_o, surfel) && 
+        (sum(surfel.fresnelReflectionAtNormalIncidence) >= 0.0001)) {
+
+        // World-space position of the point seen in reflection
+        Point3 P = texelFetch(reflectedPosition, ivec2((C + 0.5) * reflectedPositionScale), 0).xyz;
+
+        // World-space position of the reflective surface
+        Point3 X = surfel.position;
+
+        float reflectionDistance = length(P - X);
+
+        Point3 cameraCenter = gbuffer_camera_frame[3];
+        Vector3 cameraZAxis = gbuffer_camera_frame[2];
+
+        float csZ = dot(X - cameraCenter, cameraZAxis);
+        float k = (1.0 - sqrt(surfel.smoothness)) * 18;
+        mipLevel = log2((k + k * reflectionDistance) / sqrt(abs(csZ)));
+        glossy = textureLod(blurredReflections, gl_FragCoord.xy / g3d_FragCoordMax.xy, clamp(mipLevel, 0, mipLimit)).rgb;
+    }
+    else {
+        glossy = vec3(0);
+    }
+
+}

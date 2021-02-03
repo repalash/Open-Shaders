@@ -1,0 +1,137 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	SimpleElementTexture2DPreviewPixelShader.hlsl: Pixel shader for previewing 2d textures and normal maps.
+=============================================================================*/
+
+#include "Common.ush"
+#include "ColorUtils.ush"
+#include "GammaCorrectionCommon.ush"
+
+#ifndef SAMPLE_VIRTUAL_TEXTURE
+#define SAMPLE_VIRTUAL_TEXTURE 0
+#endif
+
+#ifndef TEXTURE_ARRAY
+#define TEXTURE_ARRAY 0
+#endif
+
+#if SAMPLE_VIRTUAL_TEXTURE
+	#define NUM_VIRTUALTEXTURE_SAMPLES 1
+	#include "VirtualTextureCommon.ush"
+#endif
+
+#define WRITE_TO_GBUFFER (FEATURE_LEVEL >= FEATURE_LEVEL_SM4 && !FORWARD_SHADING)
+
+#if TEXTURE_ARRAY
+	Texture2DArray InTexture;
+#else
+	Texture2D InTexture;
+#endif
+
+SamplerState InTextureSampler;
+
+#if SAMPLE_VIRTUAL_TEXTURE
+Texture2D<uint4> InPageTableTexture0;
+Texture2D<uint4> InPageTableTexture1;
+uint4 VTPackedPageTableUniform[2];
+uint4 VTPackedUniform;
+#endif // SAMPLE_VIRTUAL_TEXTURE
+
+half4 TextureComponentReplicate;
+half4 TextureComponentReplicateAlpha;
+
+float4x4 ColorWeights;
+
+//x=Gamma, y=MipLevel, z=bIsNormalMap, w=VT Layer
+float4 PackedParams;
+
+#if TEXTURE_ARRAY
+float NumSlices;
+#endif
+
+void Main(
+	in float2 TextureCoordinate : TEXCOORD0,
+	in float4 Color : TEXCOORD1,
+	in float4 HitProxyId : TEXCOORD2,
+	in float4 InPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0
+#if WRITE_TO_GBUFFER
+	,out float4 OutWorldNormal : SV_Target1 
+#endif
+	)
+{
+	float Gamma = PackedParams.x;
+	float MipLevel = PackedParams.y;
+	float bIsNormalMap = PackedParams.z;
+	uint LayerIndex = (uint)PackedParams.w;
+
+	float4 FinalColor;
+	float4 Sample;
+
+#if TEXTURE_ARRAY
+	// Divide up the texture array into horizontal slices.
+	float SliceSize = 1.0 / NumSlices;
+	float SliceIndex = floor(TextureCoordinate.y / SliceSize);
+	float3 SampleCoordinates = float3(TextureCoordinate.xy, SliceIndex);
+
+	if( MipLevel >= 0.0f )
+	{
+		Sample = Texture2DArraySampleLevel(InTexture, InTextureSampler, SampleCoordinates, MipLevel);
+	}
+	else
+	{
+		Sample = Texture2DArraySample(InTexture, InTextureSampler, SampleCoordinates);
+	}
+#else //TEXTURE_ARAY
+	if( MipLevel >= 0.0f )
+	{
+#if SAMPLE_VIRTUAL_TEXTURE
+		VTPageTableResult PageTableResult = TextureLoadVirtualPageTableLevel(InPageTableTexture0, InPageTableTexture1, VTPageTableUniform_Unpack(VTPackedPageTableUniform[0], VTPackedPageTableUniform[1]), TextureCoordinate, VTADDRESSMODE_WRAP, VTADDRESSMODE_WRAP, MipLevel);
+		Sample = TextureVirtualSampleLevel( InTexture, InTextureSampler, PageTableResult, LayerIndex, VTUniform_Unpack(VTPackedUniform));
+#else
+		Sample = Texture2DSampleLevel(InTexture, InTextureSampler,TextureCoordinate,MipLevel);
+#endif
+	}
+	else
+	{
+#if SAMPLE_VIRTUAL_TEXTURE
+		VTPageTableResult PageTableResult = TextureLoadVirtualPageTableLevel(InPageTableTexture0, InPageTableTexture1, VTPageTableUniform_Unpack(VTPackedPageTableUniform[0], VTPackedPageTableUniform[1]), TextureCoordinate, VTADDRESSMODE_WRAP, VTADDRESSMODE_WRAP, 0.0f);
+		Sample = TextureVirtualSample( InTexture, InTextureSampler, PageTableResult, LayerIndex, VTUniform_Unpack(VTPackedUniform));
+#else
+		Sample = Texture2DSample(InTexture, InTextureSampler,TextureCoordinate);
+#endif
+	}
+#endif //TEXTURE_ARRAY
+
+	ReplicateChannel(Sample,TextureComponentReplicate,TextureComponentReplicateAlpha);
+
+	if( bIsNormalMap >= 0.0 )
+	{
+		const float4 Normal = UnpackNormalMap(Sample);
+		const float4 RescaledNormal = float4(Normal.xyz * 0.5 + 0.5, 1);
+		Sample = RETURN_COLOR(RescaledNormal);	
+	}
+
+	// Seperate the Color weights and use against the Base colour to detrmine the actual colour from our filter
+	FinalColor.r = dot(Sample, ColorWeights[0]);
+	FinalColor.g = dot(Sample, ColorWeights[1]);
+	FinalColor.b = dot(Sample, ColorWeights[2]);
+	FinalColor.a = dot(Sample, ColorWeights[3]);
+
+	FinalColor *= Color;
+
+	if( Gamma != 1.0 )
+	{
+		FinalColor.rgb = ApplyGammaCorrection(saturate(FinalColor.rgb), 2.2 / (1.0 / Gamma));
+	}
+	
+	FinalColor = RETURN_COLOR(FinalColor);	
+		 
+	OutColor = FinalColor;
+
+#if WRITE_TO_GBUFFER
+	// Set the G buffer bits that indicate that deferred lighting and image reflections are not enabled
+	OutWorldNormal = 0;
+#endif
+}

@@ -1,0 +1,107 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+
+#include "Common.ush"
+
+#include "ShaderDrawDebug.ush"
+
+// The shader used to render the debug element on view
+
+#if PERMUTATION_INPUT_TYPE == 0 
+StructuredBuffer<FPackedShaderDrawElement>	ShaderDrawDebugPrimitive;
+#else
+StructuredBuffer<FPackedShaderDrawElement>	LockedShaderDrawDebugPrimitive;
+#endif
+
+Texture2D<float> DepthTexture;
+int2 DepthTextureResolution;
+float2 DepthTextureInvResolution;
+SamplerState LinearSampler;
+
+#if GPU_DEBUG_RENDERING_VS 
+void ShaderDrawDebugVS(
+	in uint InstanceId : SV_InstanceID,
+	in uint VertexId : SV_VertexID,
+	out float4 Position : SV_POSITION,
+	out float4 ColorAlpha : TEXCOORD0)
+{
+#if PERMUTATION_INPUT_TYPE == 0
+	FPackedShaderDrawElement PackedLine = ShaderDrawDebugPrimitive[InstanceId];
+#else
+	FPackedShaderDrawElement PackedLine = LockedShaderDrawDebugPrimitive[InstanceId];
+#endif
+	FShaderDrawElement Line = UnpackShaderElement(PackedLine);
+
+	float4 VertexPosition = float4(VertexId == 0 ? Line.Pos0 : Line.Pos1, 1.0f);
+	float4 VertexColor = VertexId == 0 ? Line.Color0 : Line.Color1;
+
+	Position = mul(VertexPosition, View.WorldToClip);
+	ColorAlpha = VertexColor;
+}
+#endif
+
+#if GPU_DEBUG_RENDERING_PS
+void ShaderDrawDebugPS(
+	in float4 Position : SV_POSITION,
+	in float4 ColorAlpha : TEXCOORD0,
+	out float4 OutSceneColor : SV_Target0)
+{
+	uint2 PixelCoord = Position.xy;
+
+	const float2 DepthUV = float2(PixelCoord) * DepthTextureInvResolution;
+	const float Depth = DepthTexture.SampleLevel(LinearSampler, DepthUV, 0);	
+	const bool bIsHidden = Position.z < Depth; // Reverse-Z
+
+	const float ColorScale = bIsHidden ? 0.4f : 1;
+	const float CheckerboardScale = ((PixelCoord.x%2) ^ (PixelCoord.y%2)) > 0 ? 1 : 0.0;
+	const float OcclusionScale = bIsHidden ? CheckerboardScale : 1;
+	OutSceneColor = OcclusionScale * ColorAlpha * float4(ColorAlpha.aaa * ColorScale, 1.0); // Pre multiplied alpha with color scale
+}
+#endif
+
+#if GPU_DEBUG_RENDERING_CLEAR_CS
+
+RWStructuredBuffer<FPackedShaderDrawElement>	DataBuffer;
+RWBuffer<uint> IndirectBuffer;
+
+[numthreads(1, 1, 1)]
+void ShaderDrawDebugClearCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	IndirectBuffer[0] = 2;
+	IndirectBuffer[1] = 0;
+	IndirectBuffer[2] = 0;
+	IndirectBuffer[3] = 0;
+}
+#endif
+
+#if GPU_DEBUG_RENDERING_COPY_CS
+
+	#if PERMUTATION_BUFFER_TYPE == 0
+	uint NumElements;
+	StructuredBuffer<FPackedShaderDrawElement>	InStructuredBuffer;
+	RWStructuredBuffer<FPackedShaderDrawElement>	OutStructuredBuffer;
+	[numthreads(1024, 1, 1)]
+	void ShaderDrawDebugCopyCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+	{
+		const uint Index = DispatchThreadId.x;
+		if (Index < NumElements)
+		{
+			OutStructuredBuffer[Index] = InStructuredBuffer[Index];
+		}
+	}
+	#endif
+
+	#if PERMUTATION_BUFFER_TYPE == 1
+	Buffer<uint> InBuffer;
+	RWBuffer<uint> OutBuffer;
+	[numthreads(1, 1, 1)]
+	void ShaderDrawDebugCopyCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+	{
+		OutBuffer[0] = InBuffer[0];
+		OutBuffer[1] = InBuffer[1];
+		OutBuffer[2] = InBuffer[2];
+		OutBuffer[3] = InBuffer[3];
+	}
+	#endif
+
+#endif

@@ -1,0 +1,85 @@
+#version 120 or 150 compatibility or 420 compatibility // -*- c++ -*-
+#extension GL_EXT_gpu_shader4 : require
+
+#expect INPUT_HAS_MIN_SPEED "1 or 0, indicating if the input has min speed values"
+/** \file MotionBlur_tileMax.pix 
+
+    Computes the largest-magnitude velocity in the tile with corner at gl_FragCoord.xy * maxBlurRadius.
+    Invoked from MotionBlur::computeTileMax().
+
+    This is run twice, once in each dimension.  It transposes the output from the input, so it doesn't need
+    to know which pass number it is in.
+*/
+#include <compatibility.glsl>
+
+uniform sampler2D   SS_EXPRESSIVE_MOTION_buffer;
+uniform vec4        SS_EXPRESSIVE_MOTION_readMultiplyFirst;
+uniform vec4        SS_EXPRESSIVE_MOTION_readAddSecond;
+
+uniform vec4        SS_EXPRESSIVE_MOTION_writeMultiplyFirst;
+uniform vec4        SS_EXPRESSIVE_MOTION_writeAddSecond;
+
+/** Shift input pixel coordinates by this amount to compensate for the guard band */
+uniform vec2        inputShift;
+
+// Expects macro maxBlurRadius;
+
+#if __VERSION__ < 130
+#   define tileMinMax gl_FragColor
+#else
+    out float4 tileMinMax;
+#endif
+
+void main() {
+
+    float2 m = float2(0.0);
+    float largestMagnitude2 = 0.0;
+    float minSpeed = 1e6;
+
+    // Round down to the tile corner.  Note that we're only filtering in the x direction of the source,
+    // so the y dimension is unchanged. 
+    //
+    // Note the transpose relative to the input since the next pass will
+    // transpose back for a gather in the other dimension
+    int tileCornerX = int(gl_FragCoord.y) * maxBlurRadius + int(inputShift.y);
+    int tileRowY    = int(gl_FragCoord.x + inputShift.x);
+
+    // This is relative to the input
+    int maxCoordX = textureSize(SS_EXPRESSIVE_MOTION_buffer, 0).x - 1 - int(inputShift.x);
+
+    for (int offset = 0; offset < maxBlurRadius; ++offset) { 
+
+        // Point at which we're gathering from
+        int2   G = int2(clamp(tileCornerX + offset, inputShift.x, maxCoordX), tileRowY);
+
+        // Velocity at this point/tile
+        float3 temp = texelFetch(SS_EXPRESSIVE_MOTION_buffer, G, 0).xyz * SS_EXPRESSIVE_MOTION_readMultiplyFirst.xtz + SS_EXPRESSIVE_MOTION_readAddSecond.xyz;
+        float2 v_G = temp.xy;
+        float  speed = temp.z;
+
+        // Magnitude squared
+        float thisMagnitude2 = dot(v_G, v_G);
+#       if ! INPUT_HAS_MIN_SPEED
+            // Store squared; we'll compute the square root below to avoid computing
+            // that sqrt at every pixel in the gather
+            speed = thisMagnitude2;
+            // On the 2nd pass, we have a valid speed in temp.z
+#       endif
+
+        minSpeed = min(speed, minSpeed);
+
+        if (thisMagnitude2 > largestMagnitude2) {
+            // This is the new largest PSF
+            m = v_G;
+            largestMagnitude2 = thisMagnitude2;
+        }
+    }
+    
+#   if ! INPUT_HAS_MIN_SPEED
+        minSpeed = sqrt(minSpeed);
+#   endif
+
+    tileMinMax.xy = m        * SS_EXPRESSIVE_MOTION_writeMultiplyFirst.xy + SS_EXPRESSIVE_MOTION_writeAddSecond.xy;
+    tileMinMax.z  = minSpeed * SS_EXPRESSIVE_MOTION_writeMultiplyFirst.z  + SS_EXPRESSIVE_MOTION_writeAddSecond.z;
+}
+

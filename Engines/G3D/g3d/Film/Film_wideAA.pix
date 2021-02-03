@@ -1,0 +1,43 @@
+#version 330
+/**
+  \file data-files/shader/Film/Film_wideAA.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <Texture/Texture.glsl>
+
+uniform float     radius;
+uniform_Texture(sampler2D, sourceTexture_);
+//uniform int       ySign, yOffset;
+
+in vec2 g3d_TexCoord;
+out vec4 result;
+
+void main() {
+    vec2 coord = g3d_TexCoord.st;
+
+    // This explicit correction to half-pixel positions is needed when rendering to the hardware frame buffer
+    // but not when rendering to a texture.
+//    coord = (floor(coord * sourceTexture_size.xy) * vec2(1, ySign) + float2(0.5, 0.5 + float(yOffset))) * sourceTexture_invSize.xy;
+//    coord = floor(coord * sourceTexture_size.xy) * sourceTexture_invSize.xy;
+
+    // Store the negatives in zw
+    float4 offset = float4(radius * sourceTexture_invSize.xy, 0, 0);
+    offset.zw = -offset.xy;
+
+    // Average four texels
+    result.rgb = 
+        0.25 * (
+            // +, +
+            textureLod(sourceTexture_buffer, coord + offset.xy, 0).rgb + 
+            // +, -
+            textureLod(sourceTexture_buffer, coord + offset.xw, 0).rgb + 
+            // -, +
+            textureLod(sourceTexture_buffer, coord + offset.zy, 0).rgb + 
+            // -, -
+            textureLod(sourceTexture_buffer, coord + offset.zw, 0).rgb);
+}

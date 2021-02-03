@@ -1,0 +1,56 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayCounterComputeShader.usf: Ray counter for the reference path tracing
+===============================================================================================*/
+
+#include "../Common.ush"
+
+Texture2D<uint> RayCountPerPixel;
+uint2 ViewSize;
+RWBuffer<uint> TotalRayCount;
+
+groupshared uint RowRayCount[THREADGROUP_SIZE];
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+
+void RayCounterCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint2 RayCountDimensions;
+	RayCountPerPixel.GetDimensions(RayCountDimensions.x, RayCountDimensions.y);
+
+	uint RowRaysCount = 0;
+	for (uint Column = 0; Column < ViewSize.x; Column++)
+	{
+		int2 Pixel;
+		Pixel.x = Column * ViewSize.x / RayCountDimensions.x;
+		Pixel.y = DispatchThreadId.x * ViewSize.y / RayCountDimensions.y;
+
+		uint RaysPP = RayCountPerPixel.Load(uint3(Pixel, 0));
+		RowRaysCount += RaysPP;
+	}
+
+	RowRayCount[GroupThreadId.x] = RowRaysCount;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupThreadId.x == 0) 
+	{
+		for (uint Row = 1; Row < THREADGROUP_SIZE; Row++)
+		{
+			if ((DispatchThreadId.x + Row) < ViewSize.y)
+			{
+				RowRayCount[0] += RowRayCount[Row];
+			}
+		}
+
+		// Optimization note: We could call this CS in a hierarchy to optimize thread occupation
+		// but this CS is already very fast (0.01 ms in full HD) 
+		// since atomic writes only happen Vres/Numgroups (a few dozen times tipically depending on the r)
+		// Also this CS is not called every frame but only from time to time
+		InterlockedAdd(TotalRayCount[0], RowRayCount[0]);
+	}
+}

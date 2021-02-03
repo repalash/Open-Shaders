@@ -1,0 +1,689 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+#include "../Random.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define DEBUG_FALLBACK_BLENDING 0
+
+#define DEBUG_LOW_FREQUENCY_REJECTION 0
+
+#define CONFIG_CLAMP 1
+
+#define CONFIG_RESPONSIVE_STENCIL 1
+
+#define CONFIG_SAMPLES 6
+
+#define CONFIG_MANUAL_LDS_SPILL (CONFIG_COMPILE_FP16)
+
+
+//------------------------------------------------------- CONSTANTS
+
+#define TILE_SIZE 8
+
+
+//------------------------------------------------------- PARAMETERS
+
+Texture2D<taa_half3> InputSceneColorTexture;
+Texture2D<uint2> InputSceneStencilTexture;
+Texture2D<taa_half> HistoryRejectionTexture;
+
+Texture2D<float2> DilatedVelocityTexture;
+Texture2D<taa_half> ParallaxRejectionMaskTexture;
+
+float3 HistoryQuantizationError;
+float HistoryPreExposureCorrection;
+uint bCameraCut;
+
+Texture2D<taa_half3> PrevHistory_Textures_0;
+Texture2D<taa_half3> PrevHistory_Textures_1;
+Texture2D<taa_half2> PrevHistory_Textures_2;
+
+RWTexture2D<taa_half3> HistoryOutput_Textures_0;
+RWTexture2D<taa_half3> HistoryOutput_Textures_1;
+RWTexture2D<taa_half2> HistoryOutput_Textures_2;
+
+RWTexture2D<taa_half3> SceneColorOutput;
+
+
+//------------------------------------------------------- LDS
+
+groupshared taa_half4 SharedArray0[TILE_SIZE * TILE_SIZE];
+groupshared taa_half4 SharedArray1[TILE_SIZE * TILE_SIZE];
+groupshared taa_half4 SharedArray2[TILE_SIZE * TILE_SIZE];
+
+
+//------------------------------------------------------- FUNCTIONS
+
+taa_half ComputeFallbackContribution(taa_half HistoryValidity)
+{
+	return saturate((HistoryValidity - taa_half(1.0 * rcp(MAX_SAMPLE_COUNT))) * taa_half(6.0));
+}
+
+taa_half3 TransformColorForClampingBox(taa_half3 Color)
+{
+	return RGBToYCoCg(Color);
+}
+
+uint GetGroupThreadIndex(uint GroupThreadIndex)
+#if COMPILER_SUPPORTS_WAVE_ONCE
+{
+	ISOLATE
+	{
+		return WaveGetLaneIndex();
+	}
+}
+#else
+{
+	return GroupThreadIndex;
+}
+#endif
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 HistoryPixelPos = DispatchThreadId;
+	float2 ViewportUV = (float2(HistoryPixelPos) + 0.5f) * HistoryInfo_ViewportSizeInverse;
+	float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+	
+	// Pixel coordinate of the center of output pixel O in the input viewport.
+	float2 PPCo = ViewportUV * InputInfo_ViewportSize + InputJitter;
+
+	// Pixel coordinate of the center of the nearest input pixel K.
+	float2 PPCk = floor(PPCo) + 0.5;
+	
+	uint2 InputPixelPos = InputInfo_ViewportMin + uint2(PPCk);
+
+	// Fetch reprojections related informations.
+	float2 PrevScreenPos = ScreenPos;
+	taa_half ParallaxRejectionMask = taa_half(1.0);
+	taa_half LowFrequencyRejection;
+	#if 1
+	{
+		float2 EncodedVelocity = DilatedVelocityTexture[InputPixelPos];
+		ParallaxRejectionMask = ParallaxRejectionMaskTexture[InputPixelPos];
+		PrevScreenPos = ScreenPos - DecodeVelocityFromTexture(float4(EncodedVelocity, 0.0, 0.0)).xy;
+
+		float2 RejectionBilinearBufferUV = clamp(
+			PPCo * InputInfo_ExtentInverse,
+			RejectionInfo_UVViewportBilinearMin,
+			RejectionInfo_UVViewportBilinearMax);
+		
+		LowFrequencyRejection = HistoryRejectionTexture.SampleLevel(GlobalBilinearClampedSampler, RejectionBilinearBufferUV, 0);
+	}
+	#endif
+
+	float2 ScreenVelocity = ScreenPos - PrevScreenPos;
+	taa_half OutputPixelVelocity = taa_half(length(ScreenVelocity * HistoryInfo_ViewportSize));
+	
+	// Fetch wehther the pixel is responsive AA or not.
+	bool bIsResponsiveAAPixel = false;
+	#if CONFIG_RESPONSIVE_STENCIL
+	{
+		const uint kResponsiveStencilMask = 1 << 3;
+			
+		uint SceneStencilRef = InputSceneStencilTexture.Load(int3(InputPixelPos, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+		bIsResponsiveAAPixel = (SceneStencilRef & kResponsiveStencilMask) != 0;
+	}
+	#endif
+	
+	// Detect if HistoryBufferUV would be outside of the viewport.
+	bool bOffScreen = IsOffScreen(bCameraCut, PrevScreenPos, ParallaxRejectionMask);
+	
+	// Filter input scene color at predictor frequency.
+	taa_half3 FilteredInputColor;
+	taa_half3 InputMinColor;
+	taa_half3 InputMaxColor;
+	taa_half InputPixelAlignement;
+	
+	ISOLATE
+	{
+		// Vector in pixel between pixel K -> O.
+		taa_half2 dKO = taa_half2(PPCo - PPCk);
+
+		FilteredInputColor = taa_half(0.0);
+
+		taa_half FilteredInputColorWeight = taa_half(0.0);
+		
+		#if 0 // shader compiler bug :'(
+			taa_half InputToHistoryFactor = taa_half(HistoryInfo_ViewportSize.x * InputInfo_ViewportSizeInverse.x);
+			taa_half FinalInputToHistoryFactor = bOffScreen ? taa_half(1.0) : InputToHistoryFactor;
+		#else
+			float InputToHistoryFactor = float(HistoryInfo_ViewportSize.x * InputInfo_ViewportSizeInverse.x);
+			float FinalInputToHistoryFactor = bOffScreen ? float(1.0) : InputToHistoryFactor;
+		#endif
+
+		InputMinColor = taa_half(INFINITE_FLOAT);
+		InputMaxColor = taa_half(-INFINITE_FLOAT);
+
+		UNROLL
+		for (uint SampleId = 0; SampleId < CONFIG_SAMPLES; SampleId++)
+		{
+			taa_half2 PixelOffset;
+			
+			#if CONFIG_SAMPLES == 9
+			{
+				PixelOffset = taa_half2(kOffsets3x3[SampleId]);
+			}
+			#elif CONFIG_SAMPLES == 5 || CONFIG_SAMPLES == 6
+			{
+				if (SampleId == 5)
+				{
+					PixelOffset = taa_half2(SignFastInt(float2(dKO))); // TODO: taa_half
+				}
+				else
+				{
+					PixelOffset = taa_half2(kOffsets3x3[kPlusIndexes3x3[SampleId]]);
+				}
+			}
+			#else
+				#error Unknown sample count
+			#endif
+
+			//if (any(PixelOffset != 0.0))
+			//	continue;
+
+			//if (i != 4)
+			//	continue;
+
+			float2 SampleInputBufferUV = (InputInfo_ViewportMin + PPCk + PixelOffset) * InputInfo_ExtentInverse;
+			SampleInputBufferUV = clamp(SampleInputBufferUV, InputInfo_UVViewportBilinearMin, InputInfo_UVViewportBilinearMax);
+
+			taa_half3 InputColor = InputSceneColorTexture.SampleLevel(GlobalPointClampedSampler, SampleInputBufferUV, 0);
+
+			taa_half2 dPP = PixelOffset - dKO;
+			taa_half SampleSpatialWeight = ComputeSampleWeigth(FinalInputToHistoryFactor, dPP, /* MinimalContribution = */ float(0.005));
+
+			taa_half ToneWeight = HdrWeight4(InputColor);
+
+			FilteredInputColor       += (SampleSpatialWeight * ToneWeight) * InputColor;
+			FilteredInputColorWeight += (SampleSpatialWeight * ToneWeight);
+
+			InputMinColor = min(InputMinColor, TransformColorForClampingBox(InputColor));
+			InputMaxColor = max(InputMaxColor, TransformColorForClampingBox(InputColor));
+		}
+		
+		FilteredInputColor *= SafeRcp(FilteredInputColorWeight);
+
+		InputPixelAlignement = ComputeSampleWeigth(InputToHistoryFactor, dKO, /* MinimalContribution = */ float(0.0));
+	}
+		
+	// Spills to LDS to make room in VGPR for history sampling.
+	#if CONFIG_MANUAL_LDS_SPILL
+	ISOLATE
+	{
+		uint LocalGroupThreadIndex = GetGroupThreadIndex(GroupThreadIndex);
+
+		SharedArray0[LocalGroupThreadIndex] = taa_half4(FilteredInputColor, LowFrequencyRejection);
+		SharedArray1[LocalGroupThreadIndex] = taa_half4(InputMinColor, InputPixelAlignement);
+		SharedArray2[LocalGroupThreadIndex] = taa_half4(InputMaxColor, OutputPixelVelocity);
+	}
+	#endif
+	
+	// Reproject history
+	taa_half3 PrevHistoryMoment1;
+	taa_half PrevHistoryValidity;
+
+	taa_half3 PrevFallbackColor;
+	taa_half PrevFallbackWeight;
+	
+	ISOLATE
+	{
+		// Reproject history
+		taa_half3 RawHistory0 = taa_half(0);
+		taa_half3 RawHistory1 = taa_half(0);
+		taa_half2 RawHistory2 = taa_half(0);
+
+		// Sample raw history
+		{
+			float2 PrevHistoryBufferUV = (PrevHistoryInfo_ScreenPosToViewportScale * PrevScreenPos + PrevHistoryInfo_ScreenPosToViewportBias) * PrevHistoryInfo_ExtentInverse;
+			PrevHistoryBufferUV = clamp(PrevHistoryBufferUV, PrevHistoryInfo_UVViewportBilinearMin, PrevHistoryInfo_UVViewportBilinearMax);
+
+			#if 1
+			{
+				FCatmullRomSamples Samples = GetBicubic2DCatmullRomSamples(PrevHistoryBufferUV, PrevHistoryInfo_Extent, PrevHistoryInfo_ExtentInverse);
+
+				for (uint i = 0; i < Samples.Count; i++)
+				{
+					float2 SampleUV = clamp(Samples.UV[i], PrevHistoryInfo_UVViewportBilinearMin, PrevHistoryInfo_UVViewportBilinearMax);
+
+					RawHistory0 += PrevHistory_Textures_0.SampleLevel(GlobalBilinearClampedSampler, SampleUV, 0) * taa_half(Samples.Weight[i]);
+					RawHistory1 += PrevHistory_Textures_1.SampleLevel(GlobalBilinearClampedSampler, SampleUV, 0) * taa_half(Samples.Weight[i]);
+					RawHistory2 += PrevHistory_Textures_2.SampleLevel(GlobalBilinearClampedSampler, SampleUV, 0) * taa_half(Samples.Weight[i]);
+				}
+				RawHistory0 *= taa_half(Samples.FinalMultiplier);
+				RawHistory1 *= taa_half(Samples.FinalMultiplier);
+				RawHistory2 *= taa_half(Samples.FinalMultiplier);
+			}
+			#else
+			{
+				RawHistory0 = PrevHistory_Textures_0.SampleLevel(GlobalBilinearClampedSampler, PrevHistoryBufferUV, 0);
+				RawHistory1 = PrevHistory_Textures_1.SampleLevel(GlobalBilinearClampedSampler, PrevHistoryBufferUV, 0);
+				RawHistory2 = PrevHistory_Textures_2.SampleLevel(GlobalBilinearClampedSampler, PrevHistoryBufferUV, 0);
+			}
+			#endif
+
+			RawHistory0 = -min(-RawHistory0, taa_half(0.0));
+			RawHistory1 = -min(-RawHistory1, taa_half(0.0));
+			RawHistory2 = -min(-RawHistory2, taa_half(0.0));
+		}
+		
+		// Unpack history.
+		{
+			PrevFallbackColor = RawHistory0;
+			PrevFallbackWeight = RawHistory2.r;
+
+			PrevHistoryMoment1 = RawHistory1;
+			PrevHistoryValidity = RawHistory2.g;
+		}
+
+		// Correct history
+		{
+			PrevHistoryMoment1 *= taa_half(HistoryPreExposureCorrection);
+			PrevFallbackColor *= taa_half(HistoryPreExposureCorrection);
+		}
+	}
+		
+	#if CONFIG_MANUAL_LDS_SPILL
+	ISOLATE
+	{
+		uint LocalGroupThreadIndex = GetGroupThreadIndex(GroupThreadIndex);
+
+		taa_half4 RawLDS0 = SharedArray0[LocalGroupThreadIndex];
+		taa_half4 RawLDS1 = SharedArray1[LocalGroupThreadIndex];
+		taa_half4 RawLDS2 = SharedArray2[LocalGroupThreadIndex];
+
+		FilteredInputColor = RawLDS0.rgb;
+		InputMinColor = RawLDS1.rgb;
+		InputMaxColor = RawLDS2.rgb;
+		
+		LowFrequencyRejection = RawLDS0.a;
+		InputPixelAlignement = RawLDS1.a;
+		OutputPixelVelocity = RawLDS2.a;
+	}
+	#endif
+
+	// Contribute current frame input into the predictor for next frame.
+	const taa_half Histeresis = rcp(taa_half(MAX_SAMPLE_COUNT));
+	const taa_half PredictionOnlyValidity = Histeresis * taa_half(2.0);
+	
+	// Clamp fallback
+	taa_half LumaMin;
+	taa_half LumaMax;
+	taa_half3 ClampedFallbackColor;
+	taa_half FallbackRejection;
+	{
+		LumaMin = InputMinColor.x;
+		LumaMax = InputMaxColor.x;
+
+		taa_half3 PrevYCoCg = TransformColorForClampingBox(PrevFallbackColor);
+		taa_half3 ClampedPrevYCoCg = clamp(PrevYCoCg, InputMinColor, InputMaxColor);
+		taa_half3 InputCenterYCoCg = TransformColorForClampingBox(FilteredInputColor);
+
+		ClampedFallbackColor = YCoCgToRGB(ClampedPrevYCoCg);
+		
+		FallbackRejection = MeasureRejectionFactor(
+			PrevYCoCg, ClampedPrevYCoCg,
+			InputCenterYCoCg, InputMinColor, InputMaxColor);
+
+		//Debug.x = FallbackRejection;
+	}
+
+	#if !CONFIG_CLAMP
+	{
+		ClampedFallbackColor = PrevFallbackColor;
+		FallbackRejection = taa_half(1.0);
+		LowFrequencyRejection = taa_half(1.0);
+	}
+	#endif
+
+	// Also reject sub pixel detail low frequency if detect mid frequency changes.
+	#if 0
+	{
+		LowFrequencyRejection = min(LowFrequencyRejection, FallbackRejection);
+	}
+	#endif
+	
+	taa_half3 FinalHistoryMoment1;
+	taa_half FinalHistoryValidity;
+	{
+		// Compute how much the history needs to be rejected, based on the completeness.
+		taa_half PrevHistoryRejectionWeight = LowFrequencyRejection;
+			
+		//#if !CONFIG_CLAMP
+		//	PrevHistoryRejectionWeight = 1.0;
+		//#endif
+			
+		FLATTEN
+		if (bOffScreen)
+		{
+			PrevHistoryRejectionWeight = taa_half(0.0);
+		}
+
+		taa_half DesiredCurrentContribution = max(Histeresis * InputPixelAlignement, taa_half(0.0));
+
+		// Determine whether the the prediction based rejection was confident enough.
+		taa_half RejectionConfidentEnough = taa_half(1); // saturate(RejectionValidity * MAX_SAMPLE_COUNT - 3.0);
+
+		// Compute the newly rejected validity
+		taa_half RejectedValidity = (
+			min(PrevHistoryValidity, PredictionOnlyValidity - DesiredCurrentContribution) +
+			max(PrevHistoryValidity - PredictionOnlyValidity + DesiredCurrentContribution, taa_half(0.0)) * PrevHistoryRejectionWeight);
+
+		RejectedValidity = PrevHistoryValidity * PrevHistoryRejectionWeight;
+
+		// Compute the maximum output validity.
+		taa_half OutputValidity = (
+			clamp(RejectedValidity + DesiredCurrentContribution, taa_half(0.0), PredictionOnlyValidity) +
+			clamp(RejectedValidity + DesiredCurrentContribution * PrevHistoryRejectionWeight * RejectionConfidentEnough - PredictionOnlyValidity, 0.0, 1.0 - PredictionOnlyValidity));
+
+		FLATTEN
+		if (bIsResponsiveAAPixel)
+		{
+			OutputValidity = taa_half(0.0);
+		}
+		
+		taa_half InvPrevHistoryValidity = SafeRcp(PrevHistoryValidity);
+
+		taa_half PrevMomentWeight = max(OutputValidity - DesiredCurrentContribution, taa_half(0.0));
+		taa_half CurrentMomentWeight = min(DesiredCurrentContribution, OutputValidity);
+		
+		#if 1
+		{
+			taa_half PrevHistoryToneWeight = HdrWeightY(Luma4(PrevHistoryMoment1) * InvPrevHistoryValidity);
+			taa_half FilteredInputToneWeight = HdrWeight4(FilteredInputColor);
+			
+			taa_half BlendPrevHistory = PrevMomentWeight * PrevHistoryToneWeight;
+			taa_half BlendFilteredInput = CurrentMomentWeight * FilteredInputToneWeight;
+
+			taa_half CommonWeight = OutputValidity * SafeRcp(BlendPrevHistory + BlendFilteredInput);
+
+			FinalHistoryMoment1 = (
+				PrevHistoryMoment1 * (CommonWeight * BlendPrevHistory * InvPrevHistoryValidity) +
+				FilteredInputColor * (CommonWeight * BlendFilteredInput));
+		}
+		#else
+		{
+			FinalHistoryMoment1 = PrevHistoryMoment1 * (PrevMomentWeight * InvPrevHistoryValidity) + FilteredInputColor * (CurrentMomentWeight);
+		}
+		#endif
+
+		// Quantize validity for the 8bit encoding an adjust to avoid numerical shift.
+		#if 0
+			FinalHistoryValidity = OutputValidity;
+		#else
+			taa_half OutputInvValidity = SafeRcp(OutputValidity);
+			FinalHistoryValidity = ceil(taa_half(255.0) * OutputValidity) * rcp(taa_half(255.0));
+			FinalHistoryMoment1 *= FinalHistoryValidity * OutputInvValidity;
+		#endif
+
+		//Debug.x = RejectionConfidentEnough;
+		//Debug.x = RejectionValidity;
+
+		#if 0 // DEBUG
+		{
+			FinalHistoryMoment1 = PrevHistoryMoment1;
+			FinalHistoryValidity = PrevHistoryValidity;
+		}
+		#endif
+	}
+
+	// Compute the fallback history
+	taa_half3 FinalFallbackColor;
+	taa_half FinalFallbackWeight;
+	{
+		const taa_half TargetHesteresisCurrentFrameWeight = rcp(taa_half(MAX_FALLBACK_SAMPLE_COUNT));
+
+		taa_half LumaHistory = Luma4(PrevFallbackColor);
+		taa_half LumaFiltered = Luma4(FilteredInputColor);
+
+		{
+			taa_half OutputBlend = ComputeFallbackContribution(FinalHistoryValidity);
+
+			//ClampedFallbackColor = lerp(ClampedFallbackColor, PrevFallbackColor, OutputBlend);
+		}
+
+		taa_half BlendFinal;
+		#if 1
+		{
+			taa_half CurrentFrameSampleCount = max(InputPixelAlignement, taa_half(0.005));
+			
+			// Use only one sample count to be extremely fast to recover in history rejection. But then stabilize imediately so sub pixel
+			// frequency can be used as soon as possible.
+			taa_half PrevFallbackSampleCount;
+			FLATTEN
+			if (PrevFallbackWeight < taa_half(1.0))
+			{
+				PrevFallbackSampleCount = PrevFallbackWeight;
+			}
+			else
+			{
+				PrevFallbackSampleCount = taa_half(MAX_FALLBACK_SAMPLE_COUNT);
+			}
+
+			// Reject the history based on the low frequencies.
+			#if 1
+			{
+				// float InvertedBlendFinal = PrevFallbackSampleCount / (CurrentFrameSampleCount + PrevFallbackSampleCount);
+				// float PrevFallbackRejectionFactor = saturate(LowFrequencyRejection / InvertedBlendFinal);
+				
+				taa_half PrevFallbackRejectionFactor = saturate(LowFrequencyRejection * (CurrentFrameSampleCount + PrevFallbackSampleCount) / PrevFallbackSampleCount);
+
+				PrevFallbackSampleCount *= PrevFallbackRejectionFactor;
+			}
+			#endif
+
+			BlendFinal = CurrentFrameSampleCount / (CurrentFrameSampleCount + PrevFallbackSampleCount);
+
+			// Increase the blending on motion
+			#if 1
+			{
+				BlendFinal = lerp(BlendFinal, max(taa_half(0.2), BlendFinal), saturate(OutputPixelVelocity * rcp(taa_half(40.0))));
+			}
+			#endif
+
+			// Antiflicker
+			#if 1
+			{
+				taa_half DistToClamp = min( abs(LumaHistory - LumaMin), abs(LumaHistory - LumaMax) ) / max3( LumaHistory, LumaFiltered, taa_half(1e-4) );
+				BlendFinal *= taa_half(0.2) + taa_half(0.8) * saturate(taa_half(0.5) * DistToClamp);
+			}
+			#endif
+			
+			// Make sure to have at least some small contribution
+			#if 1
+			{
+				BlendFinal = max( BlendFinal, saturate( taa_half(0.01) * LumaHistory / abs( LumaFiltered - LumaHistory ) ) );
+			}
+			#endif
+
+
+			//BlendFinal *= InputPixelAlignement; //, 0.05);
+
+			// Responsive forces 1/4 of new frame.
+			BlendFinal = bIsResponsiveAAPixel ? taa_half(1.0/4.0) : BlendFinal;
+
+			FLATTEN
+			if (bOffScreen)
+			{
+				PrevFallbackSampleCount = taa_half(0.0);
+				BlendFinal = taa_half(1.0);
+			}
+
+			FinalFallbackWeight = saturate(CurrentFrameSampleCount + PrevFallbackSampleCount);
+			
+			#if 1
+				FinalFallbackWeight = saturate(floor(255.0 * (CurrentFrameSampleCount + PrevFallbackSampleCount)) * rcp(255.0));
+			#endif
+		}
+		#endif
+
+		{
+			taa_half FilterWeight = HdrWeight4(FilteredInputColor);
+			taa_half ClampedHistoryWeight = HdrWeight4(ClampedFallbackColor);
+
+			#if 0 // DEBUG
+				FilterWeight = 1.0;
+				ClampedHistoryWeight = 1.0;
+			#endif
+
+			taa_half2 Weights = WeightedLerpFactors(ClampedHistoryWeight, FilterWeight, BlendFinal);
+
+			FinalFallbackColor = ClampedFallbackColor * Weights.x + FilteredInputColor * Weights.y;
+
+			//Debug.x = BlendFinal;
+		}
+	}
+
+	// Compute final output
+	taa_half3 FinalOutputColor;
+	taa_half FinalOutputValidity;
+	{
+		taa_half OutputBlend = ComputeFallbackContribution(FinalHistoryValidity);
+
+		#if 0 // DEBUG
+		{
+			if (View.GeneralPurposeTweak == 2.0)
+				OutputBlend = 0.0;
+			else if (View.GeneralPurposeTweak == 3.0)
+				OutputBlend = 1.0;
+		}
+		#elif 0 // DEBUG
+		{
+			OutputBlend = 0.0;
+		}
+		#elif 0 // DEBUG
+		{
+			OutputBlend = 1.0;
+		}
+		#endif
+
+		FinalOutputValidity = lerp(taa_half(1.0), saturate(FinalHistoryValidity), OutputBlend);
+
+		#if 1// Works arround shader compiler bug
+			taa_half3 NormalizedFinalHistoryMoment1 = taa_half3(FinalHistoryMoment1 * float(SafeRcp(FinalHistoryValidity)));
+		#else
+			taa_half3 NormalizedFinalHistoryMoment1 = FinalHistoryMoment1 * SafeRcp(FinalHistoryValidity);
+		#endif
+
+		taa_half FallbackWeight = HdrWeight4(FinalFallbackColor);
+		taa_half Moment1Weight = HdrWeight4(NormalizedFinalHistoryMoment1);
+
+		taa_half2 Weights = WeightedLerpFactors(FallbackWeight, Moment1Weight, OutputBlend);
+
+		#if DEBUG_FALLBACK_BLENDING
+			taa_half3 FallbackColor = taa_half3(1, 0.25, 0.25);
+			taa_half3 HighFrequencyColor = taa_half3(0.25, 1, 0.25);
+
+			FinalOutputColor = FinalFallbackColor * Weights.x * FallbackColor + NormalizedFinalHistoryMoment1 * Weights.y * HighFrequencyColor;
+		#elif DEBUG_LOW_FREQUENCY_REJECTION
+			taa_half3 DebugColor = lerp(taa_half3(1, 0.5, 0.5), taa_half3(0.5, 1, 0.5), LowFrequencyRejection);
+			
+			FinalOutputColor = FinalFallbackColor * Weights.x * DebugColor + NormalizedFinalHistoryMoment1 * Weights.y * DebugColor;
+		#else
+			FinalOutputColor = FinalFallbackColor * Weights.x + NormalizedFinalHistoryMoment1 * Weights.y;
+		#endif
+
+		#if 0
+		{
+			FinalOutputColor = FinalFallbackColor;
+			FinalOutputValidity = taa_half(1.0);
+		}
+		#elif 0
+		{
+			FinalOutputColor = NormalizedFinalHistoryMoment1;
+			FinalOutputValidity = FinalHistoryValidity;
+		}
+		#endif
+
+		//Debug.y = OutputBlend;
+	}
+
+	//Debug.x = abs(PrevHistoryRejectionWeight);
+	//Debug.x = abs(Rejection);
+
+
+	ISOLATE
+	{
+		uint LocalGroupThreadIndex = GetGroupThreadIndex(GroupThreadIndex);
+
+		#if 1
+			uint2 LocalHistoryPixelPos = (
+				ZOrder2D(LocalGroupThreadIndex, log2(TILE_SIZE)) +
+				GroupId * uint2(TILE_SIZE, TILE_SIZE));
+		#else
+			uint2 LocalHistoryPixelPos = HistoryPixelPos;
+		#endif
+			
+		// Output final history.
+		bool bIsValidhistoryPixel = all(LocalHistoryPixelPos < HistoryInfo_ViewportMax);
+		if (bIsValidhistoryPixel)
+		{
+			// Stocastically round up or down using the hardware RWTexture2D truncation unit to take into precision
+			// loss due to pixel format encoding.
+			#if CONFIG_ENABLE_STOCASTIC_QUANTIZATION
+			{
+				uint2 Random = Rand3DPCG16(int3(LocalHistoryPixelPos, View.StateFrameIndexMod8)).xy;
+				float2 E = Hammersley16(0, 1, Random);
+
+				FinalHistoryMoment1 += FinalHistoryMoment1 * taa_half3(E.x * HistoryQuantizationError);
+				FinalFallbackColor += FinalFallbackColor * taa_half3(E.x * HistoryQuantizationError);
+			}
+			#endif
+
+			#if 0 // Manual software mantissa truncation for debugging purposes.
+			{
+				const uint MantissaF32Bits = 23;
+				const uint MantissaF16Bits = 10;
+				const uint3 MantissaR11G11B10Bits = uint3(6, 6, 5);
+
+				//FinalFallbackColor.x = asfloat(asuint(FinalFallbackColor.x) & ((~0) << (MantissaF32Bits - MantissaR11G11B10Bits.r)));
+				//FinalFallbackColor.y = asfloat(asuint(FinalFallbackColor.y) & ((~0) << (MantissaF32Bits - MantissaR11G11B10Bits.g)));
+				//FinalFallbackColor.z = asfloat(asuint(FinalFallbackColor.z) & ((~0) << (MantissaF32Bits - MantissaR11G11B10Bits.b)));
+			}
+			#endif
+			
+			FinalFallbackColor = -min(-FinalFallbackColor, taa_half(0.0));
+			FinalHistoryMoment1 = -min(-FinalHistoryMoment1, taa_half(0.0));
+			FinalFallbackColor = min(FinalFallbackColor, taa_half(Max10BitsFloat));
+			FinalHistoryMoment1 = min(FinalHistoryMoment1, taa_half(Max10BitsFloat));
+			
+			HistoryOutput_Textures_0[LocalHistoryPixelPos] = FinalFallbackColor;
+			HistoryOutput_Textures_1[LocalHistoryPixelPos] = FinalHistoryMoment1;
+			HistoryOutput_Textures_2[LocalHistoryPixelPos] = taa_half2(FinalFallbackWeight, FinalHistoryValidity);
+
+			#if DEBUG_OUTPUT
+			{
+				DebugOutput[LocalHistoryPixelPos] = Debug;
+			}
+			#endif
+		}
+
+		// Output final scene color
+		{
+			taa_half3 OutputColor = FinalOutputColor;
+				
+			OutputColor = -min(-OutputColor, taa_half(0.0));
+			OutputColor = min(OutputColor, taa_half(Max10BitsFloat));
+
+			if (bIsValidhistoryPixel)
+			{
+				SceneColorOutput[LocalHistoryPixelPos] = OutputColor;
+			}
+		}
+	}
+}

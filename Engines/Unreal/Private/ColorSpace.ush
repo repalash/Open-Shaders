@@ -1,0 +1,190 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+
+//------------------------------------------------------------------
+// LMS
+// https://en.wikipedia.org/wiki/LMS_color_space
+//------------------------------------------------------------------
+
+static const float3x3 sRGB_2_LMS_MAT =
+{
+    17.8824,  43.5161,  4.1193,
+     3.4557,  27.1554,  3.8671,
+     0.02996,  0.18431, 1.4670,
+};
+
+static const float3x3 LMS_2_sRGB_MAT =
+{
+    0.0809,  -0.1305,   0.1167,
+   -0.0102,   0.0540,  -0.1136,
+   -0.0003,  -0.0041,   0.6935,
+};
+
+float3 sRGB_2_LMS( float3 RGB )
+{
+	return mul(sRGB_2_LMS_MAT, RGB);
+}
+
+float3 LMS_2_sRGB( float3 LMS )
+{
+	return mul(LMS_2_sRGB_MAT, LMS);
+}
+
+//------------------------------------------------------------------
+// CIE XYZ
+// https://en.wikipedia.org/wiki/CIE_1931_color_space
+//------------------------------------------------------------------
+
+static const float3x3 XYZ_2_LinearRGB_MAT =
+{
+	 3.2409699419, -1.5373831776, -0.4986107603,
+	-0.9692436363,  1.8759675015,  0.0415550574,
+	 0.0556300797, -0.2039769589,  1.0569715142,
+};
+
+static const float3x3 LinearRGB_2_XYZ_MAT =
+{
+	0.4124564, 0.3575761, 0.1804375,
+	0.2126729, 0.7151522, 0.0721750,
+	0.0193339, 0.1191920, 0.9503041,
+};
+
+float3 LinearRGB_2_XYZ( float3 LinearRGB )
+{
+	return mul(LinearRGB_2_XYZ_MAT, LinearRGB);
+}
+
+float3 XYZ_2_LinearRGB( float3 XYZ )
+{
+	return mul(XYZ_2_LinearRGB_MAT, XYZ);
+}
+
+//------------------------------------------------------------------
+// CIE LAB
+// https://en.wikipedia.org/wiki/Lab_color_space
+//------------------------------------------------------------------
+
+static const float3 XYZ_WHITE_REF_D65 = float3(95.047, 100.0, 108.883);
+static const float3 XYZ_WHITE_REF_D50 = float3(96.6797, 100.0, 82.5188);
+static const float XYZ_2_LAB_DELTA_SQUARED = 0.04280618311; // (6/29)^3
+static const float XYZ_2_LAB_DELTA_CUBED = 0.00885645167; // (6/29)^3
+
+float xyz_otherwise(float t)
+{
+	return (t / (3.0 * XYZ_2_LAB_DELTA_SQUARED)) + 4.0 / 29.0;
+}
+
+float3 LinearRGB_2_LAB( float3 LinearRGB, float3 ReferenceWhite )
+{
+	float3 XYZ = LinearRGB_2_XYZ(LinearRGB);
+
+	float t_X = XYZ.x / ReferenceWhite.x;
+	float t_Y = XYZ.y / ReferenceWhite.y;
+	float t_Z = XYZ.z / ReferenceWhite.z;
+
+	float f_X = (t_X > XYZ_2_LAB_DELTA_CUBED) ? pow(t_X, 1.0 / 3.0) : xyz_otherwise(t_X);
+	float f_Y = (t_Y > XYZ_2_LAB_DELTA_CUBED) ? pow(t_Y, 1.0 / 3.0) : xyz_otherwise(t_Y);
+	float f_Z = (t_Z > XYZ_2_LAB_DELTA_CUBED) ? pow(t_Z, 1.0 / 3.0) : xyz_otherwise(t_Z);
+
+	float L = ( 116.0 * f_Y ) - 16.0;
+	float a = 500.0 * ( f_X - f_Y );
+	float b = 200.0 * ( f_Y - f_Z );
+
+	return float3(L, a, b);
+}
+
+float lab_otherwise(float t)
+{
+	return (3.0 * XYZ_2_LAB_DELTA_SQUARED) * (t - (4.0 / 29.0));
+}
+
+float3 LAB_2_LinearRGB( float3 LAB, float3 ReferenceWhite)
+{
+	float L = LAB.x;
+	float a = LAB.y;
+	float b = LAB.z;
+
+	float t_y = (L + 16.0) / 116.0;
+	float t_x = t_y + (a / 500.0);
+	float t_z = t_y - (b / 200.0);
+
+	float f_x = pow(t_x, 3.0);
+	float f_y = pow(t_y, 3.0);
+	float f_z = pow(t_z, 3.0);
+
+	if (f_x <= XYZ_2_LAB_DELTA_CUBED)
+	{
+		f_x = lab_otherwise(t_x);
+	}
+
+	if (f_y <= XYZ_2_LAB_DELTA_CUBED)
+	{
+		f_y = lab_otherwise(t_y);
+	}
+
+	if (f_z <= XYZ_2_LAB_DELTA_CUBED)
+	{
+		f_z = lab_otherwise(t_z);
+	}
+
+	float X = ReferenceWhite.x * f_x;
+	float Y = ReferenceWhite.y * f_y;
+	float Z = ReferenceWhite.z * f_z;
+
+	return XYZ_2_LinearRGB(float3(X, Y, Z));
+}
+
+//------------------------------------------------------------------
+// YCoCg and LCoCg color space for luma / chroma orthogonal processing
+//------------------------------------------------------------------
+
+// Multiplier that get applied for ALU optimisation purposes on the luma, when converting LinearRGB to YCoCg.
+#define LINEARRGB_2_YCOCG_LUMA_MULTIPLIER 4.0
+
+float3 LinearRGB_2_YCoCg(float3 RGB)
+{
+	float Y = dot(RGB, float3(1, 2, 1));
+	float Co = dot(RGB, float3(2, 0, -2));
+	float Cg = dot(RGB, float3(-1, 2, -1));
+
+	float3 YCoCg = float3(Y, Co, Cg);
+	return YCoCg;
+}
+
+float3 YCoCg_2_LinearRGB(float3 YCoCg)
+{
+	float Y = YCoCg.x * 0.25;
+	float Co = YCoCg.y * 0.25;
+	float Cg = YCoCg.z * 0.25;
+
+	float R = Y + Co - Cg;
+	float G = Y + Cg;
+	float B = Y - Co - Cg;
+
+	float3 RGB = float3(R, G, B);
+	return RGB;
+}
+
+float3 YCoCg_2_LCoCg(float3 YCoCg)
+{
+	return float3(
+		YCoCg.x,
+		YCoCg.yz * (YCoCg.x > 0 ? rcp(YCoCg.x) : 0));
+}
+
+float3 LCoCg_2_YCoCg(float3 LCoCg)
+{
+	return float3(LCoCg.x, LCoCg.x * LCoCg.yz);
+}
+
+float3 LinearRGB_2_LCoCg(float3 RGB)
+{
+	return YCoCg_2_LCoCg(LinearRGB_2_YCoCg(RGB));
+}
+
+float3 LCoCg_2_LinearRGB(float3 LCoCg)
+{
+	return YCoCg_2_LinearRGB(LCoCg_2_YCoCg(LCoCg));
+}

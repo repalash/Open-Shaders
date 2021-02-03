@@ -1,0 +1,59 @@
+#version 120 or 420 compatibility
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_SVO.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include "UniversalSurface_vertex.glsl"
+
+#expect HAS_BONES
+
+attribute vec4 g3d_VertexColor;
+
+#if HAS_BONES > 0
+    attribute vec4      g3d_BoneWeights;
+    attribute ivec4     g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+#endif
+
+#if defined(NUM_LIGHTMAP_DIRECTIONS) && (NUM_LIGHTMAP_DIRECTIONS > 0)
+    attribute vec2 g3d_TexCoord1;
+#endif
+
+#if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+    uniform mat4x3  PreviousObjectToCameraMatrix;
+    varying layout(location=7) vec3 csPrevPosition;
+#endif
+    
+uniform float curSurfaceOffset;
+
+void main(void) {
+    // Temporary variables needed because some drivers do not allow modifying attribute variables directly
+    vec4 vertex         = g3d_Vertex;
+    vec3 normal         = g3d_Normal;
+    vec4 packedTangent  = g3d_PackedTangent;
+
+	vertex = vertex/vertex.w;
+	vertex.xyz += curSurfaceOffset*normal*3.0f;
+
+#   if HAS_BONES > 0
+        UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, vertex, normal, packedTangent);
+#   endif
+
+#   if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+        csPrevPosition = (PreviousObjectToCameraMatrix * vertex).xyz;
+#   endif
+
+
+    UniversalSurface_transform(vertex, normal, packedTangent, g3d_TexCoord0, 
+#       if defined(NUM_LIGHTMAP_DIRECTIONS) && (NUM_LIGHTMAP_DIRECTIONS > 0)
+            g3d_TexCoord1
+#       else   
+            vec2(0)
+#       endif
+			, g3d_VertexColor
+        );
+}

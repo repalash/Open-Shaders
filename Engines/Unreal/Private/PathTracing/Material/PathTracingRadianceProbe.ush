@@ -1,0 +1,304 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+PathTracingLambert.usf: Lambertian BRDF sampling functions 
+===============================================================================================*/
+#pragma once
+
+#if 1 // Cosine-weighted concentric sampling with optional guiding
+
+#ifdef LIGHTMAP_PATH_TRACING_MAIN_RG
+	#include "FirstBounceRayGuidingCommon.ush"
+#endif
+
+float4 CosineSampleHemisphereConcentric( float2 E )
+{
+	float2 d = UniformSampleDiskConcentric(E);
+	return float4(d.x, d.y, sqrt(saturate(1 - d.x * d.x - d.y * d.y)), sqrt(saturate(1 - d.x * d.x - d.y * d.y)) / PI);
+}
+
+float2 InverseConcentricMapping(float2 p)
+{
+	// Handle degeneracy at the origin
+	if (p.x == 0 && p.y == 0) return float2(0, 0);
+
+	float r = sqrt(p.x * p.x + p.y * p.y);
+	float theta = atan2(p.y, p.x);
+	if (theta < -PI/4) theta += 2*PI;
+
+	float a, b;
+	if (theta < PI / 4) // region 1
+	{
+		a = r;
+		b = theta * a / (PI/4);
+	}
+	else if (theta < 3*PI/4) // region 2
+	{
+		b = r;
+		a = -(theta - PI/2) * b / (PI/4);
+	}
+	else if (theta < 5*PI/4) // region 3
+	{
+		a = -r;
+		b = (theta - PI) * a / (PI/4);
+	}
+	else // region 4
+	{
+		b = -r;
+		a = -(theta - 3*PI/2) * b / (PI/4);
+	}
+
+	float x = (a + 1) / 2;
+	float y = (b + 1) / 2;
+
+	return float2(x, y);
+}
+
+void RadianceProbe_SampleMaterial(
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	out float3 OutDirection,
+	out float3 OutThroughput,
+	out float OutPdf)
+{
+	float PdfAdjust = 1.0f; 
+	
+#ifdef LIGHTMAP_PATH_TRACING_MAIN_RG
+#if USE_FIRST_BOUNCE_RAY_GUIDING
+	uint2 BatchedLaunchIndex = DispatchRaysIndex().xy;
+
+	uint2 LaunchIndex = uint2(BatchedLaunchIndex.x % GPreviewLightmapPhysicalTileSize, BatchedLaunchIndex.y);
+	int TileIndex = BatchedLaunchIndex.x / GPreviewLightmapPhysicalTileSize;
+
+	int2 ClusterPosition = clamp((int2)LaunchIndex - int2(2, 2), int2(0, 0), int2(63, 63)) / TEXEL_CLUSTER_SIZE;
+	
+	if (BatchedTiles[TileIndex].RenderPassIndex >= NumRayGuidingTrialSamples)
+	{
+		float LastRowPrefixSum = 0;
+		float RowPrefixSum = 0;
+		
+		int Y = 0;
+		
+		UNROLL
+		for (int y = 0; y < DIRECTIONAL_BINS_ONE_DIM; y++)
+		{
+			int2 WritePos = int2(y % 4, y / 4);
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM / 4 + WritePos;
+			
+			LastRowPrefixSum = RowPrefixSum;
+			RowPrefixSum = RayGuidingCDFY[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE / 4 + FinalPosition];
+			
+			if (RowPrefixSum > RandSample.y)
+			{
+				RandSample.y = (y + (RandSample.y - LastRowPrefixSum) / (RowPrefixSum - LastRowPrefixSum)) / DIRECTIONAL_BINS_ONE_DIM;
+				
+				PdfAdjust *= (RowPrefixSum - LastRowPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;
+				
+				Y = y;
+				
+				break;
+			}
+		}
+		
+		float LastPrefixSum = 0;
+		float PrefixSum = 0;
+		
+		UNROLL
+		for (int x = 0; x < DIRECTIONAL_BINS_ONE_DIM; x++)
+		{
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM + int2(x, Y);
+			LastPrefixSum = PrefixSum;
+			PrefixSum = RayGuidingCDFX[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE + FinalPosition];
+			
+			if (PrefixSum > RandSample.x)
+			{
+				RandSample.x = (x + (RandSample.x - LastPrefixSum) / (PrefixSum - LastPrefixSum)) / DIRECTIONAL_BINS_ONE_DIM;									
+				PdfAdjust *= (PrefixSum - LastPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;
+				break;
+			}
+		}
+	}
+#endif
+#endif
+
+	float3 N_World = GetWorldNormal(Payload);
+
+	float4 SampledValue = CosineSampleHemisphereConcentric(RandSample.xy);
+	OutDirection = TangentToWorld(SampledValue.xyz, N_World);
+
+	OutThroughput = 1.0f;
+	OutPdf = SampledValue.w * PdfAdjust;
+}
+
+float RadianceProbe_Pdf(float3 OutgoingDirection, FMaterialClosestHitPayload Payload)
+{
+	float3 N_World = GetWorldNormal(Payload);
+	
+	float PdfAdjust = 1.0f;	
+#ifdef LIGHTMAP_PATH_TRACING_MAIN_RG
+#if USE_FIRST_BOUNCE_RAY_GUIDING
+	float3 TangentDirection = WorldToTangent(OutgoingDirection, N_World);
+	float2 PrimarySample = InverseConcentricMapping(TangentDirection.xy);
+	
+	uint2 BatchedLaunchIndex = DispatchRaysIndex().xy;
+
+	uint2 LaunchIndex = uint2(BatchedLaunchIndex.x % GPreviewLightmapPhysicalTileSize, BatchedLaunchIndex.y);
+	int TileIndex = BatchedLaunchIndex.x / GPreviewLightmapPhysicalTileSize;
+
+	int2 ClusterPosition = clamp((int2)LaunchIndex - int2(2, 2), int2(0, 0), int2(63, 63)) / TEXEL_CLUSTER_SIZE;
+	
+	if (BatchedTiles[TileIndex].RenderPassIndex >= NumRayGuidingTrialSamples)
+	{
+		float LastPrefixSum = 0;
+		float PrefixSum;
+		float LastRowPrefixSum = 0;
+		float RowPrefixSum;
+		
+		int Y = floor(PrimarySample.y * DIRECTIONAL_BINS_ONE_DIM);	
+		
+		{
+			int2 WritePos = int2(Y % 4, Y / 4);
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM / 4 + WritePos;
+			
+			RowPrefixSum = RayGuidingCDFY[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE / 4 + FinalPosition];
+		}
+		
+		if (Y > 0)
+		{
+			int2 WritePos = int2((Y - 1) % 4, (Y - 1) / 4);
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM / 4 + WritePos;
+			
+			LastRowPrefixSum = RayGuidingCDFY[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE / 4 + FinalPosition];
+		}
+		
+		PdfAdjust *= (RowPrefixSum - LastRowPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;	
+		
+		int X = floor(PrimarySample.x * DIRECTIONAL_BINS_ONE_DIM);
+		
+		{
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM + int2(X, Y);
+			PrefixSum = RayGuidingCDFX[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE + FinalPosition];
+		}
+		
+		if (X > 0)
+		{
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM + int2(X - 1, Y);
+			LastPrefixSum = RayGuidingCDFX[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE + FinalPosition];
+		}
+		
+		PdfAdjust *= (PrefixSum - LastPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;
+	}
+#endif	
+#endif
+
+	float NoL = max(dot(N_World, OutgoingDirection), 0.0);
+	return (NoL / PI) * max(PdfAdjust, 0.00001f);
+}
+
+void RadianceProbe_EvalMaterial(
+	float3 OutgoingDirection,
+	FMaterialClosestHitPayload Payload,
+	out float3 OutThroughput,
+	out float OutPdf
+)
+{
+	float3 N_World = GetWorldNormal(Payload);
+	
+	float PdfAdjust = 1.0f;
+	
+#ifdef LIGHTMAP_PATH_TRACING_MAIN_RG 
+#if USE_FIRST_BOUNCE_RAY_GUIDING
+	float3 TangentDirection = WorldToTangent(OutgoingDirection, N_World);
+	float2 PrimarySample = InverseConcentricMapping(TangentDirection.xy);
+	
+	uint2 BatchedLaunchIndex = DispatchRaysIndex().xy;
+
+	uint2 LaunchIndex = uint2(BatchedLaunchIndex.x % GPreviewLightmapPhysicalTileSize, BatchedLaunchIndex.y);
+	int TileIndex = BatchedLaunchIndex.x / GPreviewLightmapPhysicalTileSize;
+
+	int2 ClusterPosition = clamp((int2)LaunchIndex - int2(2, 2), int2(0, 0), int2(63, 63)) / TEXEL_CLUSTER_SIZE;
+	
+	if (BatchedTiles[TileIndex].RenderPassIndex >= NumRayGuidingTrialSamples)
+	{
+		float LastPrefixSum = 0;
+		float PrefixSum;
+		float LastRowPrefixSum = 0;
+		float RowPrefixSum;
+		
+		int Y = floor(PrimarySample.y * DIRECTIONAL_BINS_ONE_DIM);	
+		
+		{
+			int2 WritePos = int2(Y % 4, Y / 4);
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM / 4 + WritePos;
+			
+			RowPrefixSum = RayGuidingCDFY[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE / 4 + FinalPosition];
+		}
+		
+		if (Y > 0)
+		{
+			int2 WritePos = int2((Y - 1) % 4, (Y - 1) / 4);
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM / 4 + WritePos;
+			
+			LastRowPrefixSum = RayGuidingCDFY[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE / 4 + FinalPosition];
+		}
+		
+		PdfAdjust *= (RowPrefixSum - LastRowPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;	
+		
+		int X = floor(PrimarySample.x * DIRECTIONAL_BINS_ONE_DIM);
+		
+		{
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM + int2(X, Y);
+			PrefixSum = RayGuidingCDFX[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE + FinalPosition];
+		}
+		
+		if (X > 0)
+		{
+			int2 FinalPosition = ClusterPosition * DIRECTIONAL_BINS_ONE_DIM + int2(X - 1, Y);
+			LastPrefixSum = RayGuidingCDFX[BatchedTiles[TileIndex].WorkingSetPosition / GPreviewLightmapPhysicalTileSize * CDF_TILE_SIZE + FinalPosition];
+		}
+		
+		PdfAdjust *= (PrefixSum - LastPrefixSum) * DIRECTIONAL_BINS_ONE_DIM;
+	}
+#endif	
+#endif
+	float NoL = max(dot(N_World, OutgoingDirection), 0.0);
+
+	OutPdf = NoL / PI * max(PdfAdjust, 0.00001f);
+	OutThroughput = 1.0f;
+}
+
+#else
+
+void RadianceProbe_SampleMaterial(
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	out float3 OutDirection,
+	out float3 OutThroughput,
+	out float OutPdf)
+{
+	float3 N_World = GetWorldNormal(Payload);
+
+	float4 SampledValue = UniformSampleHemisphere(RandSample.xy);
+	OutDirection = TangentToWorld(SampledValue.xyz, N_World);
+
+	OutThroughput = 1.0f;
+	OutPdf = 1.0f / (2 * PI);
+}
+
+float RadianceProbe_Pdf(float3 OutgoingDirection, FMaterialClosestHitPayload Payload)
+{
+	return 1.0f / (2 * PI);
+}
+
+void RadianceProbe_EvalMaterial(
+	float3 OutgoingDirection,
+	FMaterialClosestHitPayload Payload,
+	out float3 OutThroughput,
+	out float OutPdf
+)
+{
+	OutPdf = 1.0f / (2 * PI);
+	OutThroughput = 1.0f;
+}
+
+#endif

@@ -1,0 +1,29 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "RayTracingCommon.ush"
+
+#ifdef OVERRIDE_RAYTRACINGDEFERREDMATERIALS_USH
+#include "/Platform/Private/RayTracingDeferredMaterials.ush"
+#else // OVERRIDE_RAYTRACINGDEFERREDMATERIALS_USH
+
+struct FRayIntersectionBookmark
+{
+	uint Data[2];
+};
+
+#define TraceDeferredMaterialGatherRay(TLAS, RayFlags, InstanceInclusionMask, Ray, OutBookmark, InOutPayload){\
+	TraceRay(TLAS, RayFlags, InstanceInclusionMask, RAY_TRACING_SHADER_SLOT_MATERIAL, RAY_TRACING_NUM_SHADER_SLOTS, 0, Ray, InOutPayload);\
+	OutBookmark.Data[0] = asuint(InOutPayload.HitT);\
+	OutBookmark.Data[1] = asuint(InOutPayload.HitT);\
+}
+
+#define TraceDeferredMaterialShadingRay(TLAS, RayFlags, InstanceInclusionMask, Ray, Bookmark, InOutPayload){\
+	RayDesc BookmarkRay = Ray;\
+	BookmarkRay.TMin = asfloat(Bookmark.Data[0]) - 0.5f;\
+	BookmarkRay.TMax = asfloat(Bookmark.Data[1]) + 0.5f;\
+	TraceRay(TLAS, RayFlags, InstanceInclusionMask, RAY_TRACING_SHADER_SLOT_MATERIAL, RAY_TRACING_NUM_SHADER_SLOTS, 0, BookmarkRay, InOutPayload);\
+}
+
+#endif // OVERRIDE_RAYTRACINGDEFERREDMATERIALS_USH

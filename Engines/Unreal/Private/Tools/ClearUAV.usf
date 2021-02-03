@@ -1,0 +1,29 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+uint NumEntries;
+
+uint ClearValue;
+RWBuffer<uint> UAV;
+
+[numthreads(64, 1, 1)]
+void ClearUAVUIntCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x < NumEntries)
+	{
+		UAV[DispatchThreadId.x] = ClearValue;
+	}
+}
+
+float4 ClearValueFloat;
+RWBuffer<float4> UAVFloat;
+
+[numthreads(64, 1, 1)]
+void ClearUAVFloatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x < NumEntries)
+	{
+		UAVFloat[DispatchThreadId.x] = ClearValueFloat;
+	}
+}

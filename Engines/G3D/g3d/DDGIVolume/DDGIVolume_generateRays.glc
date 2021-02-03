@@ -1,0 +1,68 @@
+#version 430 // -*- c++ -*-
+#ifdef GL_ARB_compute_variable_group_size
+#extension GL_ARB_compute_variable_group_size : enable
+#endif
+
+#include <g3dmath.glsl>
+
+#include "../DDGIVolume/DDGIVolume.glsl"
+
+uniform DDGIVolume ddgiVolume;
+
+layout(local_size_variable) in;
+
+layout(rgba32f) uniform image2D rayOriginImage;
+layout(rgba32f) uniform image2D rayDirectionImage;
+
+layout(std430, binding = 2) restrict readonly buffer RayBlockIndexOffsetSSBO {
+    int rayBlockOffset[];
+};
+
+
+uniform int2    gridSize;
+uniform int     offset;
+
+uniform int textureWidth;
+
+// Assumed to be the x dimension of the output texture
+#expect RAYS_PER_PROBE "int"
+
+uniform mat3                    randomOrientation;
+
+void main() {
+
+    int idx = (int)gl_GlobalInvocationID.y * (int)gridSize.x + (int)gl_GlobalInvocationID.x;
+
+	int probeID = idx / RAYS_PER_PROBE;
+	int rayID   = idx % RAYS_PER_PROBE;
+
+	float3 direction = randomOrientation * sphericalFibonacci(rayID, RAYS_PER_PROBE);
+
+    int probeXY = ddgiVolume.probeCounts.x * ddgiVolume.probeCounts.y;
+
+	ivec2 probeFlagTexCoord = ivec2(probeID % probeXY, probeID / probeXY);
+	vec4 probeOffset = readProbeOffset(ddgiVolume, probeFlagTexCoord);
+
+	float rayMaxDistance = inf;
+
+    int sleepingProbes = rayBlockOffset[probeID];
+
+    // Don't generate rays for skipped probes.
+    if (sleepingProbes == -1) {
+        return;
+    }
+
+    idx -= sleepingProbes * RAYS_PER_PROBE;
+
+    // Don't bump the ray origin, as the probes cannot intersect themselves.
+    // If we bump, we risk putting rays through walls when probes are close to walls.
+    const float rayMinDistance = 0.000;
+	int finalIndex = offset + idx;
+	ivec2 texCoord = ivec2(finalIndex % textureWidth, finalIndex / textureWidth);
+
+	imageStore(rayOriginImage, texCoord, float4(probeLocation(ddgiVolume, probeID), rayMinDistance));
+	//rayOrigin[offset + idx] = float4(probeLocation(ddgiVolume, probeID), rayMinDistance);
+    
+	imageStore(rayDirectionImage, texCoord, float4(direction, rayMaxDistance));
+	//rayDirection[offset + idx] = float4(direction, rayMaxDistance);
+}

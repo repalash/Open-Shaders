@@ -1,0 +1,24 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+float3 ApplyRBF(
+	float3 RestControlPoint,
+	int InMaxSampleCount,
+	Buffer<float4> InRestSamplePositionsBuffer,
+	Buffer<float4> InMeshSampleWeightsBuffer)
+{
+	float3 ControlPoint = RestControlPoint;
+	// Apply rbf interpolation from the samples set
+	for (int i = 0; i < InMaxSampleCount; ++i)
+	{
+		const float3 PositionDelta = RestControlPoint - InRestSamplePositionsBuffer[i].xyz;
+		const float FunctionValue = sqrt(dot(PositionDelta, PositionDelta) + 1);
+		ControlPoint += FunctionValue * InMeshSampleWeightsBuffer[i].xyz;
+	}
+	ControlPoint += InMeshSampleWeightsBuffer[InMaxSampleCount].xyz;
+	ControlPoint += InMeshSampleWeightsBuffer[InMaxSampleCount + 1].xyz * RestControlPoint.x;
+	ControlPoint += InMeshSampleWeightsBuffer[InMaxSampleCount + 2].xyz * RestControlPoint.y;
+	ControlPoint += InMeshSampleWeightsBuffer[InMaxSampleCount + 3].xyz * RestControlPoint.z;
+	return ControlPoint;
+}

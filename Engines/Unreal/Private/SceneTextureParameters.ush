@@ -1,0 +1,75 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "SceneTexturesCommon.ush"
+#include "DeferredShadingCommon.ush"
+
+#if SHADING_PATH_DEFERRED
+
+#if !SUPPORTS_INDEPENDENT_SAMPLERS
+	#error Scene textures may only be used on platforms which support independent samplers.
+#endif
+
+uint bSceneLightingChannelsValid;
+
+// Matches FSceneTextureParameters
+Texture2D SceneDepthTexture;
+Texture2D<uint2> SceneStencilTexture;
+Texture2D GBufferATexture;
+Texture2D GBufferBTexture;
+Texture2D GBufferCTexture;
+Texture2D GBufferDTexture;
+Texture2D GBufferETexture;
+Texture2D GBufferVelocityTexture;
+Texture2D GBufferFTexture;
+Texture2D<uint> SceneLightingChannels;
+
+#define SceneDepthTextureSampler GlobalPointClampedSampler
+#define GBufferATextureSampler GlobalPointClampedSampler
+#define GBufferBTextureSampler GlobalPointClampedSampler
+#define GBufferCTextureSampler GlobalPointClampedSampler
+#define GBufferDTextureSampler GlobalPointClampedSampler
+#define GBufferETextureSampler GlobalPointClampedSampler
+#define GBufferFTextureSampler GlobalPointClampedSampler
+#define GBufferVelocityTextureSampler GlobalPointClampedSampler
+
+float SampleDeviceZFromSceneTextures(float2 UV)
+{
+	return SceneDepthTexture.SampleLevel(SceneDepthTextureSampler, UV, 0).r;
+}
+
+// @param UV - UV space in the GBuffer textures (BufferSize resolution)
+// TOOD: need to find a way to make this more convenient.
+FGBufferData GetGBufferDataFromSceneTextures(float2 UV, bool bGetNormalizedNormal = true)
+{
+	float4 GBufferA = GBufferATexture.SampleLevel(GBufferATextureSampler, UV, 0);
+	float4 GBufferB = GBufferBTexture.SampleLevel(GBufferBTextureSampler, UV, 0);
+	float4 GBufferC = GBufferCTexture.SampleLevel(GBufferCTextureSampler, UV, 0);
+	float4 GBufferD = GBufferDTexture.SampleLevel(GBufferDTextureSampler, UV, 0);
+	float4 GBufferE = GBufferETexture.SampleLevel(GBufferETextureSampler, UV, 0);
+	float4 GBufferF = GBufferFTexture.SampleLevel(GBufferFTextureSampler, UV, 0);
+	float4 GBufferVelocity = GBufferVelocityTexture.SampleLevel(GBufferVelocityTextureSampler, UV, 0);
+
+	uint CustomStencil = 0;
+	float CustomNativeDepth = 0;
+
+	float DeviceZ = SampleDeviceZFromSceneTextures(UV);
+
+	float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+	return DecodeGBufferData(GBufferA, GBufferB, GBufferC, GBufferD, GBufferE, GBufferF, GBufferVelocity, CustomNativeDepth, CustomStencil, SceneDepth, bGetNormalizedNormal, CheckerFromSceneColorUV(UV));
+}
+
+/** Returns the light channel mask that should be executed for this pixel. */
+uint GetSceneLightingChannel(uint2 PixelCoord)
+{
+	BRANCH
+	if (bSceneLightingChannelsValid)
+	{
+		return SceneLightingChannels.Load(uint3(PixelCoord, 0)).x;
+	}
+	return ~0;
+}
+
+#endif

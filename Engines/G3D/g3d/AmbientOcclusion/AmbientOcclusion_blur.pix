@@ -1,0 +1,328 @@
+#version 330
+/**
+  \file data-files/shader/AmbientOcclusion/AmbientOcclusion_blur.pix
+
+  \brief 7-tap 1D cross-bilateral blur using a packed depth key
+
+  DX11 HLSL port by Leonardo Zide, Treyarch
+  
+  Open Source under the "BSD" license: http://www.opensource.org/licenses/bsd-license.php
+
+  Copyright (c) 2011-2012, NVIDIA
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+  Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+  Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include "AmbientOcclusion_constants.glsl"
+#include <reconstructFromDepth.glsl>
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// Tunable Parameters:
+
+#define NUM_KEY_COMPONENTS 1
+
+// The other parameters in this section must be passed in as macro values
+
+/** Increase to make depth edges crisper. Decrease to reduce flicker. */
+//#define EDGE_SHARPNESS     (1.0)
+
+/** Step in 2-pixel intervals since we already blurred against neighbors in the
+    first AO pass.  This constant can be increased while R decreases to improve
+    performance at the expense of some dithering artifacts. 
+    
+    Morgan found that a scale of 3 left a 1-pixel checkerboard grid that was
+    unobjectionable after shading was applied but eliminated most temporal incoherence
+    from using small numbers of sample taps.
+    */
+//#define SCALE               (2)
+
+/** Filter radius in pixels. This will be multiplied by SCALE. */
+//#define R                   (4)
+
+
+#expect FAR_PLANE_Z "(negative) z-coordinate of the far plane"
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render AO. used for VR. <= 0 to disable"
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Type of data to read from source.  This macro allows
+    the same blur shader to be used on different kinds of input data. */
+#define VALUE_TYPE        float
+
+/** Swizzle to use to extract the channels of source. This macro allows
+    the same blur shader to be used on different kinds of input data. */
+#define VALUE_COMPONENTS   r
+
+#define VALUE_IS_KEY       0
+
+/** Channel encoding the bilateral key value (which must not be the same as VALUE_COMPONENTS) */
+#if NUM_KEY_COMPONENTS == 2
+#   define KEY_COMPONENTS     gb
+#else
+#   define KEY_COMPONENTS     g
+#endif
+
+uniform sampler2D   source;
+
+/** (1, 0) or (0, 1)*/
+uniform ivec2       axis;
+
+/** Used to make the blur/reconstruction relatively scale-invariant by adjusting
+    "epsilon" values and weights to the scale of the scene. */
+uniform float       invRadius;
+
+
+#define COMPUTE_PLANE_WEIGHT HIGH_QUALITY
+
+
+#if PACKED_BILATERAL_KEY == 1
+#include <AmbientOcclusion/AmbientOcclusion_packBilateralKey.glsl>
+#include <Texture/Texture.glsl>
+//uniform float nearZ;
+//uniform float farZ;
+uniform_Texture(sampler2D, packedBilateralKey_);
+out float result;
+#else
+out vec3            valueAndKey;
+#define  result         valueAndKey.VALUE_COMPONENTS
+#define  keyPassThrough valueAndKey.KEY_COMPONENTS
+#endif
+
+#if NUM_KEY_COMPONENTS == 2
+    /** Returns a number on (0, 1) */
+    float unpackKey(vec2 p) {
+        return p.x * (256.0 / 257.0) + p.y * (1.0 / 257.0);
+    }
+#else
+    /** Returns a number on (0, 1) */
+    float unpackKey(float p) {
+        return p;
+    }
+#endif
+
+uniform ProjInfo        projInfo;
+
+vec3 positionFromKey(float key, ivec2 ssC, ProjInfo pInfo) {
+    float z = key * FAR_PLANE_Z;
+    vec3 C = reconstructCSPosition(vec2(ssC) + vec2(0.5), z, pInfo);
+    return C;        
+}
+
+#ifdef normal_notNull
+    /** Same size as result buffer, do not offset by guard band when reading from it */
+    uniform sampler2D       normal_buffer;
+    uniform vec4            normal_readMultiplyFirst;
+    uniform vec4            normal_readAddSecond;
+#endif
+
+void getTapInformation(ivec2 tapLoc, out float tapKey, out VALUE_TYPE value, out vec3 tapN_C) {
+#   if PACKED_BILATERAL_KEY == 1
+        unpackBilateralKey(texelFetch(packedBilateralKey_buffer, tapLoc, 0), 0.0, FAR_PLANE_Z, tapKey, tapN_C);
+        value = texelFetch(source, tapLoc, 0).VALUE_COMPONENTS;
+#   else
+        vec4 temp = texelFetch(source, tapLoc, 0);
+        tapKey = unpackKey(temp.KEY_COMPONENTS);
+        value = temp.VALUE_COMPONENTS;
+#       ifdef normal_notNull
+            tapN_C = texelFetch(normal_buffer, tapLoc, 0).xyz;
+            tapN_C = normalize(tapN_C * normal_readMultiplyFirst.xyz + normal_readAddSecond.xyz);
+#       else
+            tapN_C = vec3(0);
+#       endif
+#   endif
+}
+
+float calculateBilateralWeight(float key, float tapKey, ivec2 tapLoc, vec3 n_C, vec3 tapN_C, vec3 C) {
+    float scale = 1.5 * invRadius;
+
+    // The "bilateral" weight. As depth difference increases, decrease weight.
+    // The key values are in scene-specific scale. To make them scale-invariant, factor in
+    // the AO radius, which should be based on the scene scale.
+    float depthWeight = max(0.0, 1.0 - (EDGE_SHARPNESS * 2000.0) * abs(tapKey - key) * scale);
+    float k_normal = 1.0;
+    float k_plane = 1.0;
+
+    // Prevents blending over creases. 
+    float normalWeight = 1.0;
+    float planeWeight = 1.0;
+
+#   if defined(normal_notNull) || (PACKED_BILATERAL_KEY == 1)
+        
+        float normalCloseness = dot(tapN_C, n_C);
+#       if (COMPUTE_PLANE_WEIGHT == 0)
+            normalCloseness = normalCloseness*normalCloseness;
+            normalCloseness = normalCloseness*normalCloseness;
+            k_normal = 4.0;
+#       endif
+        float normalError = (1.0 - normalCloseness) * k_normal;
+        normalWeight = max((1.0 - EDGE_SHARPNESS * normalError), 0.00);
+        
+#       if (COMPUTE_PLANE_WEIGHT == 1)
+            float lowDistanceThreshold2 = 0.001;
+
+            vec3 tapC = positionFromKey(tapKey, tapLoc, projInfo);
+
+            // Change in position in camera space
+            vec3 dq = C - tapC;
+                
+            // How far away is this point from the original sample
+            // in camera space? (Max value is unbounded)
+            float distance2 = dot(dq, dq);
+                
+            // How far off the expected plane (on the perpendicular) is this point?  Max value is unbounded.
+            float planeError = max(abs(dot(dq, tapN_C)), abs(dot(dq, n_C)));
+
+            // Minimum distance threshold must be scale-invariant, so factor in the radius
+            planeWeight = (distance2 * square(scale) < lowDistanceThreshold2) ? 1.0 :
+                             pow(max(0.0, 1.0 - EDGE_SHARPNESS * 2.0 * k_plane * planeError / sqrt(distance2)), 2.0);
+#       endif
+                         
+#   endif
+
+    return depthWeight * normalWeight * planeWeight;
+}
+
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            result = VALUE_TYPE(1);
+            return;
+        }
+#   endif
+    ivec2 ssC = ivec2(gl_FragCoord.xy);
+
+    vec4 temp = texelFetch(source, ssC, 0);
+    VALUE_TYPE sum = temp.VALUE_COMPONENTS;
+
+#if PACKED_BILATERAL_KEY == 1
+    float key;
+    vec3 n_C;
+    unpackBilateralKey(texelFetch(packedBilateralKey_buffer, ssC, 0), 0.0, FAR_PLANE_Z, key, n_C);
+#else
+    keyPassThrough = temp.KEY_COMPONENTS;
+    float key = unpackKey(keyPassThrough);
+    vec3 n_C;
+#   ifdef normal_notNull
+    n_C = normalize(texelFetch(normal_buffer, ssC, 0).xyz * normal_readMultiplyFirst.xyz + normal_readAddSecond.xyz);
+#   endif
+    
+#endif
+
+
+    if (key == 1.0) { 
+        // Sky pixel (if you aren't using depth keying, disable this test)
+        result = sum;
+        return;
+    }
+
+
+    
+        float gaussian[R + 1];
+//      if R == 0, we never call this shader
+#       if R == 1 
+            gaussian[0] = 0.5; gaussian[1] = 0.25;
+#       elif R == 2
+            gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649;
+#       elif R == 3 
+            gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649; gaussian[3] = 0.092902;  // stddev = 2.0
+#       elif R == 4 
+            gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649; gaussian[3] = 0.092902; gaussian[4] = 0.062970;  // stddev = 2.0
+#       elif R == 5 
+            gaussian[0] = 0.111220; gaussian[1] = 0.107798; gaussian[2] = 0.098151; gaussian[3] = 0.083953; gaussian[4] = 0.067458; gaussian[5] = 0.050920;
+#       elif R == 6
+            gaussian[0] = 0.111220; gaussian[1] = 0.107798; gaussian[2] = 0.098151; gaussian[3] = 0.083953; gaussian[4] = 0.067458; gaussian[5] = 0.050920; gaussian[6] = 0.036108;
+#       endif
+
+
+    // Base weight for depth falloff.  Increase this for more blurriness,
+    // decrease it for better edge discrimination
+    float BASE = gaussian[0];
+    float totalWeight = BASE;
+    sum *= totalWeight;
+
+
+    vec3 C = positionFromKey(key, ssC, projInfo);
+
+# if MDB_WEIGHTS==0
+    for (int r = -R; r <= R; ++r) {
+        // We already handled the zero case above.  This loop should be unrolled and the static branch optimized out,
+        // so the IF statement has no runtime cost
+        if (r != 0) {
+            ivec2 tapLoc = ssC + axis * (r * SCALE);
+            
+            
+            // spatial domain: offset gaussian tap
+            float weight = 0.3 + gaussian[abs(r)];
+
+            float tapKey;
+            VALUE_TYPE value;
+            vec3 tapN_C;
+            getTapInformation(tapLoc, tapKey, value, tapN_C);
+
+            VALUE_TYPE bilateralWeight = calculateBilateralWeight(key, tapKey, tapLoc, n_C, tapN_C, C);
+
+
+            weight *= bilateralWeight;
+            sum += value * weight;
+            totalWeight += weight;
+        }
+    }
+#else 
+
+    float lastBilateralWeight = 9999.0;
+    for (int r = -1; r >= -R; --r) {
+        ivec2 tapLoc = ssC + axis * (r * SCALE);
+
+        float tapKey;
+        VALUE_TYPE value;
+        vec3 tapN_C;
+        getTapInformation(tapLoc, tapKey, value, tapN_C);
+
+        float bilateralWeight = calculateBilateralWeight(key, tapKey, tapLoc, n_C, tapN_C, C);
+            
+        // spatial domain: offset gaussian tap
+        float weight = 0.3 + gaussian[abs(r)];
+
+        bilateralWeight = min(lastBilateralWeight, bilateralWeight);
+        lastBilateralWeight = bilateralWeight;
+        weight *= bilateralWeight;
+        sum += value * weight;
+        totalWeight += weight;
+    }
+
+    lastBilateralWeight = 9999.0;
+    for (int r = 1; r <= R; ++r) {
+        ivec2 tapLoc = ssC + axis * (r * SCALE);
+        
+        float tapKey;
+        VALUE_TYPE value;
+        vec3 tapN_C;
+        getTapInformation(tapLoc, tapKey, value, tapN_C);
+
+        float bilateralWeight = calculateBilateralWeight(key, tapKey, tapLoc, n_C, tapN_C, C);
+            
+        // spatial domain: offset gaussian tap
+        float weight = 0.3 + gaussian[abs(r)];
+
+        bilateralWeight = min(lastBilateralWeight, bilateralWeight);
+        lastBilateralWeight = bilateralWeight;
+        weight *= bilateralWeight;
+        sum += value * weight;
+        totalWeight += weight;
+    }
+#endif
+ 
+    const float epsilon = 0.0001;
+    result = sum / (totalWeight + epsilon);	
+}

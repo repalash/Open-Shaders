@@ -1,0 +1,111 @@
+// Unity built-in shader source. Copyright (c) 2016 Unity Technologies. MIT license (see license.txt)
+
+// Generic compute skinning ... with pos, norm, and tangent skinning
+
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=0
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=0 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=0 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=0 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=1
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=1 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=1 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=1 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=2
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=2 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=2 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=2 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=4
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=4 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=4 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=0 SKIN_BONESFORVERT=4 SKIN_NORM SKIN_TANG
+
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=0
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=0 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=0 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=0 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=1
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=1 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=1 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=1 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=2
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=2 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=2 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=2 SKIN_NORM SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=4
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=4 SKIN_NORM
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=4 SKIN_TANG
+#pragma kernel main USE_RAW_BUFFER=1 SKIN_BONESFORVERT=4 SKIN_NORM SKIN_TANG
+
+#include "HLSLSupport.cginc"
+#include "Internal-Skinning-Util.cginc"
+
+uint g_VertCount;
+
+SKINNING_GENERIC_VERTEX_BUFFER inVertices;
+SKINNING_GENERIC_SKIN_BUFFER inSkin;
+SKINNING_GENERIC_VERTEX_RWBUFFER outVertices;
+SAMPLER_UNIFORM StructuredBuffer<float4x4> inMatrices;
+
+[numthreads(64, 1, 1)]
+void main(uint3 threadID : SV_DispatchThreadID)
+{
+    const uint t = threadID.x;
+
+    if (t >= g_VertCount)
+    {
+        return;
+    }
+
+    const MeshVertex vert = FetchVert(inVertices, t);
+    SkinInfluence si = FetchSkin(inSkin, t);
+
+    float3 vPos = vert.pos.xyz;
+#if SKIN_NORM
+    float3 vNorm = vert.norm.xyz;
+#endif
+#if SKIN_TANG
+    float3 vTang = vert.tang.xyz;
+#endif
+
+    float3 oPos = float3(0, 0, 0);
+    float3 oNorm = float3(0, 0, 0);
+    float4 oTang = float4(0, 0, 0, 0);
+
+#if SKIN_BONESFORVERT == 0
+    uint startIndex = si.index0;
+    uint endIndex = FetchSkin(inSkin, t + 1).index0;
+    float4x4 blendedMatrix = 0;
+    for (uint i = startIndex; i < endIndex; i++)
+    {
+        uint weightAndIndex = FetchSkin(inSkin, i).index0;
+        float weight = float(weightAndIndex >> 16) * (1.0f / 65535.0f);
+        uint index = weightAndIndex & 0xFFFF;
+        blendedMatrix += inMatrices[index] * weight;
+    }
+#elif SKIN_BONESFORVERT == 1
+    const float4x4 blendedMatrix = inMatrices[si.index0];
+#elif SKIN_BONESFORVERT == 2
+    const float4x4 blendedMatrix = inMatrices[si.index0] * si.weight0 +
+                                   inMatrices[si.index1] * si.weight1;
+#elif SKIN_BONESFORVERT == 4
+    const float4x4 blendedMatrix = inMatrices[si.index0] * si.weight0 +
+                                   inMatrices[si.index1] * si.weight1 +
+                                   inMatrices[si.index2] * si.weight2 +
+                                   inMatrices[si.index3] * si.weight3;
+#endif
+
+    MeshVertex ouputVertex;
+
+    ouputVertex.pos = mul(blendedMatrix, float4(vPos, 1)).xyz;
+
+#if SKIN_NORM
+    ouputVertex.norm = mul(blendedMatrix, float4(vNorm, 0)).xyz;
+#endif
+
+#if SKIN_TANG
+    ouputVertex.tang.xyz = mul(blendedMatrix, float4(vTang, 0)).xyz;
+    ouputVertex.tang.w = vert.tang.w;
+#endif
+
+    StoreVert(outVertices, ouputVertex, t);
+}

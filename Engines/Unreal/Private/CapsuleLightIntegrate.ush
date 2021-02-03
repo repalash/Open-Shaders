@@ -1,0 +1,307 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "DeferredShadingCommon.ush"
+#include "MonteCarlo.ush"
+#include "ShadingModels.ush"
+#include "CapsuleLight.ush"
+#include "SobolRandom.ush"
+
+Texture2D DummyRectLightTextureForCapsuleCompilerWarning;
+
+// Should this be SH instead?
+float IntegrateLight( FCapsuleLight Capsule, bool bInverseSquared )
+{
+	float Falloff;
+
+	BRANCH
+	if( Capsule.Length > 0 )
+	{
+		float NoL;
+		float LineCosSubtended = 1;
+		LineIrradiance( 0, Capsule.LightPos[0], Capsule.LightPos[1], Capsule.DistBiasSqr, LineCosSubtended, Falloff, NoL );
+	}
+	else
+	{
+		float3 ToLight = Capsule.LightPos[0];
+		float DistSqr = dot( ToLight, ToLight );
+		Falloff = rcp( DistSqr + Capsule.DistBiasSqr );
+	}
+
+	Falloff = bInverseSquared ? Falloff : 1;
+
+	return Falloff;
+}
+
+FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, FCapsuleLight Capsule, FShadowTerms Shadow, bool bInverseSquared )
+{
+	float NoL;
+	float Falloff;
+	float LineCosSubtended = 1;
+
+	// Clip to horizon
+	//float NoP0 = dot( N, Capsule.LightPos[0] );
+	//float NoP1 = dot( N, Capsule.LightPos[1] );
+	//if( NoP0 < 0 ) Capsule.LightPos[0] = (  Capsule.LightPos[0] * NoP1 - Capsule.LightPos[1] * NoP0 ) / ( NoP1 - NoP0);
+	//if( NoP1 < 0 ) Capsule.LightPos[1] = ( -Capsule.LightPos[0] * NoP1 + Capsule.LightPos[1] * NoP0 ) / (-NoP1 + NoP0);
+
+	BRANCH
+	if( Capsule.Length > 0 )
+	{
+		LineIrradiance( N, Capsule.LightPos[0], Capsule.LightPos[1], Capsule.DistBiasSqr, LineCosSubtended, Falloff, NoL );
+	}
+	else
+	{
+		float DistSqr = dot( Capsule.LightPos[0], Capsule.LightPos[0] );
+		Falloff = rcp( DistSqr + Capsule.DistBiasSqr );
+
+		float3 L = Capsule.LightPos[0] * rsqrt( DistSqr );
+		NoL = dot( N, L );
+	}
+
+	if( Capsule.Radius > 0 )
+	{
+		// TODO Use capsule area?
+		float SinAlphaSqr = saturate( Pow2( Capsule.Radius ) * Falloff );
+		NoL = SphereHorizonCosWrap( NoL, SinAlphaSqr );
+	}
+
+	NoL = saturate( NoL );
+	Falloff = bInverseSquared ? Falloff : 1;
+
+	float3 ToLight = Capsule.LightPos[0];
+	if( Capsule.Length > 0 )
+	{
+		float3 R = reflect( -V, N );
+
+		#if 0
+			// Fix hard edge when ray is nearly parallel to line
+			float3 PointOnLine = ClosestPointLineToPoint( Capsule.LightPos[0], Capsule.LightPos[1], Capsule.Length );
+			float3 DirToLine = normalize( PointOnLine );
+			R = lerp( DirToLine, R, saturate( dot( DirToLine, R ) ) );
+			R = normalize( R );
+		#endif
+
+		ToLight = ClosestPointLineToRay( Capsule.LightPos[0], Capsule.LightPos[1], Capsule.Length, R );
+	}
+
+	float DistSqr = dot( ToLight, ToLight );
+	float InvDist = rsqrt( DistSqr );
+	float3 L = ToLight * InvDist;
+	
+	GBuffer.Roughness = max( GBuffer.Roughness, View.MinRoughness );
+	float a = Pow2( GBuffer.Roughness );
+    
+	FAreaLight AreaLight;
+	AreaLight.SphereSinAlpha = saturate( Capsule.Radius * InvDist * (1 - a) );
+	AreaLight.SphereSinAlphaSoft = saturate( Capsule.SoftRadius * InvDist );
+	AreaLight.LineCosSubtended = LineCosSubtended;
+	AreaLight.FalloffColor = 1;
+	AreaLight.Rect = (FRect)0;
+	AreaLight.bIsRect = false;
+	AreaLight.Texture = InitRectTexture(DummyRectLightTextureForCapsuleCompilerWarning);
+
+	return IntegrateBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow );
+}
+
+FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, FCapsuleLight Capsule, FShadowTerms Shadow, uint2 SVPos )
+{
+	FDirectLighting Lighting = (FDirectLighting)0;
+
+	Capsule.Radius = max( 1, Capsule.Radius );
+
+	const float SphereArea = (4*PI) * Pow2( Capsule.Radius );
+	const float CylinderArea = (2*PI) * Capsule.Radius * Capsule.Length;
+	const float SurfaceArea = SphereArea + CylinderArea;
+	const float SurfaceColor = 4.0 / SurfaceArea;
+
+	float3 ToLight = 0.5 * ( Capsule.LightPos[0] + Capsule.LightPos[1] );
+	float3 CapsuleAxis = normalize( Capsule.LightPos[1] - Capsule.LightPos[0] );
+
+	float DistanceSqr = dot( ToLight, ToLight );
+	float3 ConeAxis = ToLight * rsqrt( DistanceSqr );
+	float ConeCos = sqrt( 1 - Square( Capsule.Radius ) / DistanceSqr );
+
+
+	float3 ClosestPointOnAxis = ToLight - CapsuleAxis * dot( CapsuleAxis, ToLight );
+	
+	FRect Rect;
+	Rect.Origin = ToLight;
+	Rect.Axis[1] = CapsuleAxis;
+	Rect.Axis[2] = normalize( -ClosestPointOnAxis );
+	Rect.Axis[0] = cross( Rect.Axis[1], Rect.Axis[2] );
+
+	float SinCylinderAngle = Capsule.Radius * rsqrt( dot( ClosestPointOnAxis, ClosestPointOnAxis ) );
+	// width * cos(angle) = 2r 
+	float RectRadius = Capsule.Radius * rsqrt( 1 - Pow2( SinCylinderAngle ) );
+
+	float Extension[2];
+	for( uint i = 0; i < 2; i++ )
+	{
+		float3 PointPos = ToLight + CapsuleAxis * Capsule.Length * ( i > 0 ? 0.5 : -0.5 );
+
+		float SinSphereAngle = Capsule.Radius * rsqrt( dot( PointPos, PointPos ) );
+		float CosAxisAngle = abs( dot( CapsuleAxis, normalize( PointPos ) ) );
+		//float SinExtension = sin( AxisAngle -  SphereAngle );
+		float SinExtension = sqrt( ( 1 - Pow2( CosAxisAngle ) ) * ( 1 - Pow2( SinSphereAngle ) ) ) - CosAxisAngle * SinSphereAngle;
+		Extension[i] = Capsule.Radius / SinExtension;
+	}
+
+	float Translate = 0.5 * ( Extension[1] - Extension[0] );
+	float Extend = 0.5 * ( Extension[0] + Extension[1] );
+	
+	Rect.Origin += Translate * Rect.Axis[1];
+	Rect.Extent = float2( RectRadius, 0.5 * Capsule.Length + Extend );
+
+	FSphericalRect SphericalRect = BuildSphericalRect( Rect );
+
+	
+	const uint NumSets = 3;
+	const uint NumSamples[ NumSets ] =
+	{
+		0,	// Cosine hemisphere
+		16,	// GGX
+		16,	// Light area
+	};
+	
+	uint2 SobolBase = SobolPixel( SVPos );
+	uint2 SobolFrame = SobolIndex( SobolBase, View.StateFrameIndexMod8, 3 );
+	
+	UNROLL
+	for( uint Set = 0; Set < NumSets; Set++ )
+	{
+		LOOP
+		for( uint i = 0; i < NumSamples[ Set ]; i++ )
+		{
+			uint2 Random = Rand3DPCG16( uint3( SVPos.xy, View.Random ^ Set ) ).xy;
+
+			float2 E = float2( SobolIndex( SobolFrame, i << 3 ) ) / 0x10000;
+			//float2 E = Hammersley( i, NumSamples[ Set ], Random );
+			//float2 E = CorrelatedMultiJitter2D( i, NumSamples[ Set ], Random.x );
+			
+			float3 L, H;
+			if( Set == 0 )
+			{
+				L = TangentToWorld( CosineSampleHemisphere( E ).xyz, N );
+				H = normalize(V + L);
+			}
+			else if( Set == 1 )
+			{
+				H = TangentToWorld( ImportanceSampleGGX( E, Pow4(GBuffer.Roughness) ).xyz, N );
+				L = 2 * dot( V, H ) * H - V;
+			}
+			else
+			{
+				/*if( SourceLength > 0 )
+				{
+					uint2 Random = Rand3DPCG16( uint3( SVPos.xy, View.Random + i ) ).xy;
+
+					float3 ToArea = ToLight;
+					float3x3 Basis = GetTangentBasis( LightData.Tangent );
+					
+					if( ( (float)Random.x / 0xffff ) * SurfaceArea < SphereArea )
+					{
+						// Sphere caps
+						float3 SpherePos = SourceRadius * UniformSampleSphere( E ).xyz;
+
+						ToArea += mul( SpherePos, Basis );
+						ToArea += LightData.Tangent * ( SpherePos.z > 0 ? 0.5 * SourceLength : -0.5 * SourceLength;
+					}
+					else
+					{
+						// Cylinder
+						float Phi = (2*PI) * E.x;
+
+						float3 CylinderPos;
+						CylinderPos.x = SourceRadius * cos( Phi );
+						CylinderPos.y = SourceRadius * sin( Phi );
+						CylinderPos.z = SourceLength * E.z;
+
+						ToArea += mul( CylinderPos, Basis );
+					}
+
+					L = normalize( ToArea );
+					H = normalize( V + L );
+				}
+				else
+				{
+					uint2 Random = Rand3DPCG16( uint3( SVPos.xy, View.Random + i ) ).xy;
+
+					float3 L01 = LightData.Tangent * SourceLength;
+					float3 L0 = ToLight - 0.5 * L01;
+					float3 L1 = ToLight + 0.5 * L01;
+					L = lerp( L0, L1, (float)Random.x / 0xffff );
+				
+					float DistanceSqr = dot( L, L );
+					float3 ConeAxis = L * rsqrt( DistanceSqr );
+					float ConeCos = sqrt( 1 - Square( SourceRadius ) / DistanceSqr );
+
+					L = TangentToWorld( UniformSampleCone( E, ConeCos ).xyz, ConeAxis );
+					H = normalize(V + L);
+				}*/
+
+				if( Capsule.Length > 0 )
+				{
+					float3 ToArea = UniformSampleSphericalRect( E, SphericalRect );
+					L = normalize( ToArea );
+					H = normalize( V + L );
+				}
+				else
+				{
+					L = TangentToWorld( UniformSampleCone( E, ConeCos ).xyz, ConeAxis );
+					H = normalize(V + L);
+				}
+			}
+
+			float NoL = saturate( dot(N, L) );
+			float NoH = saturate( dot(N, H) );
+			float VoH = saturate( dot(V, H) );
+
+			if( NoL > 0 && VoH > 0 )
+			{
+				{
+					float3 ToSphere = ClosestPointLineToRay( Capsule.LightPos[0], Capsule.LightPos[1], Capsule.Length, L );
+
+					float DistSqr = dot( ToSphere, ToSphere );
+					float3 ConeAxis = ToSphere * rsqrt( DistSqr );
+					float ConeCos = sqrt( 1 - Square( Capsule.Radius ) / DistSqr );
+
+					if( dot( L, ConeAxis ) < ConeCos )
+					{
+						// Ray misses sphere
+						continue;
+					}
+				}
+
+				float PDF[] =
+				{
+					NoL / PI,
+					D_GGX( Pow4(GBuffer.Roughness), NoH ) * NoH / (4 * VoH),
+					1.0 / SphericalRect.SolidAngle,
+				};
+
+				if( Capsule.Length == 0 )
+				{
+					PDF[2] = 1.0 / ( 2 * PI * (1 - ConeCos) );
+				}
+
+				// MIS power heuristic
+				float InvWeight = 0;
+				UNROLL for( uint j = 0; j < NumSets; j++ )
+				{
+					InvWeight += Square( PDF[j] * NumSamples[j] );
+				}
+				float Weight = rcp( InvWeight ) * PDF[Set] * NumSamples[Set];
+				
+				FDirectLighting LightingSample = EvaluateBxDF( GBuffer, N, V, L, NoL, Shadow );
+
+				Lighting.Diffuse		+= SurfaceColor * Weight * LightingSample.Diffuse;
+				Lighting.Specular		+= SurfaceColor * Weight * LightingSample.Specular;
+				Lighting.Transmission	+= SurfaceColor * Weight * LightingSample.Transmission;
+			}
+		}
+	}
+
+	return Lighting;
+}

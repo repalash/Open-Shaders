@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "SceneTextureParameters.ush"
+
+
+float AmbientOcclusionStaticFraction;
+
+Texture2D AmbientOcclusionTexture;
+SamplerState AmbientOcclusionSampler;
+
+Texture2D DiffuseIndirectTexture;
+SamplerState DiffuseIndirectSampler;
+
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 BufferUV = SvPositionToBufferUV(SvPosition);
+	float2 ScreenPosition = SvPositionToScreenPosition(SvPosition).xy;
+
+	// Sample scene textures.
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+
+	// Sample the ambient occlusion that is dynamically generated every frame.
+	float DynamicAmbientOcclusion = 1.0f;
+#if DIM_APPLY_AMBIENT_OCCLUSION
+	DynamicAmbientOcclusion = AmbientOcclusionTexture.SampleLevel(AmbientOcclusionSampler, BufferUV, 0).r;
+#endif
+
+	// Compute the final ambient occlusion to be applied.
+	float FinalAmbientOcclusion = GBuffer.GBufferAO * DynamicAmbientOcclusion;
+
+	OutColor.rgb = 0.0f;
+	OutColor.a = 1.0f;
+
+	// Apply diffuse indirect.
+#if DIM_APPLY_DIFFUSE_INDIRECT
+	{
+		float3 DiffuseColor = GBuffer.DiffuseColor;
+		if (UseSubsurfaceProfile(GBuffer.ShadingModelID))
+		{
+			DiffuseColor = GBuffer.StoredBaseColor;
+		}
+
+		OutColor.rgb += DiffuseColor * DiffuseIndirectTexture.SampleLevel(DiffuseIndirectSampler, BufferUV, 0).rgb;
+	}
+#endif
+
+	// Apply AmbientOcclusion to the scene color. since before deferred direct lighting, we assume all lighting in SceneColor to be indirect ligthing
+	{
+		float AOMask = (GBuffer.ShadingModelID != SHADINGMODELID_UNLIT);
+		OutColor.a = lerp(1.0f, FinalAmbientOcclusion, AOMask * AmbientOcclusionStaticFraction);
+	}
+}

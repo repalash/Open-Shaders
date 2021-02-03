@@ -1,0 +1,67 @@
+#version 430 // -*- c++ -*-
+#ifdef GL_ARB_compute_variable_group_size
+#extension GL_ARB_compute_variable_group_size : enable
+#endif
+
+#extension GL_NV_shader_buffer_load : enable
+#extension GL_NV_shader_buffer_store : enable
+
+#include <g3dmath.glsl>
+
+#include <Texture/Texture.glsl>
+
+#include "../DDGIVolume/DDGIVolume.glsl"
+
+layout(local_size_variable) in;
+
+uniform DDGIVolume ddgiVolume;
+
+uniform int totalBoundingBoxes;
+
+// NEED vec4 FOR ALIGNMENT...
+layout(std430, binding = 2) restrict readonly buffer BoundingBox {
+	vec4 boundingBox[];
+};
+
+void main() {
+
+    ivec2 C = ivec2(gl_GlobalInvocationID.xy);
+
+    vec4 offsetAndFlags = readProbeOffset(ddgiVolume, C);
+    int oldFlags = (int)offsetAndFlags.w;
+
+    if (oldFlags == 0.0f || oldFlags == 4.0f || oldFlags == 5.0f) {
+        return;
+    }
+
+	int probeIndex = C.x + C.y * ddgiVolume.probeCounts.x * ddgiVolume.probeCounts.y;
+
+	vec3 wsProbePosition = probeLocation(ddgiVolume, probeIndex);
+
+
+	// Assume the probe is asleep
+	int newFlags = 1;
+
+	// Iterate through the bounding boxes to determine if any intersect the probe location.
+	// If the probe is being turned on, we can exit after that.
+	for (int i = 0; i < totalBoundingBoxes; ++i) {
+		vec4 lo = boundingBox[2 * i];
+		vec4 hi = boundingBox[2 * i + 1];
+		if (all(greaterThan(wsProbePosition, lo.xyz)) && all(lessThan(wsProbePosition, hi.xyz))) {
+			newFlags = 3;
+			break;
+		}
+	}
+
+	// newFlags is either 1 (if nothing was close to the probe) or 3 (if something was close to it).
+    // Note that if oldFlags >= newFlags, writing newFlags is correct no matter what 
+    // oldFlags was: the probe should be put in sleep state, because nothing woke it up.
+	if (newFlags == 3 && oldFlags != 3) {
+        // Just woke
+        newFlags = 2;
+	}
+
+    writeProbeOffset(ddgiVolume, C, 
+    //    vec3(0));
+    vec4(offsetAndFlags.xyz, newFlags));
+}

@@ -1,0 +1,35 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define TILE_SIZE 8
+
+
+//------------------------------------------------------- PARAMETERS
+
+RWTexture2D<uint> PrevUseCountOutput;
+RWTexture2D<uint> PrevClosestDepthOutput;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 InputPixelPos = InputInfo_ViewportMin + DispatchThreadId;
+	
+	if (all(InputPixelPos < InputInfo_ViewportMax))
+	{
+		PrevUseCountOutput[InputPixelPos] = 0;
+		PrevClosestDepthOutput[InputPixelPos] = 0;
+	}
+}

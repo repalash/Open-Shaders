@@ -1,0 +1,171 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ShaderDrawDebug.ush"
+
+#if SHADER_ATLAS
+
+#define PRINT_ATLAS_RESOLUTION 0
+#if PRINT_ATLAS_RESOLUTION
+#include "../ShaderPrintCommon.ush"
+#endif
+
+#define DEBUG_MODE_DEPTH 1
+#define DEBUG_MODE_COVERAGE 2
+#define DEBUG_MODE_TANGENT 3
+#define DEBUG_MODE_ROOTUV 4
+#define DEBUG_MODE_U 5
+#define DEBUG_MODE_SEED 6
+
+int2 OutputResolution;
+int2 AtlasResolution;
+int DebugMode;
+
+Texture2D<float4> AtlasTexture;
+RWTexture2D<float4> OutputTexture;
+SamplerState LinearSampler;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{	
+	const int2 PixelCoord = DispatchThreadId.xy;
+	if (any(PixelCoord >= OutputResolution))
+		return;
+
+	const int2 Offset = 50;
+	const int2 Resolution = 512 * float2(AtlasResolution.x, AtlasResolution.y)/max(AtlasResolution.x, AtlasResolution.y);
+
+	const float2 LocalUV = float2(PixelCoord - Offset) / float2(Resolution);
+
+#if 1
+	if (all(LocalUV >= 0) && all(LocalUV <= 1))
+	{
+		float4 InData = AtlasTexture.SampleLevel(LinearSampler, float2(LocalUV.x,1-LocalUV.y), 0);
+		float3 Data = 0;
+		if (DebugMode == DEBUG_MODE_DEPTH) 		{ Data = InData.xxx; }
+		if (DebugMode == DEBUG_MODE_COVERAGE)	{ Data = InData.xxx; }
+		if (DebugMode == DEBUG_MODE_TANGENT)	{ Data = InData.xyz; }
+		if (DebugMode == DEBUG_MODE_ROOTUV)		{ Data = float3(InData.xy,0); }
+		if (DebugMode == DEBUG_MODE_U)			{ Data = InData.zzz; }
+		if (DebugMode == DEBUG_MODE_SEED)		{ Data = InData.www; }
+		OutputTexture[PixelCoord] = float4(Data, 1);
+	}
+#else
+	if (all(PixelCoord <= AtlasResolution))
+	{
+		float3 Data = AtlasTexture.Load(uint3(PixelCoord, 0)).xyz;
+		if (DebugMode == DEBUG_MODE_DEPTH) { Data = Data.xxx; }
+		if (DebugMode == DEBUG_MODE_COVERAGE) { Data = Data.xxx; }
+		if (DebugMode == DEBUG_MODE_TANGENT) {}
+		OutputTexture[PixelCoord] = float4(Data, 1);
+	}
+#endif
+
+#if PRINT_ATLAS_RESOLUTION
+	// Draw AABB of the instance groups
+	if (DispatchThreadId.x == 0 && DispatchThreadId.y == 0)
+	{
+		float2 OriginalPos = float2(50, 40) / float2(OutputResolution);
+		float2 Pos = OriginalPos;
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, AtlasResolution);
+
+		Pos = ShaderPrintNewline(Pos);
+		Pos.x = OriginalPos.x;
+	}
+#endif
+}
+
+#endif // SHADER_ATLAS
+
+/////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_GUIDE
+#include "HairStrandsVertexFactoryCommon.ush"
+
+uint RenVertexCount;
+float3 RenRestOffset;
+float3 RenDeformedOffset;
+
+uint SimVertexCount;
+float3 SimRestOffset;
+float3 SimDeformedOffset;
+
+float4x4 LocalToWorld;
+
+Buffer<uint4> RenRestPosition;
+Buffer<uint4> RenDeformedPosition;
+
+Buffer<uint4> SimRestPosition;
+Buffer<uint4> SimDeformedPosition;
+
+float3 RestOffset;
+float3 DeformedOffset;
+Buffer<uint4> RestPosition;
+Buffer<uint4> DeformedPosition; 
+
+int DebugMode;
+
+[numthreads(32, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint VertexId = DispatchThreadId.x;
+	const uint VertexCount = DebugMode == 0 || DebugMode == 1 ? RenVertexCount : SimVertexCount;
+	if (VertexId+1 >= VertexCount)
+		return;
+
+	uint4 PackedP0 = 0;
+	uint4 PackedP1 = 0;
+	float3 Offset = 0;
+	float4 Color = float4(1, 1, 0, 1);
+
+	if (DebugMode == 1)
+	{
+		PackedP0 = RenRestPosition[VertexId];
+		PackedP1 = RenRestPosition[VertexId + 1];
+		Offset   = RenRestOffset;
+		Color	 = float4(1, 1, 0, 1);
+	}
+	else if (DebugMode == 2)
+	{
+		PackedP0 = RenDeformedPosition[VertexId];
+		PackedP1 = RenDeformedPosition[VertexId + 1];
+		Offset   = RenDeformedOffset;
+		Color	 = float4(1, 1, 0, 1);
+	}
+	else if (DebugMode == 3)
+	{
+		PackedP0 = SimRestPosition[VertexId];
+		PackedP1 = SimRestPosition[VertexId + 1];
+		Offset   = SimRestOffset;
+		Color	 = float4(1, 0, 1, 1);
+	}
+	else if (DebugMode == 4)
+	{
+		PackedP0 = SimDeformedPosition[VertexId];
+		PackedP1 = SimDeformedPosition[VertexId + 1];
+		Offset   = SimDeformedOffset;
+		Color	 = float4(1, 0, 1, 1);
+	}
+
+	const FHairControlPoint P0 = UnpackHairControlPoint(PackedP0, Offset, 1, 1);
+	const FHairControlPoint P1 = UnpackHairControlPoint(PackedP1, Offset, 1, 1);
+
+	if (P1.Type != HAIR_CONTROLPOINT_START)
+	{
+		AddLine(mul(float4(P0.Position, 1), LocalToWorld), mul(float4(P1.Position,1), LocalToWorld), Color, Color);
+	}
+}
+
+#endif // SHADER_GUIDE
+
+

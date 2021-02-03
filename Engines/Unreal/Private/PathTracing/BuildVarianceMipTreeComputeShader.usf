@@ -1,0 +1,155 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	BuildVarianceMapComputeShader.usf: Build variance map
+===============================================================================================*/
+
+#include "../Common.ush"
+
+Texture2D RadianceTexture;
+SamplerState RadianceTextureSampler;
+uint2 ViewSize;
+
+uint2 VarianceMapDimensions;
+uint MipLevel;
+
+RWBuffer<float> RWVarianceMipTree;
+
+// C1 continuous remapping function
+float TonemapGammaAndHDR(float Value)
+{
+	if (Value > 1.0)
+	{
+		Value = 1.0 + 2.0 * log(Value);
+	}
+	else
+	{
+		Value = pow(Value, 2.0);
+	}
+	return Value;
+}
+
+float NoTonemap(float Value)
+{
+	return Value;
+}
+
+float Tonemap(float Value)
+{
+	return TonemapGammaAndHDR(Value);
+}
+
+uint2 DimensionsAtLevel(uint Level)
+{
+	return uint2(VarianceMapDimensions.x >> Level, VarianceMapDimensions.y >> Level);
+}
+
+uint BufferOffsetAtPixel(uint2 Pixel, uint Level)
+{
+	uint Offset = 0;
+	for (uint LevelIndex = 0; LevelIndex < Level; ++LevelIndex)
+	{
+		uint2 MipLevelDimensions = DimensionsAtLevel(LevelIndex);
+		Offset += MipLevelDimensions.x * MipLevelDimensions.y;
+	}
+
+	uint2 MipLevelDimensions = DimensionsAtLevel(Level);
+	Offset += Pixel.y * MipLevelDimensions.x + Pixel.x;
+	return Offset;
+}
+
+struct Gaussian3x3
+{
+	float Weight[9];
+	int Offset;
+	int Width;
+
+	void Initialize()
+	{
+		Weight[0] = 1.0; Weight[1] = 2.0; Weight[2] = 1.0;
+		Weight[3] = 2.0; Weight[4] = 4.0; Weight[5] = 2.0;
+		Weight[6] = 1.0; Weight[7] = 2.0; Weight[8] = 1.0;
+
+		Offset = 1;
+		Width = 3;
+	}
+};
+
+struct Gaussian5x5
+{
+	float Weight[25];
+	int Offset;
+	int Width;
+
+	void Initialize()
+	{
+		Weight[0] = 1;  Weight[1] = 4;   Weight[2] = 7;   Weight[3] = 4;   Weight[4] = 1;
+		Weight[5] = 4;  Weight[6] = 16;  Weight[7] = 26;  Weight[8] = 16;  Weight[9] = 4;
+		Weight[10] = 7; Weight[11] = 26; Weight[12] = 41; Weight[13] = 26; Weight[14] = 7;
+		Weight[15] = 4; Weight[16] = 16; Weight[17] = 26; Weight[18] = 16; Weight[19] = 4;
+		Weight[20] = 1; Weight[21] = 4;  Weight[22] = 7;  Weight[23] = 4;  Weight[24] = 1;
+
+		Offset = 2;
+		Width = 5;
+	}
+};
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildVarianceMipTreeCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+	uint2 Dimensions = DimensionsAtLevel(MipLevel);
+	if (GridCoordinate.x >= Dimensions.x || GridCoordinate.y >= Dimensions.y)
+	{
+		return;
+	}
+
+	float Sum = 0.0;
+	if (MipLevel == 0)
+	{
+		float2 UV = float2(GridCoordinate.xy + 0.5f) / VarianceMapDimensions;
+
+		// Resample blurred result as the variance map
+		Gaussian5x5 Filter;
+		Filter.Initialize();
+		uint Samples = 0;
+		int2 PixelCenter = DispatchThreadId.xy;
+		int2 PixelMin = max(PixelCenter - Filter.Offset, 0);
+		int2 PixelMax = min(PixelCenter + Filter.Offset, int2(ViewSize) - 1);
+		for (int y = PixelMin.y; y <= PixelMax.y; ++y)
+		{
+			for (int x = PixelMin.x; x <= PixelMax.x; ++x)
+			{
+				int2 Pixel = int2(x, y);
+				int2 Kernel = Pixel - PixelCenter + Filter.Offset;
+				float Weight = Filter.Weight[Kernel.y * Filter.Width + Kernel.x];
+
+				float4 RadianceAndVariance = RadianceTexture.Load(uint3(Pixel, 0));
+				float3 Radiance = RadianceAndVariance.rgb;
+				float Variance = RadianceAndVariance.a;
+				float Mean = Tonemap(Luminance(Radiance));
+				float Epsilon = 0.0001;
+				float Sample = Variance / (Mean + Epsilon) * Weight;
+				Sum += Sample;
+				Samples++;
+			}
+		}
+		Sum /= Samples;
+	}
+	else
+	{
+		// Report the mean as the aggregate.
+		uint2 PixelOffset = uint2(GridCoordinate.x << 1, GridCoordinate.y << 1);
+		for (int i = 0; i < 4; ++i)
+		{
+			uint2 Pixel = PixelOffset + uint2(i >> 1, i & 1);
+			uint InputIndex = BufferOffsetAtPixel(Pixel, MipLevel - 1);
+  			Sum += RWVarianceMipTree[InputIndex];
+		}
+		Sum /= 4;
+	}
+	uint OutputIndex = BufferOffsetAtPixel(GridCoordinate.xy, MipLevel);
+	RWVarianceMipTree[OutputIndex] = Sum;
+}

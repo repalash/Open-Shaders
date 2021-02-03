@@ -1,0 +1,15 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	FullscreenVertexShader.usf: Most basic multi platform full screen vertex shader
+=============================================================================*/
+
+#include "../Common.ush"
+
+void MainVS(
+	float2 InPosition : ATTRIBUTE0,
+	float2 InUV       : ATTRIBUTE1, // TODO: kill
+	out float4 Position : SV_POSITION)
+{
+	Position = float4(InPosition.x * 2.0 - 1.0, 1.0 - 2.0 * InPosition.y, 0, 1);
+}

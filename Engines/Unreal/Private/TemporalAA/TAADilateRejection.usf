@@ -1,0 +1,78 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define TILE_SIZE 8
+
+
+//------------------------------------------------------- PARAMETERS
+
+Texture2D<taa_half> HistoryRejectionTexture;
+RWTexture2D<taa_half> DilatedHistoryRejectionOutput;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 RejectionPixelPos = DispatchThreadId;
+
+	float2 RejectionBufferUV = (RejectionPixelPos + 0.5) * RejectionInfo_ExtentInverse;
+
+	// Fetch center of the kernel
+	taa_half HistoryRejectionInfo;
+	{
+		HistoryRejectionInfo = HistoryRejectionTexture.SampleLevel(GlobalPointClampedSampler, RejectionBufferUV, 0);
+	}
+
+	const int KernelSize = 2;
+
+	// Fetch neighborhood of the kernel
+	UNROLL
+	for (int x = -KernelSize; x <= KernelSize; x++)
+	{
+		UNROLL
+		for (int y = -KernelSize; y <= KernelSize; y++)
+		//UNROLL
+		//for (uint i = 0; i < 9; i++)
+		{
+			//float2 Offset = float2(kOffsets3x3[i]);
+			float2 Offset = float2(x, y);
+		
+			if (all(Offset == 0.0))
+			{
+				continue;
+			}
+
+			float2 SampleRejectionBufferUV = RejectionBufferUV + Offset * RejectionInfo_ExtentInverse;
+			SampleRejectionBufferUV = clamp(SampleRejectionBufferUV, RejectionInfo_UVViewportBilinearMin, RejectionInfo_UVViewportBilinearMax);
+
+			taa_half SampleRejectionInfo = HistoryRejectionTexture.SampleLevel(GlobalPointClampedSampler, SampleRejectionBufferUV, 0);
+
+			HistoryRejectionInfo = min(HistoryRejectionInfo, SampleRejectionInfo);
+		}
+	}
+
+	if (all(RejectionPixelPos < RejectionInfo_ViewportSize))
+	{
+		DilatedHistoryRejectionOutput[RejectionPixelPos] = HistoryRejectionInfo;
+
+		#if DEBUG_OUTPUT
+		{
+			DebugOutput[RejectionPixelPos] = Debug;
+		}
+		#endif
+	}
+}

@@ -1,0 +1,209 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessDeviceEncodingOnly.usf: PostProcessing device encoding only. 
+	This replaces the tonemapper when displaying debug post process materials
+	used for monitor calibration.
+
+	Note: Any changes to device encoding logic must also be made 
+	in PostProcessCombineLUTs.usf's corresponding pixel shader.
+
+=============================================================================*/
+
+#include "Common.ush"
+#include "PostProcessCommon.ush"
+#include "TonemapCommon.ush"
+#include "ScreenPass.ush"
+
+/** Values of DIM_OUTPUT_DEVICE (matching C++'s ETonemapperOutputDevice) */
+#define TONEMAPPER_OUTPUT_sRGB 0
+#define TONEMAPPER_OUTPUT_Rec709 1
+#define TONEMAPPER_OUTPUT_ExplicitGammaMapping 2
+#define TONEMAPPER_OUTPUT_ACES1000nitST2084 3
+#define TONEMAPPER_OUTPUT_ACES2000nitST2084 4
+#define TONEMAPPER_OUTPUT_ACES1000nitScRGB 5
+#define TONEMAPPER_OUTPUT_ACES2000nitScRGB 6
+#define TONEMAPPER_OUTPUT_LinearEXR 7
+#define TONEMAPPER_OUTPUT_NoToneCurve 8
+#define TONEMAPPER_OUTPUT_WithToneCurve 9
+
+#ifndef DIM_OUTPUT_DEVICE
+	#define DIM_OUTPUT_DEVICE (TONEMAPPER_OUTPUT_sRGB)
+#endif
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Color)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+Texture2D ColorTexture;
+SamplerState ColorSampler;
+
+float EditorNITLevel;
+
+uint bOutputInHDR;
+
+uint OutputDevice;
+uint OutputGamut;
+
+uint GetOutputDevice()
+{
+#if FEATURE_LEVEL > FEATURE_LEVEL_ES3_1
+	return OutputDevice;
+#else
+	// Only sRGB output for Mobile
+	return 0;
+#endif 
+}
+
+float4 SampleSceneColor(float2 SceneUV)
+{
+	return Texture2DSample(ColorTexture, ColorSampler, SceneUV);
+}
+
+float4 DeviceEncodingOnlyCommonPS(
+	float2 UV,
+	float4 SvPosition
+	)
+{
+	float4 OutColor = 0;
+
+	float2 SceneUV = UV.xy;
+
+	half4 SceneColor = SampleSceneColor(SceneUV);
+
+	// AP1 to Working space matrices
+	const float3x3 sRGB_2_AP1 = mul( XYZ_2_AP1_MAT, mul( D65_2_D60_CAT, sRGB_2_XYZ_MAT ) );
+	const float3x3 AP1_2_sRGB = mul( XYZ_2_sRGB_MAT, mul( D60_2_D65_CAT, AP1_2_XYZ_MAT ) );
+
+	const float3x3 AP0_2_AP1 = mul( XYZ_2_AP1_MAT, AP0_2_XYZ_MAT );
+	const float3x3 AP1_2_AP0 = mul( XYZ_2_AP0_MAT, AP1_2_XYZ_MAT );
+
+	const float3x3 AP1_2_Output  = OuputGamutMappingMatrix( OutputGamut );
+
+	// Apply "gamma" curve adjustment.
+	float3 FilmColor = pow(max(0, SceneColor.rgb), InverseGamma.y);
+	
+	// Note: Any changes to device encoding logic below must also be made 
+	// in PostProcessCombineLUTs.usf's corresponding pixel shader.
+	half3 OutDeviceColor = 0;
+	BRANCH
+
+	// sRGB, user specified gamut
+	if( GetOutputDevice() == 0 )
+	{		
+		// Convert from sRGB to specified output gamut	
+		// float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+
+		// FIXME: Workaround for UE-29935, pushing all colors with a 0 component to black output
+		// Default parameters seem to cancel out (sRGB->XYZ->AP1->XYZ->sRGB), so should be okay for a temp fix
+		float3 OutputGamutColor = FilmColor;
+
+		// Apply conversion to sRGB (this must be an exact sRGB conversion else darks are bad).
+		OutDeviceColor = LinearToSrgb( OutputGamutColor );
+	}
+
+	// Rec 709, user specified gamut
+	else if( GetOutputDevice() == 1 )
+	{
+		// Convert from sRGB to specified output gamut
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+
+		// Didn't profile yet if the branching version would be faster (different linear segment).
+		OutDeviceColor = LinearTo709Branchless( OutputGamutColor );
+	}
+
+	// ACES 1000nit transform with PQ/2084 encoding, user specified gamut 
+	else if( GetOutputDevice() == 3 || GetOutputDevice() == 5 )
+	{		
+		// 1000 nit ODT
+		float3 ODTColor = ACESOutputTransforms1000( FilmColor );
+
+		// Convert from AP1 to specified output gamut
+		ODTColor = mul( AP1_2_Output, ODTColor );
+
+		// Apply conversion to ST-2084 (Dolby PQ)
+		OutDeviceColor = LinearToST2084( ODTColor );
+	}
+
+	// ACES 2000nit transform with PQ/2084 encoding, user specified gamut 
+	else if( GetOutputDevice() == 4 || GetOutputDevice() == 6 )
+	{		
+		// 2000 nit ODT
+		float3 ODTColor = ACESOutputTransforms2000( FilmColor );
+
+		// Convert from AP1 to specified output gamut
+		ODTColor = mul( AP1_2_Output, ODTColor );
+
+		// Apply conversion to ST-2084 (Dolby PQ)
+		OutDeviceColor = LinearToST2084( ODTColor );
+	}	
+	
+	else if( GetOutputDevice() == 7 )
+	{
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+		OutDeviceColor = LinearToST2084( OutputGamutColor );
+	}
+	// Linear HDR, including all color correction, but no tone curve
+	else if( GetOutputDevice() == 8 ) 
+	{
+		OutDeviceColor = FilmColor;
+	}
+	// "Linear" including all color correction and the tone curve, but no device gamma
+	else if (GetOutputDevice() == 9)
+	{
+		float3 OutputGamutColor = mul(AP1_2_Output, mul(sRGB_2_AP1, SceneColor)); 
+
+		OutDeviceColor = OutputGamutColor;
+	}
+
+	// OutputDevice == 2
+	// Gamma 2.2, user specified gamut
+	else
+	{
+		// Convert from sRGB to specified output gamut
+		float3 OutputGamutColor = mul( AP1_2_Output, mul( sRGB_2_AP1, FilmColor ) );
+
+		// This is different than the prior "gamma" curve adjustment (but reusing the variable).
+		// For displays set to a gamma colorspace.
+		// Note, MacOSX native output is raw gamma 2.2 not sRGB!
+		OutDeviceColor = pow( OutputGamutColor, InverseGamma.z );
+	}
+
+	OutColor.rgb = OutDeviceColor;
+	OutColor.a = 1;
+
+	return OutColor;
+}
+
+// pixel shader entry point
+void MainPS(
+	in noperspective float2 UV : TEXCOORD0,
+	float4 SvPosition : SV_POSITION,		// after all interpolators
+	out float4 OutColor : SV_Target0
+	)
+{
+    OutColor = DeviceEncodingOnlyCommonPS(UV, SvPosition);
+}
+
+#if COMPUTESHADER
+RWTexture2D<float4> RWOutputTexture;
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	float4 SvPosition = float4((float2)DispatchThreadId + Output_ViewportMin + 0.5f, 0.0f, 1.0f);
+	float2 UV = SvPosition.xy * Output_ExtentInverse;
+	float4 InScreenPos = float4(UV*2-1,0,1);
+
+	if (IsComputeUVOutOfBounds(UV))
+	{
+		return;
+	}
+
+	float4 OutColor = DeviceEncodingOnlyCommonPS(UV, SvPosition);
+
+	uint2 PixelPos = DispatchThreadId + Output_ViewportMin;
+	RWOutputTexture[PixelPos] = OutColor;
+}
+#endif
+
+

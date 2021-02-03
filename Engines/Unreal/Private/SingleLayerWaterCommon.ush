@@ -1,0 +1,35 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Scale for encoding depth into SceneDepthWithoutSingleLayerWaterTexture
+#define SINGLE_LAYER_WATER_DEPTH_SCALE 100.0f
+
+#ifndef SIMPLE_SINGLE_LAYER_WATER
+#define SIMPLE_SINGLE_LAYER_WATER 0
+#endif
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+	#define SingleLayerWaterSceneColorSampler View.SharedBilinearClampedSampler
+	#define SingleLayerWaterSceneDepthSampler View.SharedPointClampedSampler
+#else
+	#define SingleLayerWaterSceneColorSampler OpaqueBasePass.SceneColorWithoutSingleLayerWaterSampler
+	#define SingleLayerWaterSceneDepthSampler OpaqueBasePass.SceneDepthWithoutSingleLayerWaterSampler
+#endif
+
+// We use our own refract because the HLSL one was not working on all platforms (ES3.1 preview for instance)
+bool WaterRefract(float3 V, float3 N, float Eta, out float3 R)
+{
+	const float CosThetaI = dot(V, N);
+	const float CosThetaT2 = 1.f - Eta * Eta * (1.0f - CosThetaI * CosThetaI);
+	if (CosThetaT2 < 0.0f)
+	{
+		// Total internal reflection
+		R = reflect(-V, N);
+		return false;
+	}
+
+	const float CosThetaT = -(CosThetaI >= 0.0f ? 1.0f : -1.0f) * sqrt(CosThetaT2);
+	R = (Eta * CosThetaI + CosThetaT) * N - Eta * V;
+	return true;
+}

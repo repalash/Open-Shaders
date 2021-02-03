@@ -1,0 +1,48 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_levelAllocToIndex.glc
+
+  Computes (countBuffer[endIndex] - countBuffer[startIndex]) and then uses that
+  to produce the indirect buffer for dispatch/draw indirect calls.  If startIndex < 0,
+  considers countBuffer[startIndex] to be zero.
+
+  Requires BUFFER_WIDTH to be set to choose grid dimensions.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+
+
+layout(r32ui) uniform uimageBuffer       sizeBuffer;
+layout(r32ui) uniform uimageBuffer       levelStartIndexBuffer;
+layout(r32ui) uniform uimageBuffer       levelIndexBuffer;
+
+
+void main() {
+
+	imageStore(levelStartIndexBuffer, 0, uvec4(0));		//0
+	imageStore(levelStartIndexBuffer, 1, uvec4(8));		//8
+	//imageStore(levelStartIndexBuffer, 2, uvec4(16));	//16
+
+	imageStore(levelIndexBuffer, 0, uvec4(8));	//0
+	imageStore(levelIndexBuffer, 1, uvec4(16));	//8
+	//imageStore(levelIndexBuffer, 2, uvec4(16));	//16
+	
+
+	uint accVal=16;
+	for(int i=2; i<16; i++){
+		uint c = imageLoad(sizeBuffer, i).x;
+
+		imageStore(levelStartIndexBuffer, i, uvec4(accVal));
+		imageStore(levelIndexBuffer, i, uvec4(accVal));
+		
+		//int depthRes = (1<<i);
+		//accVal = int(float(depthRes*depthRes*depthRes)*0.75f);  //Debug
+		accVal+=c;
+	}
+}

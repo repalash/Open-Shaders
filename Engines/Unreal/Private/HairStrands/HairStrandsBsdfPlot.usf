@@ -1,0 +1,317 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTexturesCommon.ush"
+#include "../ShadingModels.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../HairBsdf.ush"
+#include "HairStrandsCommon.ush"
+#include "HairStrandsDebugCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairStrandsEnvironmentLightingCommon.ush"
+#include "HairStrandsDeepShadowCommon.ush"
+#include "HairStrandsDeepTransmittanceCommon.ush"
+#include "HairStrandsDeepTransmittanceDualScattering.ush"
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_PLOTBSDF
+
+int2 InputCoord;
+int2 OutputOffset;
+int2 OutputResolution;
+int2 MaxResolution;
+uint HairComponents;
+float Roughness;
+float BaseColor;
+float Exposure;
+
+RWTexture2D<float4> OutputTexture;
+
+#define COMPARE_ROUGHNESS 0
+
+#if COMPARE_ROUGHNESS
+float DefaultLit(float3 N, float3 V, float3 L, float InRoughnesss)
+{
+	FGBufferData GBuffer;
+	GBuffer.Roughness = InRoughnesss;
+	GBuffer.SpecularColor = 1;
+	GBuffer.DiffuseColor = 0;
+
+	FAreaLight AreaLight;
+	AreaLight.bIsRect = false;
+	AreaLight.FalloffColor = 1;
+	AreaLight.SphereSinAlpha = 0;
+	AreaLight.SphereSinAlphaSoft = 0;
+	AreaLight.LineCosSubtended = 1;
+	FShadowTerms Shadow;
+
+	if (dot(V,N) < 0)
+		V.z = -V.z;
+
+	const float NoL = saturate(dot(N, L));
+	const float3 Fs = DefaultLitBxDF(GBuffer, N, V, L, 1, NoL, AreaLight, Shadow).Specular;
+	return Fs.x;
+}
+#endif
+
+void MainPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0)
+{
+	const int2 PixelCoord = Input.Position.xy;
+	if (PixelCoord.x < OutputOffset.x || PixelCoord.x >= OutputOffset.x+OutputResolution.x ||
+		PixelCoord.y < OutputOffset.y || PixelCoord.y >= OutputOffset.x+OutputResolution.y )
+		discard;
+
+	const float2 UV = ((PixelCoord-OutputOffset) + float2(0.5f,0.5f)) / float2(OutputResolution);
+	float2 InputUV = saturate(float2(InputCoord - OutputOffset) / float2(OutputResolution));
+	// InputUV = float2(0.5, 0.5);
+
+
+	float V_Phi   = (UV.x*2-1) * PI; //[-Pi..Pi]
+	float V_Theta = (UV.y*2-1) * PI * 0.5f;
+	float L_Phi   = (InputUV.x*2-1) * PI; //[-Pi..Pi]
+	float L_Theta = (InputUV.y*2-1) * PI * 0.5f;
+
+	const float3 Axis_U = float3(0,0,1); // Tangent
+	const float3 Axis_V = float3(1,0,0); // Perp. to the view direction
+	const float3 Axis_W = float3(0,1,0); // Ortho.
+
+	const float3 L_Local = float3(sin(L_Theta), cos(L_Theta)*cos(L_Phi), cos(L_Theta)*sin(L_Phi));
+	const float3 V_Local = float3(sin(V_Theta), cos(V_Theta)*cos(V_Phi), cos(V_Theta)*sin(V_Phi));
+	const float3 T 		 = float3(1,0,0);
+
+	const float3 V_World = 
+		V_Local.x * Axis_U + 
+		V_Local.y * Axis_V + 
+		V_Local.z * Axis_W;
+
+	FHairTransmittanceData TransmittanceData = (FHairTransmittanceData)0;
+	TransmittanceData.LocalScattering = 0;
+	TransmittanceData.GlobalScattering = 1;
+	TransmittanceData.ScatteringComponent = HairComponents;
+	TransmittanceData.OpaqueVisibility = 1;
+
+	const float Backlit = 1;
+	const float Specular = 0.5f;
+	FGBufferData HairGBuffer = (FGBufferData)0;
+	HairGBuffer.WorldNormal = T;
+	HairGBuffer.BaseColor = BaseColor.xxx;
+	HairGBuffer.Roughness = Roughness;
+	HairGBuffer.ShadingModelID = SHADINGMODELID_HAIR;
+	HairGBuffer.DiffuseColor = 0;
+	HairGBuffer.SpecularColor = 0;
+	HairGBuffer.Specular = Specular;
+	HairGBuffer.Metallic = 0;
+	HairGBuffer.Depth = 0.5f;
+	HairGBuffer.GBufferAO = 1;
+	HairGBuffer.CustomData = float4(0,0,Backlit,0);
+	HairGBuffer.IndirectIrradiance = 1000000;
+
+	OutColor = float4(0,0,0,1);
+
+#if COMPARE_ROUGHNESS
+	const float3 Fs_Lit_R   = DefaultLit(float3(0, 0,-1), V_Local, L_Local, HairToGGXRoughness_R  (HairGBuffer.Roughness));
+	const float3 Fs_Lit_TT  = DefaultLit(float3(0, 0,-1), V_Local, L_Local, HairToGGXRoughness_TT (HairGBuffer.Roughness));
+	const float3 Fs_Lit_TRT = DefaultLit(float3(0, 0,-1), V_Local, L_Local, HairToGGXRoughness_TRT(HairGBuffer.Roughness));
+#endif
+	const float3 Fs_Hair    = HairShading(HairGBuffer, L_Local, V_Local, T, 1, TransmittanceData, 1, 0, uint2(0,0) );
+
+#if COMPARE_ROUGHNESS
+	OutColor.xyz += Fs_Lit_R   * float3(1, 0, 0);
+	OutColor.xyz += Fs_Lit_TRT * float3(0, 1, 1);
+	OutColor.xyz += Fs_Lit_TT  * float3(0, 0, 1);
+#endif
+	OutColor.xyz += Fs_Hair;
+	OutColor.xyz *= Exposure;
+
+	//const float3 ColorV = (V_World+1)* 0.5f;
+	//OutColor = float4(ColorV, 1);
+	//OutColor = float4(UV, 0, 1);
+}
+
+#endif // SHADER_PLOTBSDF
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_PLOTSAMPLE
+
+#include "HairStrandsDebugCommonStruct.ush"
+
+StructuredBuffer<FDebugShadingInfo>	Debug_ShadingPointBuffer;
+Buffer<uint>						Debug_ShadingPointCounter;
+StructuredBuffer<FDebugSample>		Debug_SampleBuffer;
+Buffer<uint>						Debug_SampleCounter;
+uint								Debug_MaxShadingPointCount;
+uint								Debug_MaxSampleCount;
+
+Texture3D<float4>					HairScatteringLUTTexture;
+SamplerState 						HairLUTSampler;
+
+int2 OutputOffset;
+int2 OutputResolution;
+int2 MaxResolution;
+uint HairComponents;
+float Exposure;
+
+struct FPlotRect
+{
+	int2 Offset;
+	int2 Resolution;
+};
+
+bool IsInside(const int2 Coord, const FPlotRect Rect)
+{
+	return all(Coord >= Rect.Offset) && all(Coord < Rect.Offset + Rect.Resolution);
+}
+
+float2 ToUV(const int2 Coord, const FPlotRect Rect)
+{
+	return ((Coord - Rect.Offset) + float2(0.5f, 0.5f)) / float2(OutputResolution);
+}
+
+RWTexture2D<float4> OutputTexture;
+
+float2 CartesianToUnwrap(float3 D)
+{
+	const float Theta = asin(D.x);
+	const float Phi = atan2(D.z, D.y);
+	return float2(Theta, Phi);
+}
+
+float2 CartesianToLatlong(float3 D)
+{
+	const float Theta = asin(D.x);
+	const float Phi = atan2(D.z, D.y);
+	return float2(((Phi/PI)+1)*0.5f, Theta/PI);
+}
+
+void MainPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(0, 0, 0, 1);
+
+	// Prune all pixel which are not within the band horizontal band
+	const int2 PixelCoord = Input.Position.xy;
+	if (PixelCoord.y < OutputOffset.y || PixelCoord.y >= OutputOffset.x + OutputResolution.y)
+	{
+		discard;
+	}
+
+	const float CosAngleThreshold = 0.999f;
+	const float PointSize = 3.f / OutputResolution.x;
+
+	// Local 
+	// Plot sample points
+	bool bIsValid = false;
+	const uint ShadingPointCount = Debug_ShadingPointCounter[0];
+	for (uint PointIt = 0; PointIt < ShadingPointCount; PointIt++)
+	{
+		FPlotRect Rect;
+		Rect.Offset = OutputOffset + PointIt * int2(OutputResolution.x + 10, 0);
+		Rect.Resolution = OutputResolution;
+
+		if (!IsInside(PixelCoord, Rect))
+			continue;
+
+		bIsValid = true;
+		const float2 UV = ToUV(PixelCoord, Rect);
+
+		const float  Pixel_Phi	= (UV.x * 2 - 1) * PI + PI*0.5; //[3PI/2, 0, 2PI, 3PI/2 ], so that the hair fiber is aligned on the center
+		const float  Pixel_Theta= (UV.y * 2 - 1) * PI * 0.5f;
+		const float3 PixelDir_Local	= float3(sin(Pixel_Theta), cos(Pixel_Theta)*cos(Pixel_Phi), cos(Pixel_Theta)*sin(Pixel_Phi));
+
+		const FDebugShadingInfo P = Debug_ShadingPointBuffer[PointIt];
+
+		// Shading frame T, V
+		const float3 Local_X = P.T;
+		const float3 Local_Y = normalize(cross(Local_X, P.V));
+		const float3 Local_Z = normalize(cross(Local_Y, Local_X));
+		const float3x3 WorldToLocal = transpose(float3x3(Local_X, Local_Y, Local_Z));
+
+		const float3 V_Local = mul(P.V, WorldToLocal);
+		const float3 T_Local = mul(P.T, WorldToLocal); // Should be float3(1,0,0)
+
+		{
+
+			const float SampleBacklit = 1;
+			const float SampleSpecular = 0.5f;
+			FHairTransmittanceData TransmittanceData = InitHairStrandsTransmittanceData();
+
+			uint InHairComponents = HairComponents;
+			const bool bPlotDualScatteringContribution = true;
+			if (!bPlotDualScatteringContribution)
+			{
+				TransmittanceData.LocalScattering = 1;
+				TransmittanceData.GlobalScattering = 1;
+				TransmittanceData.ScatteringComponent = InHairComponents;
+				TransmittanceData.OpaqueVisibility = 1;
+			}
+			else
+			{
+				const float3 L = PixelDir_Local;
+				const float3 T = T_Local;
+				const float3 V = V_Local;
+				const float SinLightAngle = dot(L, T);
+
+				// Compute the transmittance based on precompute Hair transmittance LUT
+				FHairAverageScattering AverageScattering = SampleHairLUT(HairScatteringLUTTexture, HairLUTSampler, P.BaseColor, P.Roughness, SinLightAngle);
+
+				FHairTransmittanceMask TransmittanceMask;
+				TransmittanceMask.HairCount = 0;
+				TransmittanceMask.Visibility = 1;
+				TransmittanceMask.Transmittance = 1;
+
+				TransmittanceData = ComputeDualScatteringTerms(
+					TransmittanceMask,
+					AverageScattering,
+					P.Roughness,
+					SampleBacklit,
+					V,
+					L,
+					T,
+					InHairComponents);
+			}
+
+			FGBufferData HairGBuffer = (FGBufferData)0;
+			HairGBuffer.WorldNormal = P.T;
+			HairGBuffer.BaseColor = P.BaseColor;
+			HairGBuffer.Roughness = P.Roughness;
+			HairGBuffer.ShadingModelID = SHADINGMODELID_HAIR;
+			HairGBuffer.DiffuseColor = 0;
+			HairGBuffer.SpecularColor = 0;
+			HairGBuffer.Specular = SampleSpecular;
+			HairGBuffer.Metallic = 0;
+			HairGBuffer.Depth = 0.5f;
+			HairGBuffer.GBufferAO = 1;
+			HairGBuffer.CustomData = float4(0,0,SampleBacklit,0);
+			HairGBuffer.IndirectIrradiance = 1000000;
+
+			const float Area = 0;
+			const float BackLit = 1;
+			OutColor.xyz = HairShading(HairGBuffer, PixelDir_Local, V_Local, T_Local, 1, TransmittanceData, BackLit, Area, uint2(0, 0)) * Exposure;
+		}
+
+		for (uint SampleIt = 0; SampleIt < P.SampleCount; SampleIt++)
+		{
+			const FDebugSample S_World = Debug_SampleBuffer[P.SampleOffset + SampleIt];
+
+			const float3 S_Local = mul(S_World.Direction, WorldToLocal);
+
+			if (dot(PixelDir_Local, S_Local) > CosAngleThreshold)
+			{
+				OutColor.xyz = float3(1, 0, 0);
+			}
+		}
+	}
+
+	if (!bIsValid)
+	{
+		discard;
+	}
+}
+
+#endif // SHADER_PLOTSAMPLE

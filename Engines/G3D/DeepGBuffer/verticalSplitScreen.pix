@@ -1,0 +1,29 @@
+#version 120 or 420 compatibility // -*- c++ -*-
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+uniform_Texture(2D, leftScreen_);
+uniform_Texture(2D, rightScreen_);
+
+uniform float separatorSize;
+
+uniform ivec2 guardBandSize;
+
+#if VERSION == 120
+#   define result gl_FragColor
+#else
+    out float4 result;
+#endif
+
+void main() {
+    bool inBand = abs((leftScreen_size.x * 0.5) - gl_FragCoord.x) < separatorSize;
+    bool leftSide = gl_FragCoord.x < (leftScreen_size.x * 0.5);
+    vec3 textureResult;
+    if (leftSide) {
+        textureResult = texelFetch(leftScreen_buffer, ivec2(gl_FragCoord.xy) + (ivec2(leftScreen_size.x - 2*guardBandSize.x, 0) / 4), 0).rgb;
+    } else {
+        textureResult = texelFetch(rightScreen_buffer, ivec2(gl_FragCoord.xy) - (ivec2(leftScreen_size.x - 2*guardBandSize.x, 0) / 4) , 0).rgb;
+    }
+    result = float4(textureResult, 1.0);
+    result = float4(inBand ? float3(0.0) : textureResult, 1.0);
+}

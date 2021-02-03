@@ -1,0 +1,64 @@
+#version 460 // -*- c++ -*-
+/** \file GIRenderer_generateMirrorRays.glc */
+
+#extension GL_NV_compute_shader_derivatives : enable
+
+//#include <g3dmath.glsl>
+//#include <GBuffer/GBuffer.glsl>
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <reconstructFromDepth.glsl>
+
+uniform_GBuffer(gbuffer_);
+
+// Must be after GBuffer declaration
+#include <deferredHelpers.glsl>
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+//layout(std430, binding = 0) restrict writeonly buffer OriginSSBO {
+//    vec4 rayOrigin[];
+//};
+//layout(std430, binding = 1) restrict writeonly buffer DirectionSSBO {
+//    vec4 rayDirection[];
+//};
+
+layout(rgba32f) uniform image2D rayOriginImage;
+layout(rgba32f) uniform image2D rayDirectionImage;
+
+uniform int2 scale;
+uniform int numRays;
+
+void main() {
+    const int idx = (int)gl_GlobalInvocationID.y * (int)g3d_FragCoordExtent.x + (int)gl_GlobalInvocationID.x;
+
+    if ((idx >= numRays) || (gl_GlobalInvocationID.x >= g3d_FragCoordExtent.x) || (gl_GlobalInvocationID.y >= g3d_FragCoordExtent.y)) {
+        // These indices are out of bounds. If we don't clamp the x coordinate 
+        // it wraps around and overwrites subsequent lines, so return early.
+        return;
+    }
+
+    ivec2 texCoord = ivec2(gl_GlobalInvocationID.xy);
+
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_GlobalInvocationID.xy * scale);
+    Vector3 w_o;
+    UniversalMaterialSample surfel;
+    if (! readUniversalMaterialSampleFromGBuffer(C, false, true, w_o, surfel) || 
+        (sum(surfel.fresnelReflectionAtNormalIncidence) < 0.0002)) {
+        // Non reflective (or sky!): degenerate ray. This must have a zero direction
+        // so that the reflection processing code can distinguish it from a skybox reflection.
+        imageStore(rayOriginImage, texCoord, float4(-1e6, 0, 0, 0));
+        imageStore(rayDirectionImage, texCoord, float4(0, 0, 0, 0));
+        return;
+    }
+
+    // Start the ray slightly away from the surface to avoid self-intersection and 
+    // bump maps or interpolated vertex normals sending reflection rays through the 
+    // primary surfaces.
+    const float rayMinDistance = 0.0003;
+	imageStore(rayOriginImage, texCoord, float4(surfel.position + w_o * 0.02 + surfel.shadingNormal * 0.02, rayMinDistance));
+    imageStore(rayDirectionImage, texCoord, float4(-reflect(w_o, surfel.shadingNormal), inf));
+}

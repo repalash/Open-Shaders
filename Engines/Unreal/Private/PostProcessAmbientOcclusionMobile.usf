@@ -1,0 +1,866 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessAmbientOcclusionMobile.usf
+=============================================================================*/
+
+#include "Common.ush"
+#include "PostProcessCommon.ush"
+
+// GTAO
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER || SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER || SPATIALFILTER_PIXEL_SHADER
+
+float4 FadeRadiusMulAdd_FadeDistance_AttenFactor;
+float4 WorldRadiusAdj_SinDeltaAngle_CosDeltaAngle_Thickness;
+
+half4 Power_Intensity_ScreenPixelsToSearch;
+half4 DepthBufferSizeAndInvSize;
+half4 BufferSizeAndInvSize;
+half4 ViewSizeAndInvSize;
+half4 ViewRectMin;
+
+half2 TexturePosToBufferUV(int2 TexturePos)
+{
+	half2 BufferUV = (TexturePos + half2(0.5f, 0.5f) + ViewRectMin.xy) * BufferSizeAndInvSize.zw;
+
+	return BufferUV;
+}
+
+half4 EncodeFloatRGBA(half v)
+{
+	float4 enc = float4(1.0, 255.0, 65025.0, 16581375.0) * v;
+	half4 encValue = frac(enc);
+	encValue -= encValue.yzww * half4(0.0039215686275f, 0.0039215686275f, 0.0039215686275f, 0.0f);
+	return encValue;
+}
+
+half DecodeFloatRGBA(half4 rgba)
+{
+	return dot(rgba, half4(1.0, 0.0039215686275f, 1.53787e-5f, 6.03086294e-8f));
+}
+
+#endif
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER || SPATIALFILTER_COMPUTE_SHADER
+
+const static int MAX_THREAD_GROUP_SIZE = THREADGROUP_SIZEX * THREADGROUP_SIZEY;
+#define ARRAY_SIZE (MAX_THREAD_GROUP_SIZE * 2)  //THREADGROUP_SIZEX and THREADGROUP_SIZEY should be as larger as possible and at least 16
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER
+const static int2 DEPTH_GROUP_THREAD_OFFSET = int2(3, 3);
+const static int DEPTH_THREADPOS_OFFSET = THREADGROUP_SIZEX + 6; // Spatial Filter pass needs extra 3 and HorizonSearchIntegrate pass needs extra 2 
+const static int MAX_DEPTH_THREADS = (THREADGROUP_SIZEX + 6) * (THREADGROUP_SIZEY + 6);
+#elif HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER
+const static int2 DEPTH_GROUP_THREAD_OFFSET = int2(1, 1);
+const static int DEPTH_THREADPOS_OFFSET = THREADGROUP_SIZEX + 2;
+const static int MAX_DEPTH_THREADS = (THREADGROUP_SIZEX + 2) * (THREADGROUP_SIZEY + 2);
+#elif SPATIALFILTER_COMPUTE_SHADER
+const static int2 DEPTH_GROUP_THREAD_OFFSET = int2(2, 2);
+const static int DEPTH_THREADPOS_OFFSET = THREADGROUP_SIZEX + 4;
+const static int MAX_DEPTH_THREADS = (THREADGROUP_SIZEX + 4) * (THREADGROUP_SIZEY + 4);
+#endif
+
+groupshared half DeviceZArray[ARRAY_SIZE];
+
+void SetZVal(half DeviceZ, int Index)
+{
+	DeviceZArray[Index] = DeviceZ;
+}
+
+half GetDeviceZFromSharedMemory(int2 ThreadPos)
+{
+	return DeviceZArray[ThreadPos.x + (ThreadPos.y * DEPTH_THREADPOS_OFFSET)];
+}
+
+float GetSceneDepthFromSharedMemory(int2 ThreadPos)
+{
+	return ConvertFromDeviceZ(GetDeviceZFromSharedMemory(ThreadPos));
+}
+
+const static int2 AO_GROUP_THREAD_OFFSET = int2(2, 2);
+const static int AO_THREADPOS_OFFSET = THREADGROUP_SIZEX + 4;
+const static int MAX_AO_THREADS = (THREADGROUP_SIZEX + 4) * (THREADGROUP_SIZEY + 4);
+
+groupshared half AOArray[ARRAY_SIZE];
+
+void SetAOVal(half AO, int Index)
+{
+	AOArray[Index] = AO;
+}
+
+half GetAOValueFromSharedMemory(int2 ThreadPos)
+{
+	ThreadPos += AO_GROUP_THREAD_OFFSET;
+	return AOArray[ThreadPos.x + (ThreadPos.y * AO_THREADPOS_OFFSET)];
+}
+
+RWTexture2D<half4> OutTexture;
+
+#endif
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER || SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER || SPATIALFILTER_PIXEL_SHADER
+
+#if SHADER_QUALITY == 0
+	// very low
+	#define GTAO_NUMTAPS 4
+	#define GTAO_BIASMIPLEVEL 2
+	#define GTAO_MAX_PIXEL_SCREEN_RADIUS 256.0f
+#elif SHADER_QUALITY == 1
+	// low
+	#define GTAO_NUMTAPS 6
+	#define GTAO_BIASMIPLEVEL 1
+	#define GTAO_MAX_PIXEL_SCREEN_RADIUS 256.0f
+#elif SHADER_QUALITY == 2
+	// medium
+	#define GTAO_NUMTAPS 8
+	#define GTAO_BIASMIPLEVEL 0
+	#define GTAO_MAX_PIXEL_SCREEN_RADIUS 256.0f
+#elif SHADER_QUALITY == 3
+	// high
+	#define GTAO_NUMTAPS 12
+	#define GTAO_BIASMIPLEVEL 0
+	#define GTAO_MAX_PIXEL_SCREEN_RADIUS 256.0f
+#else // SHADER_QUALITY == 4
+	// very high
+	#define GTAO_NUMTAPS 20
+	#define GTAO_BIASMIPLEVEL 0
+	#define GTAO_MAX_PIXEL_SCREEN_RADIUS 256.0f
+#endif
+
+const static half PI_HALF = (PI*0.5);
+const static half LUTSize = 16;
+
+Texture2D AOInputTexture;
+SamplerState AOInputSampler;
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+Texture2D NormalTexture;
+SamplerState NormalSampler;
+
+#if PREINTEGRATED_LUT_TYPE == 2
+Texture3D GTAOPreIntegrated3D;
+#elif PREINTEGRATED_LUT_TYPE == 1
+Texture2D GTAOPreIntegrated2D;
+#endif
+
+#if PREINTEGRATED_LUT_TYPE != 0
+SamplerState GTAOPreIntegratedSampler;
+#endif
+
+half InterleavedGradientNoise(int2 TexturePos)
+{
+	return frac(52.9829189f * frac((TexturePos.x * 0.06711056f) + (TexturePos.y * 0.00583715f)));
+}
+
+half3 GetRandomVector(int2 TexturePos)
+{
+	TexturePos.y = 16384 - TexturePos.y;
+
+	half3 RandomVec = half3(0, 0, 0);
+	half3 RandomTexVec = half3(0, 0, 0);
+	half ScaleOffset;
+
+	const half TemporalCos = 0.8660253882f;
+	const half TemporalSin = 0.50f;
+
+	half GradientNoise = InterleavedGradientNoise(TexturePos);
+
+	RandomTexVec.x = cos((GradientNoise*PI));
+	RandomTexVec.y = sin((GradientNoise*PI));
+
+	ScaleOffset = (1.0 / 4.0)  *  ((TexturePos.y - TexturePos.x) & 3);
+//	ScaleOffset = (1.0/5.0)  *  (( TexturePos.y - TexturePos.x) % 5);
+
+	RandomVec.x = dot(RandomTexVec.xy, half2(TemporalCos, -TemporalSin));
+	RandomVec.y = dot(RandomTexVec.xy, half2(TemporalSin, TemporalCos));
+	RandomVec.z = frac(ScaleOffset + 0.025f);
+
+	return RandomVec;
+}
+
+half GetDeviceZFromAOInput(half2 TextureUV)
+{
+	return Texture2DSample(SceneDepthTexture, SceneDepthSampler, TextureUV).r;
+}
+
+float GetSceneDepthFromAOInput(half2 TextureUV)
+{
+	return ConvertFromDeviceZ(GetDeviceZFromAOInput(TextureUV));
+}
+
+float3 GetViewSpacePosFromAOInput(half2 UV)
+{
+	float SceneDepth = GetSceneDepthFromAOInput(UV);
+
+	return ScreenToViewPos(UV, SceneDepth);
+}
+
+float TakeSmallerAbsDelta(float left, float mid, float right)
+{
+	float a = mid - left;
+	float b = right - mid;
+
+	return (abs(a) < abs(b)) ? a : b;
+}
+
+half3 GetNormal(half2 UV, int2 ThreadPos, float3 ViewSpacePosMid)
+{
+	half3 ViewSpaceNormal;
+
+#if USE_NORMALBUFFER
+
+	// Get the normal from the normal buffer
+	half3 WorldNormal = Texture2DSample(NormalTexture, NormalSampler, UV).xyz;
+	ViewSpaceNormal = normalize(mul(WorldNormal, (half3x3)ResolvedView.TranslatedWorldToView));
+
+#else
+	// Get the normal derived from the depth buffer
+	half2 XOffset = half2(BufferSizeAndInvSize.z, 0.0f);
+	half2 YOffset = half2(0.0f, BufferSizeAndInvSize.w);
+
+#if HORIZONSEARCH_INTEGRAL_PIXEL_SHADER || SPATIALFILTER_PIXEL_SHADER
+	float DeviceZ = GetDeviceZFromAOInput(UV);
+	float DeviceZLeft = GetDeviceZFromAOInput(UV - XOffset);
+	float DeviceZTop = GetDeviceZFromAOInput(UV - YOffset);
+	float DeviceZRight = GetDeviceZFromAOInput(UV + XOffset);
+	float DeviceZBottom = GetDeviceZFromAOInput(UV + YOffset);
+#else
+	int2 iXOffset = int2(1, 0);
+	int2 iYOffset = int2(0, 1);
+	int2 ThreadOffsetPos = ThreadPos + DEPTH_GROUP_THREAD_OFFSET;
+	float DeviceZ = GetDeviceZFromSharedMemory(ThreadOffsetPos);
+	float DeviceZLeft = GetDeviceZFromSharedMemory(ThreadOffsetPos - iXOffset);
+	float DeviceZTop = GetDeviceZFromSharedMemory(ThreadOffsetPos - iYOffset);
+	float DeviceZRight = GetDeviceZFromSharedMemory(ThreadOffsetPos + iXOffset);
+	float DeviceZBottom = GetDeviceZFromSharedMemory(ThreadOffsetPos + iYOffset);
+#endif
+
+	float DeviceZDdx = TakeSmallerAbsDelta(DeviceZLeft, DeviceZ, DeviceZRight);
+	float DeviceZDdy = TakeSmallerAbsDelta(DeviceZTop, DeviceZ, DeviceZBottom);
+
+	float ZRight = ConvertFromDeviceZ(DeviceZ + DeviceZDdx);
+	float ZDown = ConvertFromDeviceZ(DeviceZ + DeviceZDdy);
+
+	float3 Right = ScreenToViewPos(UV + XOffset, ZRight) - ViewSpacePosMid;
+	float3 Down = ScreenToViewPos(UV + YOffset, ZDown) - ViewSpacePosMid;
+
+	ViewSpaceNormal = normalize(cross(Right, Down));
+#endif
+
+	return ViewSpaceNormal;
+}
+
+// max absolute error 9.0x10^-3
+// Eberly's polynomial degree 1 - respect bounds
+// 4 VGPR, 12 FR (8 FR, 1 QR), 1 scalar
+// input [-1, 1] and output [0, PI]
+half acosFast_Half(half inX)
+{
+	half x = abs(inX);
+	half res = -0.156583f * x + (0.5f * PI);
+	res *= sqrt(1.0f - x);
+	return (inX >= 0) ? res : PI - res;
+}
+
+half4 UnwrappedTexture3DSamplePoint(Texture2D Texture, SamplerState Sampler, half3 UVW, half Size)
+{
+	// a volume texture 16x16x16 would be unwrapped to a 2d texture 256x16
+
+	half IntW = floor(UVW.z * (Size - 1) + 0.5f);
+
+	half U = (UVW.x + IntW) / Size;
+	half V = UVW.y;
+
+	half4 RG0 = Texture2DSample(Texture, Sampler, half2(U, V));
+
+	return RG0;
+}
+
+half2 SearchForLargestAngleDual(half2 BaseUV, half2 ScreenDir, float SearchRadius, half InitialOffset, float3 ViewPos, half3 ViewDir, float AttenFactor)
+{
+	half OOLen, Ang, FallOff;
+	float3 V;
+	float LenSq;
+	float2 SceneDepths = 0;
+
+	half2 BestAng = half2(-1, -1);
+	half Thickness = WorldRadiusAdj_SinDeltaAngle_CosDeltaAngle_Thickness.w;
+
+	for (uint i = 0; i < GTAO_NUMTAPS; i++)
+	{
+		half fi = (half)i;
+
+		half2 UVOffset = ScreenDir * max(SearchRadius * (fi + InitialOffset), (fi + 1));
+		UVOffset.y *= -1;
+		half4 UV2 = BaseUV.xyxy + half4(UVOffset.xy, -UVOffset.xy);
+
+		// Positive Direction
+		SceneDepths.x = GetSceneDepthFromAOInput(UV2.xy);
+		SceneDepths.y = GetSceneDepthFromAOInput(UV2.zw);
+
+		V = ScreenToViewPos(UV2.xy, SceneDepths.x) - ViewPos;
+		LenSq = dot(V, V);
+		OOLen = rsqrt(LenSq + 0.0001);
+		Ang = dot(V, ViewDir) * OOLen;
+
+		FallOff = saturate(LenSq * AttenFactor);
+		Ang = lerp(Ang, BestAng.x, FallOff);
+		BestAng.x = (Ang > BestAng.x) ? Ang : lerp(Ang, BestAng.x, Thickness);
+
+		// Negative Direction
+		V = ScreenToViewPos(UV2.zw, SceneDepths.y) - ViewPos;
+		LenSq = dot(V, V);
+		OOLen = rsqrt(LenSq + 0.0001);
+		Ang = dot(V, ViewDir) * OOLen;
+
+		FallOff = saturate(LenSq * AttenFactor);
+		Ang = lerp(Ang, BestAng.y, FallOff);
+		BestAng.y = (Ang > BestAng.y) ? Ang : lerp(Ang, BestAng.y, Thickness);
+	}
+
+#if PREINTEGRATED_LUT_TYPE == 0
+	BestAng.x = acosFast(clamp(BestAng.x, -1.0, 1.0));
+	BestAng.y = acosFast(clamp(BestAng.y, -1.0, 1.0));
+#endif
+
+	return BestAng;
+}
+
+half ComputeInnerIntegral(half2 Angles, half3 ScreenDir, half3 ViewDir, half3 ViewSpaceNormal, half SceneDepth)
+{
+	// Given the angles found in the search plane we need to project the View Space GBuffer Normal onto the plane defined by the search axis and the View Direction and perform the inner integrate
+	half3 PlaneNormal = normalize(cross(ScreenDir, ViewDir));
+	half3 Perp = cross(ViewDir, PlaneNormal);
+	half3 ProjNormal = ViewSpaceNormal - PlaneNormal * dot(ViewSpaceNormal, PlaneNormal);
+
+	half LenProjNormal = length(ProjNormal) + 0.000001f;
+	half RecipMag = 1.0f / (LenProjNormal);
+
+	half CosAng = dot(ProjNormal, Perp) * RecipMag;
+
+#if PREINTEGRATED_LUT_TYPE == 2
+
+	half3 UVW = half3(Angles, CosAng)*0.5f + 0.5f;
+	half AO = (LenProjNormal) * Texture3DSample(GTAOPreIntegrated3D, GTAOPreIntegratedSampler, UVW).r;
+
+#elif PREINTEGRATED_LUT_TYPE == 1
+
+	half3 UVW = half3(Angles, CosAng)*0.5f + 0.5f;
+	half AO = (LenProjNormal) * UnwrappedTexture3DSamplePoint(GTAOPreIntegrated2D, GTAOPreIntegratedSampler, UVW, LUTSize).r;
+
+#else
+
+	half Gamma = acosFast_Half(CosAng) - PI_HALF;
+	half CosGamma = dot(ProjNormal, ViewDir) * RecipMag;
+	half SinGamma = CosAng * -2.0f;
+
+	// clamp to normal hemisphere 
+	Angles.x = Gamma + max(-Angles.x - Gamma, -(PI_HALF));
+	Angles.y = Gamma + min(Angles.y - Gamma, (PI_HALF));
+
+	half AO = ((LenProjNormal) *  0.25f *
+		((Angles.x * SinGamma + CosGamma - cos((2.0 * Angles.x) - Gamma)) +
+		(Angles.y * SinGamma + CosGamma - cos((2.0 * Angles.y) - Gamma))));
+
+#endif
+	
+	return AO;
+}
+
+half CalculateGTAO(half2 TextureUV, int2 TexturePos, int2 ThreadPos)
+{
+	TextureUV += DepthBufferSizeAndInvSize.zw*0.125;
+#if HORIZONSEARCH_INTEGRAL_PIXEL_SHADER || SPATIALFILTER_PIXEL_SHADER
+	float SceneDepth = GetSceneDepthFromAOInput(TextureUV);
+#else
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER
+	ThreadPos -= AO_GROUP_THREAD_OFFSET;
+#endif
+	float SceneDepth = GetSceneDepthFromSharedMemory(ThreadPos + DEPTH_GROUP_THREAD_OFFSET);
+#endif
+
+	if (SceneDepth > FadeRadiusMulAdd_FadeDistance_AttenFactor.z)
+	{
+		return 1.0f;
+	}
+	else
+	{
+		float3 ViewSpacePos = ScreenToViewPos(TextureUV, SceneDepth);
+		half3 ViewSpaceNormal = GetNormal(TextureUV, ThreadPos, ViewSpacePos);
+		half3 ViewDir = -normalize(ViewSpacePos.xyz);
+
+		float WorldRadiusAdj = WorldRadiusAdj_SinDeltaAngle_CosDeltaAngle_Thickness.x;
+
+		float PixelRadius = max(min(WorldRadiusAdj / ViewSpacePos.z, GTAO_MAX_PIXEL_SCREEN_RADIUS), (half)GTAO_NUMTAPS);
+		float StepRadius = PixelRadius / ((half)GTAO_NUMTAPS + 1);
+		float AttenFactor = FadeRadiusMulAdd_FadeDistance_AttenFactor.w;
+
+		half3 RandomAndOffset = GetRandomVector(TexturePos);
+		half2 RandomVec = RandomAndOffset.xy;
+		half  Offset = RandomAndOffset.z;
+
+		half Sum = 0.0;
+
+		const uint NumAngles = 2;
+
+		half SinDeltaAngle = WorldRadiusAdj_SinDeltaAngle_CosDeltaAngle_Thickness.y;
+		half CosDeltaAngle = WorldRadiusAdj_SinDeltaAngle_CosDeltaAngle_Thickness.z;
+
+		half3 ScreenDir = half3(RandomVec.x, RandomVec.y, 0.0);
+
+		for (uint Angle = 0; Angle < 2; Angle++)
+		{
+			half2 Angles = SearchForLargestAngleDual(TextureUV, ScreenDir.xy * View.BufferSizeAndInvSize.zw, StepRadius,
+				Offset, ViewSpacePos, ViewDir, AttenFactor);
+
+			Sum += ComputeInnerIntegral(Angles, ScreenDir, ViewDir, ViewSpaceNormal, SceneDepth);
+
+			// Rotate for the next angle
+			half2 TempScreenDir = ScreenDir.xy;
+			ScreenDir.x = (TempScreenDir.x *  CosDeltaAngle) + (TempScreenDir.y * -SinDeltaAngle);
+			ScreenDir.y = (TempScreenDir.x *  SinDeltaAngle) + (TempScreenDir.y * CosDeltaAngle);
+			Offset = frac(Offset + 0.617);
+		}
+
+		half AO = Sum;
+
+		AO = AO * 0.5f;
+		AO *= 2.0 * 0.3183098861f;
+
+		// Fade out based on user defined distance
+		AO = lerp(AO, 1, saturate(SceneDepth * FadeRadiusMulAdd_FadeDistance_AttenFactor.x + FadeRadiusMulAdd_FadeDistance_AttenFactor.y));
+
+		return AO;
+	}
+}
+
+half2 GetDeviceZAndAO(half2 TextureUV)
+{
+	half2 DeviceZAndAO;
+	half4 EncodeDeviceZAndAO = Texture2DSample(AOInputTexture, AOInputSampler, TextureUV);
+	DeviceZAndAO.y = EncodeDeviceZAndAO.a;
+	EncodeDeviceZAndAO.a = 0.0f;
+	DeviceZAndAO.x = DecodeFloatRGBA(EncodeDeviceZAndAO);
+
+	return DeviceZAndAO;
+}
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER || HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER || SPATIALFILTER_COMPUTE_SHADER
+void CacheZVal(int2 FullGroupOriginDepth, uint pixIdx)
+{
+	int2 ThreadPos;
+
+	ThreadPos.x = pixIdx % DEPTH_THREADPOS_OFFSET;
+	ThreadPos.y = pixIdx / DEPTH_THREADPOS_OFFSET;
+
+	int2 TexturePos = FullGroupOriginDepth + ThreadPos;
+
+	half2 TextureUV = TexturePosToBufferUV(TexturePos);
+
+//	TextureUV += DepthBufferSizeAndInvSize.zw*0.125;
+
+	SetZVal(GetDeviceZFromAOInput(TextureUV.xy).r, pixIdx);
+}
+
+void CacheAOVal(int2 FullGroupOriginAO, uint pixIdx)
+{
+	int2 ThreadPos;
+
+	ThreadPos.x = pixIdx % AO_THREADPOS_OFFSET;
+	ThreadPos.y = pixIdx / AO_THREADPOS_OFFSET;
+
+	int2 TexturePos = FullGroupOriginAO + ThreadPos;
+
+	half2 TextureUV = TexturePosToBufferUV(TexturePos);
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER
+	SetAOVal(CalculateGTAO(TextureUV.xy, TexturePos.xy, ThreadPos.xy), pixIdx);
+#elif SPATIALFILTER_COMPUTE_SHADER
+	half2 DeviceZAndAO = GetDeviceZAndAO(TextureUV);
+	SetAOVal(DeviceZAndAO.y, pixIdx);
+	SetZVal(DeviceZAndAO.x, pixIdx);
+#endif
+}
+#endif
+
+#if SPATIALFILTER_PIXEL_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+half4 GTAOSpatialFilter(half2 TextureUV, int2 ThreadPos, int2 PixelPos)
+#else
+void GTAOSpatialFilter(int2 ThreadPos, int2 PixelPos)
+#endif
+{
+	if (any(PixelPos >= (int2)ViewSizeAndInvSize.xy))
+	{
+#if SPATIALFILTER_PIXEL_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+		return 1.0f;
+#else
+		return;
+#endif
+	}
+
+	half2 ZDiff;
+
+	// Get the ZDiffs array
+#if SPATIALFILTER_PIXEL_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+	half ThisZ = GetDeviceZAndAO(TextureUV).x;
+
+	{
+		half2 X2Offset = half2(2 * BufferSizeAndInvSize.z, 0);
+		half2 X1Offset = half2(BufferSizeAndInvSize.z, 0);
+
+		half XM2Z = GetDeviceZAndAO(TextureUV - X2Offset).x;
+		half XM1Z = GetDeviceZAndAO(TextureUV - X1Offset).x;
+		half XP1Z = GetDeviceZAndAO(TextureUV + X1Offset).x;
+		half XP2Z = GetDeviceZAndAO(TextureUV + X2Offset).x;
+
+		// Get extrapolated point either side
+		half C1 = abs((XM1Z + (XM1Z - XM2Z)) - ThisZ);
+		half C2 = abs((XP1Z + (XP1Z - XP2Z)) - ThisZ);
+
+		if (C1 < C2)
+		{
+			ZDiff.x = XM1Z - XM2Z;
+		}
+		else
+		{
+			ZDiff.x = XP2Z - XP1Z;
+		}
+	}
+
+	{
+		half2 Y2Offset = half2(0, 2 * BufferSizeAndInvSize.w);
+		half2 Y1Offset = half2(0, BufferSizeAndInvSize.w);
+
+		half YM2Z = GetDeviceZAndAO(TextureUV - Y2Offset).x;
+		half YM1Z = GetDeviceZAndAO(TextureUV - Y1Offset).x;
+		half YP1Z = GetDeviceZAndAO(TextureUV + Y1Offset).x;
+		half YP2Z = GetDeviceZAndAO(TextureUV + Y2Offset).x;
+
+		// Get extrapolated point either side
+		half C1 = abs((YM1Z + (YM1Z - YM2Z)) - ThisZ);
+		half C2 = abs((YP1Z + (YP1Z - YP2Z)) - ThisZ);
+
+		if (C1 < C2)
+		{
+			ZDiff.y = YM1Z - YM2Z;
+		}
+		else
+		{
+			ZDiff.y = YP2Z - YP1Z;
+		}
+	}
+#else
+	int2 ThreadOffsetPos = ThreadPos + DEPTH_GROUP_THREAD_OFFSET;
+	half ThisZ = GetDeviceZFromSharedMemory(ThreadOffsetPos);
+
+	{
+		int2 X2Offset = int2(2, 0);
+		int2 X1Offset = int2(1, 0);
+
+		half XM2Z = GetDeviceZFromSharedMemory(ThreadOffsetPos - X2Offset);
+		half XM1Z = GetDeviceZFromSharedMemory(ThreadOffsetPos - X1Offset);
+		half XP1Z = GetDeviceZFromSharedMemory(ThreadOffsetPos + X1Offset);
+		half XP2Z = GetDeviceZFromSharedMemory(ThreadOffsetPos + X2Offset);
+
+		// Get extrapolated point either side
+		half C1 = abs((XM1Z + (XM1Z - XM2Z)) - ThisZ);
+		half C2 = abs((XP1Z + (XP1Z - XP2Z)) - ThisZ);
+
+		if (C1 < C2)
+		{
+			ZDiff.x = XM1Z - XM2Z;
+		}
+		else
+		{
+			ZDiff.x = XP2Z - XP1Z;
+		}
+	}
+
+	{
+		int2 Y2Offset = int2(0, 2);
+		int2 Y1Offset = int2(0, 1);
+
+		half YM2Z = GetDeviceZFromSharedMemory(ThreadOffsetPos - Y2Offset);
+		half YM1Z = GetDeviceZFromSharedMemory(ThreadOffsetPos - Y1Offset);
+		half YP1Z = GetDeviceZFromSharedMemory(ThreadOffsetPos + Y1Offset);
+		half YP2Z = GetDeviceZFromSharedMemory(ThreadOffsetPos + Y2Offset);
+
+		// Get extrapolated point either side
+		half C1 = abs((YM1Z + (YM1Z - YM2Z)) - ThisZ);
+		half C2 = abs((YP1Z + (YP1Z - YP2Z)) - ThisZ);
+
+		if (C1 < C2)
+		{
+			ZDiff.y = YM1Z - YM2Z;
+		}
+		else
+		{
+			ZDiff.y = YP2Z - YP1Z;
+		}
+	}
+#endif
+
+	half SumAO = 0;
+	half SumWeight = 0;
+
+	int x, y;
+
+	// Get the Z Value to compare against 
+
+	half DepthBase = ThisZ - (ZDiff.x * 2) - (ZDiff.y * 2);
+
+	for (y = -2; y <= 2; y++)
+	{
+		half PlaneZ = DepthBase;
+
+		for (x = -2; x <= 2; x++)
+		{
+			// Get value and see how much it compares to the centre with the gradients
+			half XDiff = abs(x);
+
+#if SPATIALFILTER_PIXEL_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+			half2 CurrentTextureUV = TextureUV + half2(x, y) * BufferSizeAndInvSize.zw;
+			half2 SampleZAndAO = GetDeviceZAndAO(CurrentTextureUV);
+#else
+			int2 SamplePos = ThreadPos + int2(x, y);
+			half2 SampleZAndAO;
+			SampleZAndAO.y = GetAOValueFromSharedMemory(SamplePos);
+			SampleZAndAO.x = GetDeviceZFromSharedMemory(SamplePos + DEPTH_GROUP_THREAD_OFFSET);
+#endif
+			half Weight = 1.0f;
+// 			if ((x == 0) && (y == 0)) //Need do profile to see whether disble branch is more efficent
+// 			{
+// 				Weight = 1.0f;
+// 			}
+// 			else
+			{
+				// Get the bilateral weight. This is a function of the difference in height between the plane equation and the base depth
+				// Compare the Z at this sample with the gradients 
+				half SampleZDiff = abs(PlaneZ - SampleZAndAO.x);
+
+				Weight = 1.0f - saturate(SampleZDiff*1000.0f);
+			}
+
+			SumAO += SampleZAndAO.y * Weight;
+			SumWeight += Weight;
+
+			PlaneZ += ZDiff.x;
+		}
+		DepthBase += ZDiff.y;
+	}
+	SumAO /= SumWeight;
+
+	SumAO *= (PI * 0.5f);
+
+	// user adjust AO
+	half AmbientOcclusionIntensity = Power_Intensity_ScreenPixelsToSearch.y;
+	half AmbientOcclusionPower = Power_Intensity_ScreenPixelsToSearch.x;
+	SumAO = 1 - (1 - pow(abs(SumAO), AmbientOcclusionPower)) * AmbientOcclusionIntensity;
+
+#if SPATIALFILTER_PIXEL_SHADER || HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+	return SumAO;
+#else
+	OutTexture[PixelPos] = SumAO;
+#endif
+}
+#endif
+
+#if HORIZONSEARCH_INTEGRAL_SPATIALFILTER_COMPUTE_SHADER
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void GTAOHorizonSearchIntegralSpatialFilterCS(
+	int   GroupIndex : SV_GroupIndex,
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID
+#if INSTANCED_STEREO
+	, uint InstanceId : SV_InstanceID
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in uint ViewId : SV_ViewID
+	, out float MultiViewIndex : VIEW_ID
+#endif
+)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = GetEyeIndex(InstanceId);
+	ResolvedView = ResolveView(EyeIndex);
+	LayerIndex = EyeIndex;
+#elif MOBILE_MULTI_VIEW
+#if COMPILER_GLSL_ES3_1
+	const int MultiViewId = int(ViewId);
+	ResolvedView = ResolveView(uint(MultiViewId));
+	MultiViewIndex = float(MultiViewId);
+#else
+	ResolvedView = ResolveView(ViewId);
+	MultiViewIndex = float(ViewId);
+#endif
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	int2 FullGroupOrigin = int2(GroupId.x * THREADGROUP_SIZEX, GroupId.y * THREADGROUP_SIZEY);
+	uint pixIdx = GroupIndex;
+
+	// Cache SceneDepth in Group Shared memory for calculating the normal from depth.
+	{
+		int2 FullGroupOriginDepth = FullGroupOrigin.xy - DEPTH_GROUP_THREAD_OFFSET;
+
+		pixIdx = GroupIndex * 2;
+		if (pixIdx < MAX_DEPTH_THREADS)
+		{
+			CacheZVal(FullGroupOriginDepth, pixIdx);
+
+			CacheZVal(FullGroupOriginDepth, pixIdx + 1);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	// Cache AO in shared group memory for spatial filter
+	{
+		int2   FullGroupOriginAO = FullGroupOrigin.xy - AO_GROUP_THREAD_OFFSET;
+
+		pixIdx = GroupIndex * 2;
+
+		if (pixIdx < MAX_AO_THREADS)
+		{
+			CacheAOVal(FullGroupOriginAO, pixIdx);
+
+			CacheAOVal(FullGroupOriginAO, pixIdx + 1);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	GTAOSpatialFilter(GroupThreadId, DispatchThreadId);
+}
+#endif
+
+#if HORIZONSEARCH_INTEGRAL_COMPUTE_SHADER
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void GTAOHorizonSearchIntegralCS(
+	int   GroupIndex : SV_GroupIndex,
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID
+#if INSTANCED_STEREO
+	, uint InstanceId : SV_InstanceID
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in uint ViewId : SV_ViewID
+	, out float MultiViewIndex : VIEW_ID
+#endif
+)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = GetEyeIndex(InstanceId);
+	ResolvedView = ResolveView(EyeIndex);
+	LayerIndex = EyeIndex;
+#elif MOBILE_MULTI_VIEW
+#if COMPILER_GLSL_ES3_1
+	const int MultiViewId = int(ViewId);
+	ResolvedView = ResolveView(uint(MultiViewId));
+	MultiViewIndex = float(MultiViewId);
+#else
+	ResolvedView = ResolveView(ViewId);
+	MultiViewIndex = float(ViewId);
+#endif
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	int2 FullGroupOrigin = int2(GroupId.x * THREADGROUP_SIZEX, GroupId.y * THREADGROUP_SIZEY);
+	int pixIdx = GroupIndex;
+
+	// Cache SceneDepth in Group Shared memory for calculating the normal from depth.
+	{
+		int2 FullGroupOriginDepth = FullGroupOrigin.xy - DEPTH_GROUP_THREAD_OFFSET;
+
+		pixIdx = GroupIndex * 2;
+		if (pixIdx < MAX_DEPTH_THREADS)
+		{
+			CacheZVal(FullGroupOriginDepth, pixIdx);
+
+			CacheZVal(FullGroupOriginDepth, pixIdx + 1);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	int2 ThreadPos = int2(GroupThreadId);
+	int2 TexturePos = int2(DispatchThreadId);
+
+	half2 TextureUV = TexturePosToBufferUV(TexturePos);
+
+	half GTAO = CalculateGTAO(TextureUV.xy, TexturePos.xy, ThreadPos.xy);
+	half DeviceZ = GetDeviceZFromSharedMemory(ThreadPos + DEPTH_GROUP_THREAD_OFFSET);
+
+	half4 EncodeZ = EncodeFloatRGBA(DeviceZ);
+	EncodeZ.a = GTAO;
+	OutTexture[TexturePos] = EncodeZ;
+}
+#endif
+
+#if SPATIALFILTER_COMPUTE_SHADER
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void GTAOSpatialFilterCS(
+	int   GroupIndex : SV_GroupIndex,
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	int2 FullGroupOrigin = int2(GroupId.x * THREADGROUP_SIZEX, GroupId.y * THREADGROUP_SIZEY);
+	uint pixIdx = GroupIndex;
+
+	// Cache AO and DeviceZ in shared group memory for spatial filter
+	{
+		int2 FullGroupOriginAO = FullGroupOrigin.xy - AO_GROUP_THREAD_OFFSET;
+
+		pixIdx = GroupIndex * 2;
+
+		if (pixIdx < MAX_AO_THREADS)
+		{
+			CacheAOVal(FullGroupOriginAO, pixIdx);
+
+			CacheAOVal(FullGroupOriginAO, pixIdx + 1);
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	GTAOSpatialFilter(GroupThreadId, DispatchThreadId);
+}
+#endif
+
+#if HORIZONSEARCH_INTEGRAL_PIXEL_SHADER
+void GTAOHorizonSearchIntegralPS(
+	float4 InUVPos : TEXCOORD0,
+	in float4 SvPosition : SV_Position,
+	out half4 OutColor : SV_Target0
+)
+{
+	ResolvedView = ResolveView();
+
+	int2 TexturePos = SvPosition.xy - 0.5f;
+	half2 TextureUV = TexturePosToBufferUV(TexturePos);
+
+	half GTAO = CalculateGTAO(TextureUV, TexturePos, 0);
+	OutColor = EncodeFloatRGBA(GetDeviceZFromAOInput(TextureUV));
+	OutColor.a = GTAO;
+}
+#endif
+
+#if SPATIALFILTER_PIXEL_SHADER
+void GTAOSpatialFilterPS(
+	float4 InUVPos : TEXCOORD0,
+	in float4 SvPosition : SV_Position, 
+	out half4 OutColor : SV_Target0)
+{
+	ResolvedView = ResolveView();
+
+	int2 TexturePos = SvPosition.xy - 0.5f;
+	half2 TextureUV = TexturePosToBufferUV(TexturePos);
+
+	OutColor = GTAOSpatialFilter(TextureUV, 0, TexturePos);
+}
+#endif

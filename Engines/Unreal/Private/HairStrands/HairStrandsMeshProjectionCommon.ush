@@ -1,0 +1,259 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+struct FHairMeshTriangle
+{
+	float3 P0;
+	float3 P1;
+	float3 P2;
+
+	float3 E0;
+	float3 E1;
+
+	float3 N;
+};
+
+struct FHairMeshTriangleWithUVs : FHairMeshTriangle
+{
+	float2 UV0;
+	float2 UV1;
+	float2 UV2;
+};
+
+uint PackUVs(float2 UV)
+{
+	return (f32tof16(UV.x) & 0xFFFF) | ((f32tof16(UV.y) & 0xFFFF) << 16);
+}
+
+float PackUVsToFloat(float2 UV)
+{
+	return asfloat(PackUVs(UV));
+}
+
+float2 UnPackUVs(uint InUV)
+{
+	float2 Out;
+	Out.x = f16tof32(InUV & 0xFFFF);
+	Out.y = f16tof32((InUV >> 16) & 0xFFFF);
+	return Out;
+}
+
+float2 UnPackUVs(float InUV)
+{
+	return UnPackUVs(asuint(InUV));
+}
+
+float2 GetVertexUV(uint VId, Buffer<float2> InUVBuffer, Buffer<uint> InIndexBuffer, uint InIndexOffset, uint InMaxIndexCount, uint InMaxVertexCount, uint InMeshUVsChannelOffset, uint InMeshUVsChannelCount)
+{
+	const uint Index = min(InIndexOffset + VId, InMaxIndexCount - 1);
+	uint VertexIndex = InIndexBuffer.Load(Index);
+	VertexIndex = min(VertexIndex, InMaxVertexCount - 1);
+
+	const uint UVIndex = InMeshUVsChannelOffset + InMeshUVsChannelCount * VertexIndex;
+	return InUVBuffer.Load(UVIndex);
+}
+
+float3 GetVertexPosition(uint VId, Buffer<float> InPositionBuffer, Buffer<uint> InIndexBuffer, uint InIndexOffset, uint InMaxIndexCount, uint InMaxVertexCount)
+{
+	const uint Index = min(InIndexOffset + VId, InMaxIndexCount-1);
+	uint VertexIndex = InIndexBuffer.Load(Index);
+	VertexIndex = min(VertexIndex, InMaxVertexCount-1);
+
+	float3 P = 0;
+	P.x = InPositionBuffer.Load(VertexIndex*3 + 0);
+	P.y = InPositionBuffer.Load(VertexIndex*3 + 1);
+	P.z = InPositionBuffer.Load(VertexIndex*3 + 2);
+	return P;
+}
+
+FHairMeshTriangle GetTriangleData(uint TriangleIndex, Buffer<float> InPositionBuffer, Buffer<uint> InIndexBuffer, uint InIndexOffset, uint InMaxIndexCount, uint InMaxVertexCount)
+{
+	const uint BaseVertexId = TriangleIndex*3;
+	const uint VId0 = BaseVertexId;
+	const uint VId1 = BaseVertexId+1;
+	const uint VId2 = BaseVertexId+2;
+
+	FHairMeshTriangle Out;
+	Out.P0 = GetVertexPosition(VId0, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.P1 = GetVertexPosition(VId1, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.P2 = GetVertexPosition(VId2, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.E0 = Out.P1 - Out.P0;
+	Out.E1 = Out.P2 - Out.P0;
+	Out.N = normalize(cross(Out.E1, Out.E0));
+
+	return Out;
+}
+
+FHairMeshTriangleWithUVs GetTriangleData(uint TriangleIndex, Buffer<float> InPositionBuffer, Buffer<float2> InUVBuffer, Buffer<uint> InIndexBuffer, uint InIndexOffset, uint InMaxIndexCount, uint InMaxVertexCount, uint InMeshUVsChannelOffset, uint InMeshUVsChannelCount)
+{
+	const uint BaseVertexId = TriangleIndex * 3;
+	const uint VId0 = BaseVertexId;
+	const uint VId1 = BaseVertexId + 1;
+	const uint VId2 = BaseVertexId + 2;
+
+	FHairMeshTriangleWithUVs Out;
+	Out.P0 = GetVertexPosition(VId0, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.P1 = GetVertexPosition(VId1, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.P2 = GetVertexPosition(VId2, InPositionBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount);
+	Out.E0 = Out.P1 - Out.P0;
+	Out.E1 = Out.P2 - Out.P0;
+	Out.N = normalize(cross(Out.E1, Out.E0));
+
+	Out.UV0 = GetVertexUV(VId0, InUVBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount, InMeshUVsChannelOffset, InMeshUVsChannelCount);
+	Out.UV1 = GetVertexUV(VId1, InUVBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount, InMeshUVsChannelOffset, InMeshUVsChannelCount);
+	Out.UV2 = GetVertexUV(VId2, InUVBuffer, InIndexBuffer, InIndexOffset, InMaxIndexCount, InMaxVertexCount, InMeshUVsChannelOffset, InMeshUVsChannelCount);
+	
+	return Out;
+}
+
+FHairMeshTriangle GetTriangleTransformation(
+	uint RootIndex,
+	Buffer<float4>  InPosition0Buffer,
+	Buffer<float4>  InPosition1Buffer,
+	Buffer<float4>  InPosition2Buffer)
+{
+	FHairMeshTriangle Out;
+
+	// Build orthonormal frame
+	Out.P0 = InPosition0Buffer[RootIndex].xyz;
+	Out.P1 = InPosition1Buffer[RootIndex].xyz;
+	Out.P2 = InPosition2Buffer[RootIndex].xyz;
+	Out.E0 = Out.P1 - Out.P0;
+	Out.E1 = Out.P2 - Out.P0;
+
+	Out.N  = normalize(cross(Out.E1, Out.E0));
+	Out.E0 = normalize(Out.E0); 
+	Out.E1 = normalize(cross(Out.E0, Out.N));
+
+	return Out;
+}
+
+FHairMeshTriangleWithUVs GetTriangleWithUVsTransformation(
+	uint RootIndex,
+	Buffer<float4>  InPosition0Buffer,
+	Buffer<float4>  InPosition1Buffer,
+	Buffer<float4>  InPosition2Buffer)
+{
+	FHairMeshTriangleWithUVs Out;
+
+	const float4 V0 = InPosition0Buffer[RootIndex];
+	const float4 V1 = InPosition1Buffer[RootIndex];
+	const float4 V2 = InPosition2Buffer[RootIndex];
+
+	// Build orthonormal frame
+	Out.P0 = V0.xyz;
+	Out.P1 = V1.xyz;
+	Out.P2 = V2.xyz;
+	Out.E0 = Out.P1 - Out.P0;
+	Out.E1 = Out.P2 - Out.P0;
+
+	Out.N = normalize(cross(Out.E1, Out.E0));
+	Out.E0 = normalize(Out.E0);
+	Out.E1 = normalize(cross(Out.E0, Out.N));
+
+	Out.UV0 = UnPackUVs(V0.w);
+	Out.UV1 = UnPackUVs(V1.w);
+	Out.UV2 = UnPackUVs(V2.w);
+
+	return Out;
+}
+
+float3 ToTriangle(const float3 P, float3 B, const FHairMeshTriangle T)
+{
+	const float3 LocalP = P - (T.P0 * B.x + T.P1 * B.y + T.P2 * B.z);
+
+	float3 Out;
+	Out.x = dot(LocalP, T.E0);
+	Out.y = dot(LocalP, T.E1);
+	Out.z = dot(LocalP, T.N);
+	return Out;
+}
+
+float3 ToWorld(const float3 P, float3 B, const FHairMeshTriangle T)
+{
+	const float3 Rotation = P.x * T.E0 + P.y * T.E1 + P.z * T.N;
+	const float3 Translation = T.P0 * B.x + T.P1 * B.y + T.P2 * B.z;
+	return Rotation + Translation;
+
+}
+
+float3 VectorToWorld(const float3 P, const FHairMeshTriangle T)
+{
+	const float3 Rotation = P.x * T.E0 + P.y * T.E1 + P.z * T.N;
+	return Rotation;
+}
+
+float3 VectorToTriangle(const float3 P, const FHairMeshTriangle T)
+{
+	float3 Out;
+	Out.x = dot(P, T.E0);
+	Out.y = dot(P, T.E1);
+	Out.z = dot(P, T.N);
+	return Out;
+}
+
+float3 TransformPoint(float3 P, float3 B, const FHairMeshTriangle RestTriangle, const FHairMeshTriangle DeformedTriangle)
+{
+	float3 LocalP = ToTriangle(P, B, RestTriangle);
+	return ToWorld(LocalP, B, DeformedTriangle);
+}
+
+struct FHairProjectionData
+{
+	uint TriangleIndex;
+	float2 Barycentrics;
+};
+
+FHairProjectionData DecodeHairProjectionData(uint4 Data)
+{
+	const float B0 = f16tof32(Data.z);
+	const float B1 = f16tof32(Data.w);
+
+	FHairProjectionData Out;
+	Out.Barycentrics = float2(B0, B1);
+	Out.TriangleIndex = (Data.x & 0xFFFF) | ((Data.y & 0xFFFF) << 16);
+	return Out;
+}
+
+uint4 EncodeHairProjectionData(FHairProjectionData Data)
+{
+	uint4 Out;
+	Out.x = Data.TriangleIndex & 0xFFFF;
+	Out.y = (Data.TriangleIndex>>16) & 0xFFFF;
+	Out.z = f32tof16(saturate(Data.Barycentrics.x));
+	Out.w = f32tof16(saturate(Data.Barycentrics.y));
+	return Out;
+}
+
+uint EncodeBarycentrics(float2 B)
+{
+	return f32tof16(B.x) | (f32tof16(B.y) << 16);
+}
+
+float3 DecodeBarycentrics(uint E)
+{
+	float3 Out;
+	Out.x = f16tof32(E & 0xFFFF);
+	Out.y = f16tof32((E >> 16) & 0xFFFF);
+	Out.z = 1 - Out.x - Out.y;
+	return Out;
+}
+
+
+struct FHairTriangleIndex
+{
+	uint TriangleIndex;
+	uint SectionIndex;
+};
+
+uint EncodeTriangleIndex(uint TriangleIndex, uint SectionIndex)
+{
+	return ((SectionIndex & 0xFF)<<24) | (TriangleIndex & 0xFFFFFF);
+}
+
+FHairTriangleIndex DecodeTriangleIndex(uint Encoded)
+{
+	FHairTriangleIndex Out;
+	Out.SectionIndex = (Encoded>>24) & 0xFF;
+	Out.TriangleIndex = Encoded & 0xFFFFFF;
+	return Out;
+}

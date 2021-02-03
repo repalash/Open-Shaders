@@ -1,0 +1,29 @@
+#version 410
+/**
+  \file data-files/shader/unlit.vrt
+
+  Apply a color and texture.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#expect HAS_TEXTURE "1 or 0"
+
+#if HAS_TEXTURE
+    in vec2 g3d_TexCoord0;
+    out vec2 texCoord;
+#endif
+
+in vec4 g3d_Vertex;
+
+out vec3 csPosition;
+
+void main() {
+#   if HAS_TEXTURE
+        texCoord = g3d_TexCoord0.xy;
+#   endif
+    csPosition = g3d_ObjectToCameraMatrix * g3d_Vertex;
+    gl_Position = g3d_Vertex * g3d_ObjectToScreenMatrixTranspose;
+}

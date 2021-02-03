@@ -1,0 +1,43 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "RayTracingDiskLight.ush"
+
+bool GenerateSpotLightOcclusionRay(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax
+)
+{
+	bool IsVisible = true;
+	float3 LightDirection = LightParameters.Position - WorldPosition;
+	float RayLength = length(LightDirection);
+	LightDirection *= rcp(RayLength);
+
+	if (LightParameters.SourceRadius > 0.0)
+	{
+		IsVisible = GenerateDiskLightOcclusionRay(LightParameters, WorldPosition, WorldNormal, RandSample,
+			RayOrigin, RayDirection, RayTMin, RayTMax);
+	}
+	else
+	{
+		RayOrigin = WorldPosition;
+		RayDirection = LightDirection;
+		RayTMin = 0.01;
+		RayTMax = RayLength;
+	}
+
+	// Apply culling
+	if (IsVisible)
+	{
+		float CosAngle = LightParameters.SpotAngles.x;
+		IsVisible = dot(LightDirection, LightParameters.Direction) >= CosAngle;
+	}
+	return IsVisible;
+}

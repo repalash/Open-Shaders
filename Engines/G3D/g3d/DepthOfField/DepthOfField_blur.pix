@@ -1,0 +1,205 @@
+#version 330
+/**
+  \file data-files/shader/DepthOfField/DepthOfField_blur.pix
+
+  Computes the near field blur.  This is included by both the horizontal
+  (first) and vertical (second) passes.
+
+  The shader produces two outputs:
+
+  * blurResult
+
+    A buffer that is the scene blurred with a spatially varying kernel
+    kernel that attempts to make the point-spread function at each pixel
+    equal to its circle of confusion radius.
+
+    blurResult.rgb = color
+    blurResult.a   = normalized coc radius
+
+  * nearResult
+
+    A buffer that contains only near field, blurred with premultiplied
+    alpha.  The point spread function is a fixed RADIUS in this region.
+
+    nearResult.rgb = coverage * color
+    nearResult.a   = coverage
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+/* The near field has a POSITIVE radius in this code and the far field is negative. This is the opposite of other G3D conventions. */
+
+#include <compatibility.glsl>
+
+#expect HORIZONTAL "1 if horizontal, 0 if vertical"
+
+/** Maximum blur radius for any point in the scene, in pixels.  Used to
+    reconstruct the CoC radius from the normalized CoC radius. */
+uniform int         maxCoCRadiusPixels;
+
+/** Source image in RGB, normalized CoC in A. */
+uniform sampler2D	blurSourceBuffer;
+
+uniform int         nearBlurRadiusPixels;
+uniform float       invNearBlurRadiusPixels;
+
+uniform float       lowResolutionFactor;
+
+uniform float       fieldOfView;
+
+#if HORIZONTAL
+	const int2 direction = int2(1, 0);
+#else
+	const int2 direction = int2(0, 1);
+
+	/** For the second pass, the output of the previous near-field blur pass. */
+	uniform sampler2D  nearSourceBuffer;
+#endif
+
+#if __VERSION__ < 130
+#	define nearResult gl_FragData[0]
+#	define blurResult gl_FragData[1]
+#else
+layout(location = 0) out float4 nearResult;
+layout(location = 1) out float4 blurResult;
+#endif
+
+    
+bool inNearField(float radiusPixels) {
+    return radiusPixels > 0.25;
+}
+
+float square(float x) { return x * x; }
+
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render. used for VR. <= 0 to disable"
+
+void main() {        
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+           discard;
+        }
+#   endif
+        
+    // Accumulate the blurry image color
+    blurResult.rgb  = float3(0.0f);
+    float blurWeightSum = 0.0f;
+    
+    // Accumulate the near-field color and coverage
+    nearResult = float4(0.0f);
+    float nearWeightSum = 0.000f;
+    
+    // Location of the central filter tap (i.e., "this" pixel's location)
+    // Account for the scaling down to 50% of original dimensions during blur
+	int2 A = int2(gl_FragCoord.xy * (direction * lowResolutionFactor + (ivec2(1) - direction)));
+    
+    float packedA = texelFetch(blurSourceBuffer, A, 0).a;
+    float r_A = (packedA * 2.0 - 1.0) * maxCoCRadiusPixels;
+    
+    // Map r_A << 0 to 0, r_A >> 0 to 1
+    float nearFieldness_A = saturate(r_A * 4.0);
+    
+    for (int delta = -maxCoCRadiusPixels; delta <= maxCoCRadiusPixels; ++delta)	{
+        // Tap location near A
+        int2   B = A + (direction * delta);
+
+        // Packed values
+        float4 blurInput = texelFetch(blurSourceBuffer, clamp(B, int2(0), textureSize(blurSourceBuffer, 0) - int2(1)), 0);
+
+        // Signed kernel radius at this tap, in pixels
+        float r_B = (blurInput.a * 2.0 - 1.0) * float(maxCoCRadiusPixels);
+
+        /////////////////////////////////////////////////////////////////////////////////////////////
+        // Compute blurry buffer
+
+        float weight = 0.0;
+       
+        float invB = 1.0 / (0.01 + abs(r_B));
+        float wNormal  =
+            // Only consider mid- or background pixels (allows inpainting of the near-field)
+            float(! inNearField(r_B)) *
+            
+            // Only blur B over A if B is closer to the viewer (allow a few pixels of slop, and smooth the transition)
+			// This term avoids "glowy" background objects OR both are *really* blurry in the far field
+            saturate(max(r_B - r_A + 1.0, (0.01 - r_A) * invB)) *
+           
+            // Gaussian kernel of "radius" based on pixel B.
+            exp(-square(delta * invB * 1.4142));
+        weight = lerp(wNormal, 1.0, nearFieldness_A);
+
+        // far + mid-field output 
+        blurWeightSum  += weight;
+        blurResult.rgb += blurInput.rgb * weight;
+        
+        ///////////////////////////////////////////////////////////////////////////////////////////////
+        // Compute near-field super-blurry buffer.
+        // Applying this only within the near blur radius has no effect on performance or quality.
+        
+        float4 near;
+#   	if HORIZONTAL
+            // On the first pass, roll in a prepass of computing near-field premultiplied 
+            // blur contribution. This is similar to http://www.crytek.com/download/Sousa_Graphics_Gems_CryENGINE3.pdf
+            // No terms based on delta may appear in these expressions, since that will be asymmetric
+            // under the separated blur. Note that the signed nature must be preserved so that
+            // negative values become zero.
+            near.a = square(saturate(r_B * invNearBlurRadiusPixels));
+            near.rgb = blurInput.rgb * near.a;
+#       else
+            // In the second pass, we're just performing a box blur on this image with premultiplied alpha            
+            near = texelFetch(nearSourceBuffer, clamp(B, int2(0), textureSize(nearSourceBuffer, 0) - int2(1)), 0);
+#       endif
+
+        // The outer loop iterates over both near and far field.
+        // Apply gaussian weighting to the near-field blur within the radius of 
+        // the intended near field.
+        weight = exp(-square(delta * invNearBlurRadiusPixels));
+
+        nearResult += near * weight;
+        nearWeightSum += weight;
+    }
+
+    
+#   if HORIZONTAL
+        // Retain the packed radius on the first pass.  On the second pass it is not needed.
+        blurResult.a = packedA;
+#   else
+        // Vertical, second pass
+        blurResult.a = 1.0;
+#   endif
+
+    // Normalize the blur
+    blurResult.rgb /= blurWeightSum;
+    nearResult     /= max(nearWeightSum, 0.000001); 
+    
+#   if ! HORIZONTAL
+
+    // Boost the coverage of the near field by this factor.  Should always be >= 1
+    //
+    // Make this larger if near-field objects seem too transparent
+    //
+    // Make this smaller if an obvious line is visible between the near-field blur and the mid-field sharp region
+    // when looking at a textured ground plane.
+
+    {
+        // Needs to increase with field of view
+        float coverageBoost = fieldOfView;
+        // Increase near field coverage. We can't just scale by coverageBoost
+        // even though we're using premultiplied alpha because there
+        // is nonlinear clamping of alpha at 1.0. 
+        
+        // If this minimum value is too large, then there will be an intensity
+        // dip when compositing the premultiplied-alpha value, since it will not
+        // be correctly premultiplied.
+        const float minimumValue = 0.000001;
+        
+        float oldAlpha = nearResult.a;
+        float newAlpha = clamp(smoothstep(oldAlpha, 0.0, 0.025 / coverageBoost), minimumValue, 1.0);
+
+        nearResult.rgb = nearResult.rgb * (max(minimumValue, newAlpha) / max(oldAlpha, minimumValue));
+        nearResult.a = newAlpha;
+    }
+#   endif
+}

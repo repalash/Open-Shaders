@@ -1,0 +1,342 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayTracingSkyLightEvaluation.ush: Common functions for SkyLight ray traced evaluation
+===============================================================================================*/
+
+#pragma once
+
+#include "../Common.ush"
+#include "../QuasiRandom.ush"
+#include "../ShadingModels.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ReflectionEnvironmentShared.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingSkyLightCommon.ush"
+#include "SkyLightVisibilityRaysData.ush"
+
+uint3 SkyLightVisibilityRaysDimensions;
+StructuredBuffer<FSkyLightVisibilityRays> SkyLightVisibilityRays;
+
+#ifndef USE_HAIR_LIGHTING
+#define USE_HAIR_LIGHTING 0
+#endif
+
+#if USE_HAIR_LIGHTING
+#include "../HairStrands/HairStrandsRaytracing.ush"
+#endif
+
+// Evaluates the radiance for the current sky light in a given direction
+float3 EvaluateSkyLightRadiance(float3 Direction)
+{
+	return SkyLight.Color * TextureCubeSampleLevel(SkyLight.Texture, SkyLight.TextureSampler, Direction, 0).rgb;
+}
+
+// Evaluates the current sky light at a given location on a surface by integrating over the sky light via casting occlusion rays
+// SampleCoord - Used for accessing the decoupled visibility ray buffer and should reflect some sort of uniformly distributed 2d coordinate to properly importance sample from the sky light. If bGBufferSampleOrigin is true this must be
+//               the pixel location of the g-buffer sample for proper camera ray bias and depth reconstruction.
+// WorldPosition - Unbiased position on a surface to sample from.
+// WorldNormal - Normal of the surface to sample from.
+// ViewDirection - Normalized vector from the viewing source in the direction of observation of the point to sample from
+// GBufferData - GBuffer data to use for surface BxDF evaluation.
+// bGBufferSampleOrigin - Indicates that the sample coordinate and world position were acquired from a g-buffer sample and that camera relative depth biasing should be used instead of just normal biased.
+// DeviceZ - The DeviceZ value from the g-buffer's depth buffer if bGBufferSampleOrigin is set to true, otherwise ignored.
+// bDecoupleSampleGeneration - Indicates weather or not to use decoupled sample generation for generating visibility rays, requires that the visibility ray buffer has been populated by the GenerateSkyLightVisibilityRaysCS pass.
+void SkyLightEvaluate(
+	in const uint2 SampleCoord,
+	in const uint2 PixelCoord,
+	in const uint SamplesPerPixel,
+	in const float3 WorldPosition,
+	in const float3 WorldNormal,
+	in const float3 ViewDirection,
+	in const FGBufferData GBufferData,
+	in const RaytracingAccelerationStructure TLAS,
+	in const bool bGBufferSampleOrigin,
+	in const float DeviceZ,
+	in const bool bDecoupleSampleGeneration,
+	inout float3 ExitantRadiance,
+	inout float3 DiffuseExitantRadiance,
+	inout float AmbientOcclusion,
+	inout float HitDistance)
+{
+	float FaceCdf[7];
+	FQuasiRandom QuasiRandom;
+	const uint BlueNoiseDimension = 0;
+	float3 BlueNoiseShift;
+
+	if (!bDecoupleSampleGeneration)
+	{
+		// Cache Cubeface CDF
+		const uint MipCount = log2(SkyLight.MipDimensions.x);
+		BuildFaceCdf(MipCount, FaceCdf);
+
+		// Initialize a quasi random sequence for the current pixel
+		QuasiRandom_Initialize(QuasiRandom, SampleCoord, 0, SamplesPerPixel);
+		BlueNoiseShift = EvalBlueNoise(QuasiRandom.BlueNoiseCoord, BlueNoiseDimension);
+	}
+
+	float3 CurrentWorldNormal = WorldNormal;
+	float RayDistance = 0.0;
+	float HitCount = 0.0;
+	float3 BentNormal = float3(0.0f, 0.0f, 0.0f);
+
+	// Initialize the output exitant radiance, diffuse exitant radiance, ambient occlusion and hit distance
+	ExitantRadiance = float3(0.0f, 0.0f, 0.0f);
+	DiffuseExitantRadiance = float3(0.0f, 0.0f, 0.0f);
+	AmbientOcclusion = 0.0f;
+	HitDistance = -1.0f;
+
+	// Iterate up to the requested sample count
+	for (uint SampleIndex = 0; SampleIndex < SamplesPerPixel; ++SampleIndex)
+	{
+		RayDesc Ray;
+		float RayWeight;
+
+		if (bDecoupleSampleGeneration)
+		{
+			// Get a visibility ray for the current sample from the precomputed visibility ray buffer
+
+			const uint SkyLightVisibilityRayIndex = GetSkyLightVisibilityRayTiledIndex(SampleCoord, SampleIndex, SkyLightVisibilityRaysDimensions.xy);
+			FSkyLightVisibilityRays SkyLightVisibilityRay = SkyLightVisibilityRays[SkyLightVisibilityRayIndex];
+
+			Ray.Origin = WorldPosition;
+			Ray.Direction = SkyLightVisibilityRay.DirectionAndPdf.xyz;
+			Ray.TMin = 0.0;
+			Ray.TMax = SkyLight.MaxRayDistance;
+			RayWeight = SkyLightVisibilityRay.DirectionAndPdf.w;
+		}
+		else
+		{
+			QuasiRandom_Update(QuasiRandom, SampleIndex, SamplesPerPixel);
+
+			// Determine sky light or lambert ray
+			float3 RandSample = QuasiRandom_Sample3(QuasiRandom);
+			RandSample = HaltonSequence3(QuasiRandom.HaltonSequence, QuasiRandom.HaltonIteration, BlueNoiseDimension);
+			RandSample += BlueNoiseShift;
+			RandSample = fmod(RandSample, 1.0);
+
+			// Generate a visibility ray for the current sample
+			float SkyLightSamplingStrategyPdf = 0.5;
+			float MisWeight = 1.0;
+			float RayPdf = 0.0;
+			BRANCH
+			if (RandSample.x < SkyLightSamplingStrategyPdf)
+			{
+				RandSample.x /= SkyLightSamplingStrategyPdf;
+				GenerateSkyLightOcclusionRay(FaceCdf, RandSample, Ray.Direction, RayPdf);
+				MisWeight = RayPdf / (SkyLightSamplingStrategyPdf * RayPdf + (1.0 - SkyLightSamplingStrategyPdf) * PdfCosineHemisphericalOcclusionRay(CurrentWorldNormal, Ray.Direction));
+			}
+			else
+			{
+				GenerateCosineHemisphericalOcclusionRay(CurrentWorldNormal, RandSample.yz, Ray.Direction, RayPdf);
+				MisWeight = RayPdf / ((1.0 - SkyLightSamplingStrategyPdf) * RayPdf + SkyLightSamplingStrategyPdf * PdfSkyLightOcclusionRay(FaceCdf, Ray.Direction));
+			}
+
+			Ray.Origin = WorldPosition;
+			Ray.TMin = 0.0;
+			Ray.TMax = SkyLight.MaxRayDistance;
+			RayWeight = MisWeight / RayPdf;
+		}
+
+		// Recompute the current WorldNormal if lighting a hair fiber
+		if (GBufferData.ShadingModelID == SHADINGMODELID_HAIR)
+		{
+			const float3 LightDirection = Ray.Direction;
+			const float3 TangentDirection = normalize(CurrentWorldNormal);
+
+			CurrentWorldNormal = normalize(LightDirection - TangentDirection * dot(LightDirection, TangentDirection));
+		}
+
+		// Apply a depth bias based on if the sample world position came from the g-buffer or not
+		float NoL = dot(CurrentWorldNormal, Ray.Direction);
+		if (NoL > 0.0)
+		{
+			if (bGBufferSampleOrigin)
+			{
+				ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, CurrentWorldNormal, SkyLight.MaxNormalBias);
+			}
+			else
+			{
+				ApplyPositionBias(Ray, CurrentWorldNormal, SkyLight.MaxNormalBias);
+			}
+		}
+		else
+		{
+			ApplyPositionBias(Ray, -CurrentWorldNormal, SkyLight.MaxNormalBias);
+		}
+		NoL = saturate(NoL);
+
+		// Trace a visibility ray
+		uint RayFlags = 0;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+#if !ENABLE_MATERIALS
+		RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+#endif
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			Ray);
+
+		#if USE_HAIR_LIGHTING
+		if (GBufferData.ShadingModelID != SHADINGMODELID_HAIR)
+		{
+			const float HairOcclusionThreshold = 1;
+			RandomSequence RandSequence;
+			uint LinearIndex = CalcLinearIndex(PixelCoord);
+			RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex);
+			MinimalPayload.HitT = TraverseHair(PixelCoord, RandSequence, Ray.Origin, Ray.Direction, MinimalPayload.HitT, VirtualVoxel.Raytracing_SkyOcclusionThreshold);
+		}
+		#endif
+
+		if (MinimalPayload.IsHit())
+		{
+			RayDistance += MinimalPayload.HitT;
+			HitCount += 1.0;
+		}
+		else
+		{
+			BentNormal += Ray.Direction;
+
+			// Evaluate material
+			const half3 N = WorldNormal;
+			const half3 V = -ViewDirection;
+			const half3 L = Ray.Direction;
+			FDirectLighting LightingSample;
+			if (GBufferData.ShadingModelID == SHADINGMODELID_HAIR)
+			{
+				float Shadow = 0.0;
+				float Backlit = 0.0;
+				float Area = 0.0;
+				uint2 Random = 0;
+				FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
+				LightingSample.Diffuse = HairShading(GBufferData, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
+				LightingSample.Transmission = 0;
+				LightingSample.Specular = 0;
+			}
+			else
+			{
+				FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+				LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+			}
+			float3 Brdf = LightingSample.Diffuse + LightingSample.Transmission + LightingSample.Specular;
+			float3 IncomingRadiance = EvaluateSkyLightRadiance(Ray.Direction);
+
+			ExitantRadiance += IncomingRadiance * Brdf * RayWeight;
+			float3 DiffuseThroughput = LightingSample.Diffuse;
+			if (SkyLight.bTransmission)
+			{
+				DiffuseThroughput += LightingSample.Transmission;
+			}
+			DiffuseExitantRadiance += IncomingRadiance * DiffuseThroughput * RayWeight;
+		}
+	}
+
+	// Average values over the number of samples
+	if (SamplesPerPixel > 0)
+	{
+		const float SamplesPerPixelInv = rcp(SamplesPerPixel);
+		ExitantRadiance *= SamplesPerPixelInv;
+		DiffuseExitantRadiance *= SamplesPerPixelInv;
+		AmbientOcclusion = HitCount * SamplesPerPixelInv;
+	}
+
+	// Normalize the bent normal if it is not the zero vector
+	if (all(BentNormal == 0.0f))
+	{
+		BentNormal = WorldNormal;
+	}
+	else
+	{
+		BentNormal = normalize(BentNormal);
+	}
+
+	// Calculate the hit distance if any occluding geometry was hit
+	if (HitCount > 0.0)
+	{
+		HitDistance = RayDistance / HitCount;
+	}
+
+	// Add multi-scattering contribution
+	if (GBufferData.ShadingModelID == SHADINGMODELID_HAIR) {
+		const half3 N = WorldNormal;
+		const half3 V = -ViewDirection;
+		const half3 L = BentNormal;
+
+		// Trace a visibility ray from light to shading point to get estimation of "shadow thickness"
+		float ShadowThickness = 0.0;
+		{
+			RayDesc RayLocal;
+			RayLocal.Origin = WorldPosition + L * SkyLight.MaxShadowThickness;
+			RayLocal.Direction = -L;
+			RayLocal.TMin = 0.0;
+			RayLocal.TMax = SkyLight.MaxShadowThickness;
+
+			uint RayFlagsLocal = 0;
+			const uint InstanceInclusionMaskLocal = RAY_TRACING_MASK_SHADOW;
+
+#if !ENABLE_MATERIALS
+			RayFlagsLocal |= RAY_FLAG_FORCE_OPAQUE;
+#endif
+#if !ENABLE_TWO_SIDED_GEOMETRY
+			RayFlagsLocal |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+			FMinimalPayload MinimalPayloadLocal = TraceVisibilityRay(
+				TLAS,
+				RayFlagsLocal,
+				InstanceInclusionMaskLocal,
+				PixelCoord,
+				RayLocal);
+
+			float3 P = RayLocal.Origin + RayLocal.Direction * MinimalPayloadLocal.HitT;
+			ShadowThickness = min(length(WorldPosition - P), 1.0);
+		}
+		float3 ScatterThroughput = PI * KajiyaKayDiffuseAttenuation(GBufferData, L, V, N, ShadowThickness);
+		float3 SkySHDiffuseIrradiance = GetSkySHDiffuse(L) * View.SkyLightColor.rgb;
+
+		DiffuseExitantRadiance += SkySHDiffuseIrradiance * ScatterThroughput * (1.0 - AmbientOcclusion);
+	}
+}
+
+
+// special case of pixel coord == sample coord
+void SkyLightEvaluate(
+	in const uint2 SampleCoord,
+	in const uint SamplesPerPixel,
+	in const float3 WorldPosition,
+	in const float3 WorldNormal,
+	in const float3 ViewDirection,
+	in const FGBufferData GBufferData,
+	in const RaytracingAccelerationStructure TLAS,
+	in const bool bGBufferSampleOrigin,
+	in const float DeviceZ,
+	in const bool bDecoupleSampleGeneration,
+	inout float3 ExitantRadiance,
+	inout float3 DiffuseExitantRadiance,
+	inout float AmbientOcclusion,
+	inout float HitDistance)
+{
+	SkyLightEvaluate(
+		SampleCoord,
+		SampleCoord,
+		SamplesPerPixel,
+		WorldPosition,
+		WorldNormal,
+		ViewDirection,
+		GBufferData,
+		TLAS,
+		bGBufferSampleOrigin,
+		DeviceZ,
+		bDecoupleSampleGeneration,
+		ExitantRadiance,
+		DiffuseExitantRadiance,
+		AmbientOcclusion,
+		HitDistance);
+}

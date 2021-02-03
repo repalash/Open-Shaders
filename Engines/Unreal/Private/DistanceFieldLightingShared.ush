@@ -1,0 +1,496 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DistanceFieldLightingShared.usf
+=============================================================================*/
+
+#ifndef THREADGROUP_SIZEX
+#define THREADGROUP_SIZEX 1
+#endif   
+
+#ifndef THREADGROUP_SIZEY
+#define THREADGROUP_SIZEY 1
+#endif
+
+#define THREADGROUP_TOTALSIZE (THREADGROUP_SIZEX * THREADGROUP_SIZEY)
+
+#ifndef DOWNSAMPLE_FACTOR
+#define DOWNSAMPLE_FACTOR 1
+#endif
+
+#ifndef UPDATEOBJECTS_THREADGROUP_SIZE
+#define UPDATEOBJECTS_THREADGROUP_SIZE 1
+#endif
+
+#ifndef DISTANCEFIELD_PRIMITIVE_TYPE_DEFINED
+#define DISTANCEFIELD_PRIMITIVE_TYPE_DEFINED
+#define DFPT_SignedDistanceField 0
+#define DFPT_HeightField 1
+#endif
+
+#ifndef DISTANCEFIELD_PRIMITIVE_TYPE
+#define DISTANCEFIELD_PRIMITIVE_TYPE DFPT_SignedDistanceField
+#endif
+
+float3 DistanceFieldVolumePositionToUV(float3 VolumePosition, float3 UVScale, float3 UVAdd)
+{
+	float3 VolumeUV = VolumePosition * UVScale + UVAdd;
+	return VolumeUV;
+}
+
+Texture2D HFVisibilityTexture;
+SamplerState DistanceFieldSampler;
+
+#if (DISTANCEFIELD_PRIMITIVE_TYPE == DFPT_SignedDistanceField)
+Texture3D DistanceFieldTexture;
+
+float SampleMeshDistanceField(float3 VolumeUV, float2 ObjectDistanceFieldMAD)
+{
+	float TextureValue = Texture3DSampleLevel(DistanceFieldTexture, DistanceFieldSampler, VolumeUV, 0).x;
+#if EIGHT_BIT_MESH_DISTANCE_FIELDS
+	TextureValue = TextureValue * ObjectDistanceFieldMAD.x + ObjectDistanceFieldMAD.y;
+#endif
+	return TextureValue;
+}
+
+float SampleHeightFieldAtlas(float2 UV)
+{
+	return 0.0;
+}
+
+float SampleHFVisibilityTexture(float2 UV)
+{
+	return 0.0;
+}
+#else
+Texture2D DistanceFieldTexture;
+
+float SampleMeshDistanceField(float3 VolumeUV, float2 ObjectDistanceFieldMAD)
+{
+	return 0.0;
+}
+
+float SampleHeightFieldAtlas(float2 UV)
+{
+	float4 SampleValue = Texture2DSampleLevel(DistanceFieldTexture, DistanceFieldSampler, UV, 0);
+	return DecodePackedHeight(SampleValue.xy);
+}
+
+float SampleHFVisibilityTexture(float2 UV)
+{
+	return Texture2DSampleLevel(HFVisibilityTexture, DistanceFieldSampler, UV, 0).r;
+}
+#endif
+
+float3 DistanceFieldAtlasTexelSize;
+
+RWBuffer<uint> RWObjectIndirectArguments;
+Buffer<uint> ObjectIndirectArguments;
+
+uint GetCulledNumObjects()
+{
+	// IndexCount, NumInstances, StartIndex, BaseVertexIndex, FirstInstance
+	return ObjectIndirectArguments[1];
+}
+
+// In float4's.  Must match equivalent C++ variables.
+#if (DISTANCEFIELD_PRIMITIVE_TYPE == DFPT_SignedDistanceField)
+#define OBJECT_BOUNDS_STRIDE 1
+#define OBJECT_DATA_STRIDE 17
+#elif (DISTANCEFIELD_PRIMITIVE_TYPE == DFPT_HeightField)
+#define OBJECT_BOUNDS_STRIDE 2
+#define OBJECT_DATA_STRIDE 6
+#else
+#error Unknown distance field primitive type
+#endif
+
+uint NumSceneObjects;
+
+#if PLATFORM_SUPPORTS_4COMPONENT_UAV_READ_WRITE
+
+Buffer<float4> SceneObjectBounds;
+Buffer<float4> SceneObjectData;
+
+float4 LoadFloat4(Buffer<float4> InBuffer, uint VectorIndex)
+{
+	return InBuffer[VectorIndex];
+}
+
+
+RWBuffer<float4> RWSceneObjectBounds;
+RWBuffer<float4> RWSceneObjectData;
+
+float4 LoadFloat4(RWBuffer<float4> InBuffer, uint VectorIndex)
+{
+	return InBuffer[VectorIndex];
+}
+
+void WriteFloat4(RWBuffer<float4> InBuffer, uint VectorIndex, float4 Value)
+{
+	InBuffer[VectorIndex] = Value;
+}
+
+#else
+
+// Have to make these R32F with 4x the reads and writes because of the horrible D3D11 limitation
+// "error X3676: typed UAV loads are only allowed for single-component 32-bit element types"
+Buffer<float> SceneObjectBounds;
+Buffer<float> SceneObjectData;
+
+float4 LoadFloat4(Buffer<float> InBuffer, uint VectorIndex)
+{
+	uint BaseVectorIndex = VectorIndex * 4;
+	return float4(InBuffer[BaseVectorIndex + 0], InBuffer[BaseVectorIndex + 1], InBuffer[BaseVectorIndex + 2], InBuffer[BaseVectorIndex + 3]);
+}
+
+RWBuffer<float> RWSceneObjectBounds;
+RWBuffer<float> RWSceneObjectData;
+
+float4 LoadFloat4(RWBuffer<float> InBuffer, uint VectorIndex)
+{
+	uint BaseVectorIndex = VectorIndex * 4;
+	return float4(InBuffer[BaseVectorIndex + 0], InBuffer[BaseVectorIndex + 1], InBuffer[BaseVectorIndex + 2], InBuffer[BaseVectorIndex + 3]);
+}
+
+void WriteFloat4(RWBuffer<float> InBuffer, uint VectorIndex, float4 Value)
+{
+	uint BaseVectorIndex = VectorIndex * 4;
+	InBuffer[BaseVectorIndex + 0] = Value.x;
+	InBuffer[BaseVectorIndex + 1] = Value.y;
+	InBuffer[BaseVectorIndex + 2] = Value.z;
+	InBuffer[BaseVectorIndex + 3] = Value.w;
+}
+
+#endif
+
+
+
+float4 LoadGlobalObjectPositionAndRadius(uint ObjectIndex)
+{
+	return LoadFloat4(SceneObjectBounds, ObjectIndex);
+}
+
+float4x4 LoadGlobalObjectWorldToVolume(uint ObjectIndex)
+{
+	float4 M0 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 0);
+	float4 M1 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 1);
+	float4 M2 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 2);
+
+	return transpose(float4x4(M0, M1, M2, float4(0.0f, 0.0f, 0.0f, 1.0f)));
+}
+ 
+float3 LoadGlobalObjectLocalPositionExtent(uint ObjectIndex)
+{
+	return LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 3).xyz;
+}
+
+uint LoadGlobalObjectOftenMoving(uint ObjectIndex)
+{
+	float WComponent = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 3).w;
+	return WComponent;
+}
+
+float4 LoadGlobalObjectUVScale(uint ObjectIndex)
+{
+	return LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 4);
+}
+
+float3 LoadGlobalObjectUVAdd(uint ObjectIndex)
+{
+	return LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 5).xyz;
+}
+
+float2 LoadGlobalObjectDistanceFieldMAD(uint ObjectIndex)
+{
+	return LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 6).xy;
+}
+
+float2 LoadGlobalObjectMinMaxDrawDistance2(uint ObjectIndex)
+{
+    return LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 6).zw;
+}
+
+float4x4 LoadGlobalObjectOBBToWorld(uint ObjectIndex)
+{
+	float4 M0 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 14);
+	float4 M1 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 15);
+	float4 M2 = LoadFloat4(SceneObjectData, ObjectIndex * OBJECT_DATA_STRIDE + 16);
+
+	return transpose(float4x4(M0, M1, M2, float4(0.0f, 0.0f, 0.0f, 1.0f)));
+}
+
+// In float4's.  Must match equivalent C++ variables.
+#if (DISTANCEFIELD_PRIMITIVE_TYPE == DFPT_SignedDistanceField)
+#define CULLED_OBJECT_DATA_STRIDE 17
+#define CULLED_OBJECT_BOX_BOUNDS_STRIDE 5
+#elif (DISTANCEFIELD_PRIMITIVE_TYPE == DFPT_HeightField)
+#define CULLED_OBJECT_DATA_STRIDE 6
+#define CULLED_OBJECT_BOX_BOUNDS_STRIDE 5
+#else
+#error Unknown distance field primitive type
+#endif
+
+float4 LoadObjectPositionAndRadiusFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * OBJECT_BOUNDS_STRIDE];
+}
+
+float4x4 LoadObjectWorldToVolumeFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	float4 M0 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 0];
+	float4 M1 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 1];
+	float4 M2 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 2];
+
+	return transpose(float4x4(M0, M1, M2, float4(0.0f, 0.0f, 0.0f, 1.0f)));
+}
+ 
+float3 LoadObjectLocalPositionExtentFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 3].xyz;
+}
+
+float4 LoadObjectUVScaleFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer, out bool bGeneratedAsTwoSided)
+{
+	float4 Value = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 4].xyzw;
+	bGeneratedAsTwoSided = Value.w < 0;
+	return float4(Value.xyz, abs(Value.w));
+}
+
+float4 LoadObjectUVAddAndSelfShadowBiasFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 5];
+}
+
+float2 LoadObjectDistanceFieldMADFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 6].xy;
+}
+
+float3x3 LoadObjectVolumeToWorldFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	float3 M0 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 7].xyz;
+	float3 M1 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 8].xyz;
+	float3 M2 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 9].xyz;
+
+	return float3x3(M0, M1, M2);
+}
+
+float4x4 LoadObjectLocalToWorldFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	float4 M0 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 10];
+	float4 M1 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 11];
+	float4 M2 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 12];
+
+	return transpose(float4x4(M0, M1, M2, float4(0.0f, 0.0f, 0.0f, 1.0f)));
+}
+
+float4x4 LoadObjectOBBToWorldFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	float4 M0 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 14];
+	float4 M1 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 15];
+	float4 M2 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 16];
+
+	return transpose(float4x4(M0, M1, M2, float4(0.0f, 0.0f, 0.0f, 1.0f)));
+}
+
+void LoadHeightFieldObjectBoxBoundsFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer, out float3 OutBoxOrigin, out float3 OutBoxExtent)
+{
+	OutBoxOrigin = InBuffer[ObjectIndex * OBJECT_BOUNDS_STRIDE + 0].xyz;
+	OutBoxExtent = InBuffer[ObjectIndex * OBJECT_BOUNDS_STRIDE + 1].xyz;
+}
+
+float4x4 LoadHeightFieldObjectWorldToLocalFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	float4 M0 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 0];
+	float4 M1 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 1];
+	float4 M2 = InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 2];
+
+	return transpose(float4x4(M0, M1, M2, float4(0, 0, 0, 1)));
+}
+
+float4 LoadHeightFieldObjectSizeScaleFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 3];
+}
+
+float4 LoadHeightFieldObjectAtlasUVScaleBiasFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 4];
+}
+
+float4 LoadHeightFieldObjectVisibilityAtlasUVScaleBiasFromBuffer(uint ObjectIndex, StructuredBuffer<float4> InBuffer)
+{
+	return InBuffer[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 5];
+}
+
+// These are structured buffers so they can be scalar memory loads on GCN
+StructuredBuffer<float4> CulledObjectBounds;
+StructuredBuffer<float4> CulledObjectData;
+StructuredBuffer<float4> CulledObjectBoxBounds;
+
+RWStructuredBuffer<float4> RWCulledObjectBounds;
+RWStructuredBuffer<float4> RWCulledObjectData;
+RWStructuredBuffer<float4> RWCulledObjectBoxBounds;
+
+float4 LoadObjectPositionAndRadius(uint ObjectIndex)
+{
+	return LoadObjectPositionAndRadiusFromBuffer(ObjectIndex, CulledObjectBounds);
+}
+
+float4x4 LoadObjectWorldToVolume(uint ObjectIndex)
+{
+	return LoadObjectWorldToVolumeFromBuffer(ObjectIndex, CulledObjectData);
+}
+ 
+float3 LoadObjectLocalPositionExtent(uint ObjectIndex)
+{
+	return LoadObjectLocalPositionExtentFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4 LoadObjectUVScale(uint ObjectIndex)
+{
+	bool bUnused;
+	return LoadObjectUVScaleFromBuffer(ObjectIndex, CulledObjectData, bUnused);
+}
+
+float4 LoadObjectUVScale(uint ObjectIndex, out bool bGeneratedAsTwoSided)
+{
+	return LoadObjectUVScaleFromBuffer(ObjectIndex, CulledObjectData, bGeneratedAsTwoSided);
+}
+
+float4 LoadObjectUVAddAndSelfShadowBias(uint ObjectIndex)
+{
+	return LoadObjectUVAddAndSelfShadowBiasFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float2 LoadObjectDistanceFieldMAD(uint ObjectIndex)
+{
+	return LoadObjectDistanceFieldMADFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float3x3 LoadObjectVolumeToWorld(uint ObjectIndex)
+{
+	return LoadObjectVolumeToWorldFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4x4 LoadObjectLocalToWorld(uint ObjectIndex)
+{
+	return LoadObjectLocalToWorldFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4x4 LoadObjectOBBToWorld(uint ObjectIndex)
+{
+	return LoadObjectOBBToWorldFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+void LoadHeightFieldObjectBoxBounds(uint ObjectIndex, out float3 OutBoxOrigin, out float3 OutBoxExtent)
+{
+	LoadHeightFieldObjectBoxBoundsFromBuffer(ObjectIndex, CulledObjectBounds, OutBoxOrigin, OutBoxExtent);
+}
+
+float4x4 LoadHeightFieldObjectWorldToLocal(uint ObjectIndex)
+{
+	return LoadHeightFieldObjectWorldToLocalFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4 LoadHeightFieldObjectAtlasUVScaleBias(uint ObjectIndex)
+{
+	return LoadHeightFieldObjectAtlasUVScaleBiasFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4 LoadHeightFieldObjectSizeScale(uint ObjectIndex)
+{
+	return LoadHeightFieldObjectSizeScaleFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+float4 LoadHeightFieldObjectVisibilityAtlasUVScaleBias(uint ObjectIndex)
+{
+	return LoadHeightFieldObjectVisibilityAtlasUVScaleBiasFromBuffer(ObjectIndex, CulledObjectData);
+}
+
+// x = Offset in global buffer, y = NumLOD0, z = NumSurfels (all LODs), W = instance index
+uint4 LoadObjectSurfelCoordinate(uint ObjectIndex)
+{
+	return (uint4)CulledObjectData[ObjectIndex * CULLED_OBJECT_DATA_STRIDE + 13];
+}
+
+void LoadObjectViewSpaceBox(uint ObjectIndex, out float3 ObjectViewSpaceMin, out float3 ObjectViewSpaceMax)
+{
+	ObjectViewSpaceMin = CulledObjectBoxBounds[ObjectIndex * CULLED_OBJECT_BOX_BOUNDS_STRIDE + 0].xyz;
+	ObjectViewSpaceMax = CulledObjectBoxBounds[ObjectIndex * CULLED_OBJECT_BOX_BOUNDS_STRIDE + 1].xyz;
+}
+
+void LoadObjectAxes(uint ObjectIndex, out float3 ObjectAxisX, out float3 ObjectAxisY, out float3 ObjectAxisZ)
+{
+	ObjectAxisX = CulledObjectBoxBounds[ObjectIndex * CULLED_OBJECT_BOX_BOUNDS_STRIDE + 2].xyz;
+	ObjectAxisY = CulledObjectBoxBounds[ObjectIndex * CULLED_OBJECT_BOX_BOUNDS_STRIDE + 3].xyz;
+	ObjectAxisZ = CulledObjectBoxBounds[ObjectIndex * CULLED_OBJECT_BOX_BOUNDS_STRIDE + 4].xyz;
+}
+
+// VPLs generated by raytracing from the light
+#define VPL_DATA_STRIDE 3
+
+#define FINAL_GATHER_THREADGROUP_SIZE 64
+
+// Must match C++
+#define NUM_VISIBILITY_STEPS 10
+
+// Must match C++
+#define RECORD_CONE_DATA_STRIDE NUM_VISIBILITY_STEPS
+
+// Must match C++
+#define BENT_NORMAL_STRIDE 1
+
+Buffer<float4> IrradianceCachePositionRadius;
+Buffer<float> IrradianceCacheOccluderRadius;
+Buffer<uint2> IrradianceCacheTileCoordinate;
+Buffer<float4> IrradianceCacheNormal;
+Buffer<float4> IrradianceCacheBentNormal;
+Buffer<float4> IrradianceCacheIrradiance;
+
+Buffer<uint> ScatterDrawParameters;
+Buffer<uint> SavedStartIndex;
+
+uint NumConvexHullPlanes;
+float4 ViewFrustumConvexHull[6];
+
+bool ViewFrustumIntersectSphere(float3 SphereOrigin, float SphereRadius)
+{
+	for (uint PlaneIndex = 0; PlaneIndex < NumConvexHullPlanes; PlaneIndex++)
+	{
+		float4 PlaneData = ViewFrustumConvexHull[PlaneIndex];
+		float PlaneDistance = dot(PlaneData.xyz, SphereOrigin) - PlaneData.w;
+
+		if (PlaneDistance > SphereRadius)
+		{
+			return false;
+		}
+	}
+	
+	return true;
+}
+
+float ApproximateConeConeIntersection(float ArcLength0, float ArcLength1, float AngleBetweenCones)
+{
+	float AngleDifference = abs(ArcLength0 - ArcLength1);
+
+	float Intersection = smoothstep(
+		0,
+		1.0,
+		1.0 - saturate((AngleBetweenCones - AngleDifference) / (ArcLength0 + ArcLength1 - AngleDifference)));
+
+	return Intersection;
+}
+
+float GetVPLOcclusion(float3 BentNormalAO, float3 NormalizedVectorToVPL, float VPLConeAngle, float VPLOcclusionStrength)
+{
+	float BentNormalLength = length(BentNormalAO);
+	float UnoccludedAngle = BentNormalLength * PI / VPLOcclusionStrength;
+	float AngleBetween = acos(dot(BentNormalAO, NormalizedVectorToVPL) / max(BentNormalLength, .0001f));
+	float Visibility = ApproximateConeConeIntersection(VPLConeAngle, UnoccludedAngle, AngleBetween);
+
+	// Can't rely on the direction of the bent normal when close to fully occluded, lerp to shadowed
+	Visibility = lerp(0, Visibility, saturate((UnoccludedAngle - .1f) / .2f));
+
+	return Visibility;
+}

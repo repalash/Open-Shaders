@@ -1,0 +1,33 @@
+#version 120 // -*- c++ -*-
+/** 
+  HeightfieldModel_Tile_gbuffer.vrt
+*/
+#include <HeightfieldModel/HeightfieldModel_Tile_vertex.glsl>
+
+#if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+    uniform mat4x3      PreviousObjectToCameraMatrix;
+    varying vec3        csPrevPosition;
+#endif
+
+#if defined(SS_EXPRESSIVE_MOTION)
+    uniform mat4x3  ExpressivePreviousObjectToCameraMatrix;
+    varying layout(location=8) vec3 csExpressivePrevPosition;
+#endif
+
+void main() {
+    vec4 osVertex;
+    vec3 osNormal;
+    vec2 texCoord0;
+
+    TerrainTile_computeOSInput(osVertex, osNormal, texCoord0);
+
+#   if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+        csPrevPosition = (PreviousObjectToCameraMatrix * osVertex).xyz;
+#   endif
+
+#   if defined(SS_EXPRESSIVE_MOTION)
+        csExpressivePrevPosition = (ExpressivePreviousObjectToCameraMatrix * osVertex).xyz;
+#   endif
+
+    UniversalSurface_transform(osVertex, osNormal, vec4(0), texCoord0, vec2(0), vec4(0));
+}

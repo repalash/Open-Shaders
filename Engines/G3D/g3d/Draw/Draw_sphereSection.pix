@@ -1,0 +1,29 @@
+#version 400
+/**
+  \file data-files/shader/Draw/Draw_sphereSection.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <g3dmath.glsl>
+
+uniform vec4      color;
+in vec3           csNormal;
+in vec3           csPosition;
+out vec4          result;
+
+#if defined(WRITE_PIXEL_FILENAME)
+    // For DECLARE_writePixel's computeRefractionOffset helper
+    const vec2 backSizeMeters = vec2(1.0);
+    #include WRITE_PIXEL_FILENAME
+#else
+    out vec4 _result; void writePixel(vec3 premultipliedReflectionAndEmission, float coverage, vec3 transmissionCoefficient, float collimation, float etaRatio, vec3 csPosition, vec3 csNormal) { _result = vec4(premultipliedReflectionAndEmission, coverage); }
+#endif
+
+void main() {
+    vec4 c = color;
+    writePixel(c.rgb * c.a, c.a, vec3(0), 1, 1, csPosition, normalize(csNormal));
+}

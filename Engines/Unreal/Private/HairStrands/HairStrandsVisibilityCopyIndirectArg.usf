@@ -1,0 +1,42 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+Texture2D<uint> CounterTexture;
+RWBuffer<uint> OutArgBuffer;
+uint ThreadGroupSize;
+uint ItemCountPerGroup;
+
+[numthreads(1, 1, 1)]
+void CopyCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint NodeCount  = CounterTexture.Load(uint3(0,0,0)) * ItemCountPerGroup;
+	const uint TotalGroup = (NodeCount + ThreadGroupSize-1) / ThreadGroupSize;
+#if 0
+	// Minimize unused groups
+	const uint SideSize   = uint(floor(sqrt(float(TotalGroup))));
+	const uint ExtraLines = (TotalGroup - SideSize * SideSize + (SideSize - 1)) / SideSize;
+	OutArgBuffer[0] = SideSize;
+	OutArgBuffer[1] = SideSize + ExtraLines;
+	OutArgBuffer[2] = 1;
+#else
+	// Note: Use a fixed group count width (64) for avoiding loading the indirect args (to avoid dep. memory fetch)
+	// This value is in sync with DeepTransmittanceMask.usf | HairStrandsEnvironementLightingCS.usf
+	if (TotalGroup < HAIR_VISIBILITY_GROUP_COUNT_WIDTH)
+	{
+		OutArgBuffer[0] = TotalGroup;
+		OutArgBuffer[1] = 1;
+		OutArgBuffer[2] = 1;
+	}
+	else
+	{
+		const uint DispatchY = ceil(float(TotalGroup) / float(HAIR_VISIBILITY_GROUP_COUNT_WIDTH));
+		OutArgBuffer[0] = HAIR_VISIBILITY_GROUP_COUNT_WIDTH;
+		OutArgBuffer[1] = DispatchY;
+		OutArgBuffer[2] = 1;
+	}
+#endif
+}

@@ -1,0 +1,139 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+
+
+//------------------------------------------------------- CONFIG
+
+#define CONFIG_OUTPUT_HALF_RES 1
+
+#define TILE_SIZE 8
+
+
+//------------------------------------------------------- PARAMETERS
+
+Texture2D<taa_half> ParallaxRejectionMaskTexture;
+Texture2D<taa_half3> FilteredInputTexture;
+Texture2D<taa_half3> FilteredPredictionSceneColorTexture;
+
+RWTexture2D<taa_half> HistoryRejectionOutput;
+
+
+//------------------------------------------------------- LDS
+
+groupshared taa_half SharedRejection[TILE_SIZE * TILE_SIZE];
+
+
+//------------------------------------------------------- FUNCTIONS
+
+taa_half3 TransformColorForClampingBox(taa_half3 Color)
+{
+	return RGBToYCoCg(Color);
+}
+
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 InputPixelPos = InputInfo_ViewportMin + DispatchThreadId;
+
+	float2 InputBufferUV = (InputPixelPos + 0.5) * InputInfo_ExtentInverse;
+	InputBufferUV = clamp(InputBufferUV, InputInfo_UVViewportBilinearMin, InputInfo_UVViewportBilinearMax);
+
+	taa_half3 InputMinColor;
+	taa_half3 InputMaxColor;
+	taa_half3 InputCenterColor;
+	taa_half ParallaxRejectionMask;
+
+	{
+		InputCenterColor = TransformColorForClampingBox(FilteredInputTexture.SampleLevel(GlobalPointClampedSampler, InputBufferUV, 0));
+		ParallaxRejectionMask = ParallaxRejectionMaskTexture[InputPixelPos];
+
+		InputMinColor = InputCenterColor;
+		InputMaxColor = InputCenterColor;
+	}
+
+	UNROLL
+	for (uint i = 0; i < 9; i++)
+	{
+		if (i == 4)
+		{
+			continue;
+		}
+
+		float2 SampleInputBufferUV = InputBufferUV + float2(kOffsets3x3[i]) * InputInfo_ExtentInverse;
+		SampleInputBufferUV = clamp(SampleInputBufferUV, InputInfo_UVViewportBilinearMin, InputInfo_UVViewportBilinearMax);
+
+		taa_half3 Color = TransformColorForClampingBox(FilteredInputTexture.SampleLevel(GlobalPointClampedSampler, SampleInputBufferUV, 0));
+
+		InputMinColor = min(InputMinColor, Color);
+		InputMaxColor = max(InputMaxColor, Color);
+	}
+
+	taa_half3 PrevColor = TransformColorForClampingBox(FilteredPredictionSceneColorTexture[InputPixelPos]);
+
+	taa_half Rejection = 1.0;
+	#if 1
+	{
+		taa_half3 ClampedPrevColor = clamp(PrevColor, InputMinColor, InputMaxColor);
+
+		Rejection = MeasureRejectionFactor(
+			PrevColor, ClampedPrevColor,
+			InputCenterColor, InputMinColor, InputMaxColor);
+		
+		Debug.rgb = abs(YCoCgToRGB(PrevColor - ClampedPrevColor)) / max3(YCoCgToRGB(InputMaxColor), YCoCgToRGB(InputCenterColor), 0.01);
+	}
+	#endif
+	
+	if (ParallaxRejectionMask < taa_half(PARALLAX_REJECTION_MASK_THRESHOLD))
+	{
+		Rejection = taa_half(1.0);
+	}
+
+	#if CONFIG_OUTPUT_HALF_RES
+	{
+		SharedRejection[GroupThreadIndex] = Rejection;
+
+		GroupMemoryBarrierWithGroupSync();
+
+		UNROLL
+		for (uint i = 1; i < 4; i++)
+		{
+			uint ButterflySwap = i;
+
+			Rejection = min(Rejection, SharedRejection[GroupThreadIndex ^ ButterflySwap]);
+		}
+
+		
+		if (all(InputPixelPos < InputInfo_ViewportMax) && all(((InputPixelPos - InputInfo_ViewportMin) % 2) == 0))
+		{
+			HistoryRejectionOutput[(InputPixelPos - InputInfo_ViewportMin) / 2] = Rejection;
+		}
+	}
+	#endif
+
+	if (all(InputPixelPos < InputInfo_ViewportMax))
+	{
+		#if !CONFIG_OUTPUT_HALF_RES
+		{
+			HistoryRejectionOutput[(InputPixelPos - InputInfo_ViewportMin)] = Rejection;
+		}
+		#endif
+
+		#if DEBUG_OUTPUT
+		{
+			DebugOutput[InputPixelPos - InputInfo_ViewportMin] = Debug;
+		}
+		#endif
+	}
+}

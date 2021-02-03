@@ -1,0 +1,109 @@
+#version 410
+/**
+  \file data-files/shader/DepthOfField/DepthOfField_composite.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+/* The near field has a POSITIVE radius in this code and the far field is negative. This is the opposite of other G3D conventions. */
+#include <compatibility.glsl>
+
+uniform sampler2D packedBuffer;
+uniform float2    packedBufferInvSize;
+uniform sampler2D blurBuffer;
+uniform sampler2D nearBuffer;
+
+uniform float     farRadiusRescale;
+
+#if __VERSION__ < 130
+#   define result gl_FragColor.rgb
+#else
+    out vec3 result;
+#endif
+
+const float2 cocReadScaleBias = vec2(2.0, -1.0);
+
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render. used for VR. <= 0 to disable"
+float square(float x) { return x * x; }
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+           discard;
+        }
+#   endif
+
+    vec2 A         = gl_FragCoord.xy - g3d_FragCoordMin;
+
+    float4 pack        = texelFetch(packedBuffer, int2(A), 0);
+    float3 sharp       = pack.rgb;
+    float3 farBlurred  = textureLod(blurBuffer, A * packedBufferInvSize, 0.0).rgb;
+    float4 nearBlurred = textureLod(nearBuffer, A * packedBufferInvSize, 0.0);
+
+    // Signed, normalized radius of the circle of confusion.
+    // |normRadius| == 1.0 corresponds to camera->maxCircleOfConfusionRadiusPixels()
+    float normRadius = pack.a * cocReadScaleBias.x + cocReadScaleBias.y;
+
+    // Fix the far field scaling factor so that it remains independent of the 
+    // near field settings
+    normRadius *= (normRadius < 0.0) ? farRadiusRescale : 1.0;
+
+    // Boost the blur factor
+    // normRadius = clamp(normRadius * 2.0, -1.0, 1.0);
+    
+    // Two lerps. The nearBlurred texture has a premultiplied alpha, so it isn't scaled by its own alpha
+    result = max(lerp(sharp, 
+                      farBlurred,
+                      saturate(-12.0 * normRadius)) * (1.0 - nearBlurred.a), 
+                vec3(0)) + nearBlurred.rgb;
+    
+    /////////////////////////////////////////////////////////////////////////////////
+    // Debugging options:
+    const int NO_DEBUG          = 0;
+    const int SHOW_COC          = 1;
+    const int SHOW_REGION       = 2;
+    const int SHOW_NEAR         = 3;
+    const int SHOW_BLURRY       = 4;
+    const int SHOW_INPUT        = 5;
+    const int SHOW_MID_AND_FAR  = 6;
+    const int SHOW_SIGNED_COC   = 7;
+
+    const int debugOption = NO_DEBUG;
+
+    if (debugOption == SHOW_MID_AND_FAR) {
+        // Go back to the true radius, before it was enlarged by post-processing
+        result.rgb = float3(abs(pack.a * cocReadScaleBias.x + cocReadScaleBias.y));
+    } else if (debugOption == SHOW_SIGNED_COC) {
+        // Go back to the true radius, before it was enlarged by post-processing
+        float r = pack.a * cocReadScaleBias.x + cocReadScaleBias.y;
+	    if (r < 0) {
+	        result.rgb = float3(0.0, 0.14, 0.8) * abs(r);
+	    } else {
+	        result.rgb = float3(1.0, 1.0, 0.15) * abs(r);
+	    }
+    } else if (debugOption == SHOW_REGION) {
+        if (pack.a < 0.49) {
+            // Far field: Dark blue
+            result.rgb = float3(0.0, 0.07, 0.4) * (dot(sharp, vec3(1.0 / 3.0)) * 0.7 + 0.3);
+        } else if (pack.a <= 0.51) {
+            // Midfield: Gray
+            result.rgb = float3(0.4) * (dot(sharp, vec3(1.0 / 3.0)) * 0.7 + 0.3);
+        } else {
+            // Nearfield: Yellow
+            result.rgb = float3(1.0, 1.0, 0.15) * (dot(sharp, vec3(1.0 / 3.0)) * 0.7 + 0.3);
+        }
+    } else if ( debugOption == SHOW_BLURRY ) {
+        result = farBlurred;
+    } else if ( debugOption == SHOW_NEAR ) {
+        result = nearBlurred.rgb;
+    } else if ( debugOption == SHOW_INPUT ) {
+        result = sharp;
+    } else if ( debugOption == SHOW_MID_AND_FAR ) {
+        // Just lerp based on this pixel's blurriness. Works well in the background, less well in the foreground
+        result = lerp(sharp, farBlurred, saturate(abs(normRadius)));
+    }
+}

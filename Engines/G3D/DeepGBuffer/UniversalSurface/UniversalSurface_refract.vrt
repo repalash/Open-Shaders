@@ -1,0 +1,18 @@
+#version 120
+varying vec3        csPos;
+varying vec3        csN_raw;
+
+/** Texture coordinate */
+varying vec2        texCoord;
+
+attribute vec4      g3d_Vertex;
+attribute vec3      g3d_Normal;
+attribute vec2      g3d_TexCoord0;
+
+void main(void) {
+    csN_raw         = gl_NormalMatrix     * g3d_Normal;
+    csPos           = (gl_ModelViewMatrix * g3d_Vertex).xyz;
+    gl_Position     = gl_ModelViewProjectionMatrix * g3d_Vertex;
+    gl_ClipVertex   = gl_ModelViewMatrix * g3d_Vertex;
+    texCoord        = g3d_TexCoord0.st;
+}

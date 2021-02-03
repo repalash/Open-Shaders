@@ -1,0 +1,211 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "Common.ush"
+#include "ParticipatingMediaCommon.ush" 
+#include "ShadingCommon.ush" 
+#include "DistortionCommon.ush"
+#include "SingleLayerWaterCommon.ush"
+
+#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	// We need the water base pass to be allowed to use masking (if blend mode is Masked) because it doesn't rely on a depth pre-pass (where clipping would normally occur)
+	#undef EARLY_Z_PASS_ONLY_MATERIAL_MASKING
+	#define EARLY_Z_PASS_ONLY_MATERIAL_MASKING 0
+#endif
+
+struct WaterVolumeLightingOutput
+{
+	float3 Luminance;
+	float3 WaterToSceneTransmittance;
+	float3 WaterToSceneToLightTransmittance;
+};
+
+// Returns as luminance, the result of lighting scattering in water and the under water scene color contribution.
+WaterVolumeLightingOutput EvaluateWaterVolumeLighting(
+	FMaterialPixelParameters MaterialParameters, FPixelMaterialInputs PixelMaterialInputs, ViewState ResolvedView,
+	float DirectionalLightShadow,
+#if SINGLE_LAYER_WATER_SIMPLE_FORWARD
+	Texture2D SceneDepthWithoutSingleLayerWaterTexture, SamplerState SceneDepthWithoutSingleLayerWaterSampler,
+#endif
+#if !SIMPLE_SINGLE_LAYER_WATER
+	Texture2D SceneColorWithoutSingleLayerWaterTexture, SamplerState SceneColorWithoutSingleLayerWaterSampler,
+	Texture2D SceneDepthWithoutSingleLayerWaterTexture, SamplerState SceneDepthWithoutSingleLayerWaterSampler,
+	float2 SceneWithoutSingleLayerWaterMinUV,
+	float2 SceneWithoutSingleLayerWaterMaxUV,
+#endif // SIMPLE_SINGLE_LAYER_WATER
+	float Specular, const float4 DistortionParams,
+	float3 SunIlluminance, float3 AmbiantIlluminance, float3 EnvBrdf,
+	bool CameraIsUnderWater, float WaterVisibility, uint EyeIndex)
+{
+	WaterVolumeLightingOutput Output;
+	Output.Luminance = 0.0f;
+	Output.WaterToSceneTransmittance = 1.0f;
+	Output.WaterToSceneToLightTransmittance = 1.0f;
+
+	float2 WaterNDC = MaterialParameters.ScreenPosition.xy / MaterialParameters.ScreenPosition.w;
+	float2 ViewportUV = WaterNDC * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz;
+
+	if (WaterVisibility > 0.0f)
+	{
+		float WaterDepth = ConvertFromDeviceZ(MaterialParameters.SvPosition.z);
+#if SIMPLE_SINGLE_LAYER_WATER
+
+#if SINGLE_LAYER_WATER_SIMPLE_FORWARD 
+		float PixelSceneDepth = SceneDepthWithoutSingleLayerWaterTexture.SampleLevel(SceneDepthWithoutSingleLayerWaterSampler, ViewportUV, 0).x * SINGLE_LAYER_WATER_DEPTH_SCALE;
+		float PixelSceneDeviceZ = ConvertToDeviceZ(PixelSceneDepth);
+#else
+		float PixelSceneDeviceZ = LookupDeviceZ(ViewportUV);
+		float PixelSceneDepth = ConvertFromDeviceZ(PixelSceneDeviceZ);
+#endif
+
+#if FEATURE_LEVEL <= FEATURE_LEVEL_ES3_1
+		// Only mobile run the SIMPLE_SINGLE_LAYER_WATER path today.
+		// On mobile, depth is stored linear in alpha channel of scene color as FP16 so it is easy to reach it max value. It would then result in fully transparent water.
+		// To counter that, we assume any visible water pixel has a constant under water depth and we progressively lerp towards this simplified representation.
+		// Lighting remains correct thanks to the analytical integration of scattering.
+		const float FadeLenght = 10000.0f;								// 0.1 kilometers
+		const float FadeStartDistance = 65504.0f - FadeLenght;
+		const float FadeBehindWaterDepth = WaterDepth + FadeLenght;
+		if (WaterDepth > FadeStartDistance)
+		{
+			PixelSceneDepth = lerp(PixelSceneDepth, FadeBehindWaterDepth, saturate((WaterDepth - FadeStartDistance) / FadeLenght));
+			PixelSceneDeviceZ = ConvertToDeviceZ(PixelSceneDepth);
+		}
+#endif
+
+		float SceneDeviceZ = PixelSceneDeviceZ;
+		float SceneDepth = PixelSceneDepth;
+
+#else  // !SIMPLE_SINGLE_LAYER_WATER
+
+		ViewportUV = clamp(ViewportUV, SceneWithoutSingleLayerWaterMinUV, SceneWithoutSingleLayerWaterMaxUV);
+
+		float PixelSceneDepth = SceneDepthWithoutSingleLayerWaterTexture.SampleLevel(SceneDepthWithoutSingleLayerWaterSampler, ViewportUV, 0).x * SINGLE_LAYER_WATER_DEPTH_SCALE;
+		
+		float2 Refraction = GetMaterialRefraction(PixelMaterialInputs); // X = IOR, Y = Refraction Bias
+		float2 BufferUVDistortion = ComputeBufferUVDistortion(
+			MaterialParameters, PixelMaterialInputs, ResolvedView,
+			MaterialParameters.WorldNormal, DistortionParams, ViewportUV, Refraction, false, EyeIndex);
+		PostProcessUVDistortion(MaterialParameters, PixelMaterialInputs, PixelSceneDepth, BufferUVDistortion, Refraction);
+		// Also reduce refraction according to water thickness
+		BufferUVDistortion *= saturate((PixelSceneDepth - WaterDepth) * 1.0 / 30.0f);// *(1 - saturate(WaterDepth * 1.0 / 2000.0f));
+
+		const float2 DistortedUV = clamp(ViewportUV + BufferUVDistortion, SceneWithoutSingleLayerWaterMinUV, SceneWithoutSingleLayerWaterMaxUV);
+
+		float SceneDepth = SceneDepthWithoutSingleLayerWaterTexture.SampleLevel(SceneDepthWithoutSingleLayerWaterSampler, DistortedUV, 0).x * SINGLE_LAYER_WATER_DEPTH_SCALE;
+
+		if (SceneDepth < WaterDepth)
+		{
+			SceneDepth = PixelSceneDepth; // The pixel we try to sample is closer than the water pixel: falback to no distortion
+		}
+		else
+		{
+			ViewportUV = DistortedUV;
+		}
+
+		const float SceneDeviceZ = ConvertToDeviceZ(SceneDepth);
+
+#endif // !SIMPLE_SINGLE_LAYER_WATER
+
+		const float BehindWaterDeltaDepth = CameraIsUnderWater ? WaterDepth : max(0.0f, SceneDepth - WaterDepth);
+
+		const float3 ScatteringCoeff = max(0.0f, GetSingleLayerWaterMaterialOutput0(MaterialParameters));
+		const float3 AbsorptionCoeff = max(0.0f, GetSingleLayerWaterMaterialOutput1(MaterialParameters));
+		const float PhaseG = clamp(GetSingleLayerWaterMaterialOutput2(MaterialParameters), -1.0f, 1.0f);
+		//Sample the optional Material Input ColorScaleBehindWater and fade it out at shorelines to avoid hard edge intersections
+		float3 ColorScaleBehindWater = lerp(1.0f, max(0.0f, GetSingleLayerWaterMaterialOutput3(MaterialParameters)), saturate(BehindWaterDeltaDepth * 0.02f));
+		
+		const float3 ExtinctionCoeff = ScatteringCoeff + AbsorptionCoeff; 
+		// Max to avoid division by 0 with the analytical integral below.
+		// 1e-5 is high enough to avoid denorms on mobile
+		const float3 ExtinctionCoeffSafe = max(ScatteringCoeff + AbsorptionCoeff, 1e-5); 
+		
+		float DirLightPhaseValue = 0.0f; // Default when Total Internal Reflection happens.
+		{
+#if SIMPLE_SINGLE_LAYER_WATER
+			DirLightPhaseValue = IsotropicPhase();
+#else
+			float IorFrom = 1.0f; // assumes we come from air
+			float IorTo   = DielectricF0ToIor(DielectricSpecularToF0(Specular)); // Wrong if metal is set to >1. But we still keep refraction on the water surface nonetheless.
+			const float relativeIOR = IorFrom / IorTo;
+			float3 UnderWaterRayDir = 0.0f;
+			if (WaterRefract(MaterialParameters.CameraVector, MaterialParameters.WorldNormal, relativeIOR, UnderWaterRayDir))
+			{
+				DirLightPhaseValue = SchlickPhase(PhaseG, dot(-ResolvedView.DirectionalLightDirection.xyz, UnderWaterRayDir));
+			}
+#endif
+		}
+
+		// We also apply transmittance from light to under water surface. However, the scene has been lit by many sources already.
+		// So the transmittance toabove surface is simply approximated using the travel distance from the scene pixel to the water top, assuming a flat water surface.
+		// We cannot combine this transmittance with the transmittance from view because this would change the behavior of the analytical integration of light scattering integration.
+		const float3 BehindWaterSceneWorldPos = SvPositionToWorld(float4(MaterialParameters.SvPosition.xy, SceneDeviceZ, 1.0));
+		const float DistanceFromScenePixelToWaterTop = max(0.0, MaterialParameters.AbsoluteWorldPosition.z - BehindWaterSceneWorldPos.z);
+		const float3 MeanTransmittanceToLightSources = exp(-DistanceFromScenePixelToWaterTop * ExtinctionCoeff);
+
+#if SIMPLE_SINGLE_LAYER_WATER
+		const float3 BehindWaterSceneLuminance = 0.0f; // Cannot read back the scene color in this case
+#else
+		// We use the pixel SvPosition instead of the scene one pre refraction/distortion to avoid those extra ALUs.
+		float3 BehindWaterSceneLuminance = SceneColorWithoutSingleLayerWaterTexture.SampleLevel(SceneColorWithoutSingleLayerWaterSampler, ViewportUV, 0).rgb;
+		BehindWaterSceneLuminance = MeanTransmittanceToLightSources * (USE_PREEXPOSURE ? ResolvedView.OneOverPreExposure : 1.0f) * BehindWaterSceneLuminance;
+#endif
+
+		float3 SunScattLuminance = DirLightPhaseValue * SunIlluminance;
+		float3 AmbScattLuminance = IsotropicPhase()   * AmbiantIlluminance;
+
+#define VOLUMETRICSHADOW	0
+#if !VOLUMETRICSHADOW || SIMPLE_SINGLE_LAYER_WATER
+
+		const float3 OpticalDepth = ExtinctionCoeff * BehindWaterDeltaDepth;
+		float3 Transmittance = exp(-OpticalDepth);
+		float3 ScatteredLuminance = ScatteringCoeff * (AmbScattLuminance + SunScattLuminance * DirectionalLightShadow);
+		ScatteredLuminance = (ScatteredLuminance - ScatteredLuminance * Transmittance) / ExtinctionCoeffSafe;
+
+#else
+		// TODO Make the volumetric shadow part work again
+		float3 Transmittance = 1.0f;
+		float3 ScatteredLuminance = 0.0f;
+		const float RayMarchMaxDistance = min(BehindWaterDeltaDepth, 200.0f);  // 20 meters
+		const float RayMarchStepSize = RayMarchMaxDistance / 10.0f; // Less samples wil lresult in a bit brighter look due to TransmittanceToLightThroughWater being 1 on a longer first sample. Would need it part of analiytical integration
+		const float ShadowDither = RayMarchStepSize * GBufferDither;
+		for (float s = 0.0f; s < RayMarchMaxDistance; s += RayMarchStepSize)
+		{
+			// Only jitter shadow map sampling to not lose energy on first sample
+			float Shadow = ComputeDirectionalLightDynamicShadowing(MaterialParameters.AbsoluteWorldPosition - (s + ShadowDither)*MaterialParameters.CameraVector, GBuffer.Depth);
+
+			float3 WP = MaterialParameters.AbsoluteWorldPosition - s * MaterialParameters.CameraVector;
+			float WaterHeightAboveSample = max(0.0, MaterialParameters.AbsoluteWorldPosition.z - WP.z);
+			float3 TransmittanceToLightThroughWater = 1.0;												// no self shadow, same energy as above analytical solution
+			//float3 TransmittanceToLightThroughWater = exp(-ExtinctionCoeff * WaterHeightAboveSample);	// self shadow as transmittance to water level, close to reference, depends a bit on sample count due to first sample being critical for dense medium
+
+			float3 SampleTransmittance = exp(-ExtinctionCoeff * RayMarchStepSize); // Constant
+			float3 SS = (ScatteringCoeff * TransmittanceToLightThroughWater * (SunScattLuminance * Shadow + AmbScattLuminance));
+			ScatteredLuminance += Transmittance * (SS - SS * SampleTransmittance) / ExtinctionCoeffSafe;
+			Transmittance *= SampleTransmittance;
+		}
+
+		// The rest of the medium
+		const float3 OpticalDepth2 = ExtinctionCoeff * max(0.0, BehindWaterDeltaDepth - RayMarchMaxDistance);
+		if (any(OpticalDepth2 > 0.0f))
+		{
+			float3 Transmittance2 = exp(-OpticalDepth2);
+			float3 ScatteredLuminance2 = ScatteringCoeff * (SunScattLuminance + AmbScattLuminance);
+			ScatteredLuminance += Transmittance * (ScatteredLuminance2 - ScatteredLuminance2 * Transmittance2) / ExtinctionCoeffSafe;
+			Transmittance *= Transmittance2;
+		}
+#endif
+
+		// Apply Fresnel effect to out-scattering towards the view
+		ScatteredLuminance *= CameraIsUnderWater ? 1.0 : (1.0 - EnvBrdf);	// Under water is less visible due to Fresnel effect
+		Transmittance *= CameraIsUnderWater ? (1.0 - EnvBrdf) : 1.0;		// Above	"		"		"		"		"
+
+		// Add single in-scattering apply colored transmittance to scene color
+		Output.Luminance = WaterVisibility * (ScatteredLuminance + Transmittance * (BehindWaterSceneLuminance* ColorScaleBehindWater));
+		Output.WaterToSceneTransmittance = Transmittance;
+		Output.WaterToSceneToLightTransmittance = Transmittance * MeanTransmittanceToLightSources;
+	}
+
+	return Output;
+}

@@ -1,0 +1,313 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+PathTracingRayGenShader.usf: Reference path tracing
+===============================================================================================*/
+
+#define PATH_TRACING  
+
+#include "../Common.ush"
+#include "../PostProcessCommon.ush"
+#include "../RectLight.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+
+#include "PathTracingCommon.ush"
+#include "../RayTracing/RayTracingHitGroupCommon.ush"
+
+#include "../ShadingModels.ush"
+#include "./Utilities/PathTracingRandomSequence.ush"
+#include "./Light/PathTracingLightSampling.ush"
+#include "./Material/PathTracingMaterialSampling.ush"
+#include "PathTracingCamera.ush"
+
+
+RWTexture2D<float4> RadianceRT;
+RWTexture2D<uint>	SampleCountRT;
+RWTexture2D<uint>   PixelPositionRT;
+RWTexture2D<uint>	RayCountPerPixelRT;
+RaytracingAccelerationStructure TLAS;
+
+
+RAY_TRACING_ENTRY_RAYGEN(PathTracingMainRG)
+{
+	uint2 LaunchIndex = DispatchRaysIndex().xy + View.ViewRectMin + PathTracingData.TileOffset;
+	
+	bool IsUnidirectionalEnabled = true;
+	bool IsNextEventEstimationEnabled = true;
+
+	RadianceRT[LaunchIndex] = 0;
+	SampleCountRT[LaunchIndex] = 0;
+	PixelPositionRT[LaunchIndex] = 0;
+	RayCountPerPixelRT[LaunchIndex] = 0;
+	uint RayCounter = 0;
+	
+	// Initialize random sequence 
+	float2 BufferSize = View.BufferSizeAndInvSize.xy; 
+	uint LinearIndex = LaunchIndex.x + (LaunchIndex.y * BufferSize.x); 
+	RandomSequence RandSequence;
+	RandomSequence_Initialize(RandSequence, LinearIndex, AdaptiveSamplingData.TemporalSeed);
+	RandSequence.Type = AdaptiveSamplingData.RandomSequence;
+	uint SampleIndex = 0;
+	uint SampleCount = 1;
+
+	for (uint i = 0; i < SampleCount; ++i) 
+	{
+		float3 Irradiance = 0;
+
+		// Initialize ray and payload
+		RayDesc Ray;
+		uint2 Pixel;
+		float EmitterPdf;
+		SampleEmitter(LaunchIndex, RandSequence, SampleIndex, 0, 0, Ray, Pixel, EmitterPdf);
+		if (EmitterPdf <= 0.0)
+		{
+			continue;
+		}
+
+		float3 RayThroughput = 1.0;
+		float RayPdf = 1.0;
+
+		FRayCone RayCone = (FRayCone)0;
+		RayCone.SpreadAngle = View.EyeToPixelSpreadAngle;
+
+		// Cast ray
+		const uint InitialRayFlags = 0;
+		const uint InitialInstanceInclusionMask = RAY_TRACING_MASK_ALL;
+		const bool bInitialDisableSkyLightContribution = false;
+		const bool bIgnoreTranslucentMaterials = false;
+		const uint2 RenderTargetPos = LaunchIndex.xy + View.ViewRectMin.xy;
+
+		FMaterialClosestHitPayload Payload = TraceMaterialRay(
+			TLAS,
+			InitialRayFlags,
+			InitialInstanceInclusionMask,
+			Ray,
+			RayCone,
+			RenderTargetPos,
+			bInitialDisableSkyLightContribution,
+			bIgnoreTranslucentMaterials);
+		RayCounter++;
+
+		float MaterialPdf = 0.0;
+		FMaterialClosestHitPayload PrevMaterialPayload = (FMaterialClosestHitPayload)0;
+		uint Bounces = 0;
+		bool bIsNeeValid = true;
+		while (Bounces < PathTracingData.MaxBounces)
+		{
+			// Environment contribution
+			if (Payload.IsMiss())
+			{
+				// WARNING: Until ray payload encodes NEE LightId, the execution depends on this ordering!
+				uint SkyLightId = 0;
+				float3 EnvironmentRadiance = 0.0;
+				SkyLight_EvalLight(SkyLightId, Ray.Direction, Ray, EnvironmentRadiance);
+				if (length(EnvironmentRadiance) > 0.0)
+				{
+					if (IsUnidirectionalEnabled)
+					{
+						// Apply NEE Pdf for correct MIS weight
+						float MisWeight = 1.0;
+						if (IsNextEventEstimationEnabled && Bounces > 0 && bIsNeeValid)
+						{
+							float NeePdf = 0.0;
+							float3 LightUV = GetLightUV(SkyLightId, Ray, Payload);
+							PdfLight(Ray, PrevMaterialPayload, SkyLightId, LightUV, NeePdf);
+
+							MisWeight = MaterialPdf / (MaterialPdf + NeePdf);
+						}
+						Irradiance += EnvironmentRadiance * RayThroughput * MisWeight / RayPdf;
+					}
+					// Record primary environment hits with NEE
+					else if (IsNextEventEstimationEnabled && Bounces == 0)
+					{
+						Irradiance += EnvironmentRadiance * RayThroughput / RayPdf;
+					}
+				}
+				break;
+			}
+
+			// Emissive geometry contribution
+			float3 Emission = GetMaterialEmission(Payload);
+			if (any(Emission) > 0.0)
+			{
+				if (IsUnidirectionalEnabled)
+				{
+					// Apply NEE Pdf for correct MIS weight
+					float MisWeight = 1.0;
+					if (IsNextEventEstimationEnabled && Bounces > 0 && bIsNeeValid)
+					{
+						float NeePdf = 0.0;
+						int LightId = GetLightId(Payload);
+						float3 LightUV = GetLightUV(LightId, Ray, Payload);
+						PdfLight(Ray, PrevMaterialPayload, LightId, LightUV, NeePdf);
+
+						float MisWeight = MaterialPdf / (MaterialPdf + NeePdf);
+					}
+
+					Irradiance += Emission * RayThroughput * MisWeight / RayPdf;
+				}
+				// Record primary environment hits with NEE
+				else if (IsNextEventEstimationEnabled && Bounces == 0)
+				{
+					Irradiance += Emission * RayThroughput / RayPdf;
+				}
+				break;
+			}
+
+			Bounces = Bounces + 1;
+			// Update origin
+			Ray.Origin = Ray.Origin + Ray.Direction * Payload.HitT;
+			FMaterialClosestHitPayload RayHitInfo = Payload; 
+
+			bIsNeeValid = IsNeeValidMaterial(RayHitInfo);
+
+			// Perform next-event estimation
+			if (IsNextEventEstimationEnabled && bIsNeeValid)
+			{
+				int LightId;
+				float3 LightUV;
+				float NeePdf = 0.0;
+				float4 RandSample = RandomSequence_GenerateSample4D(RandSequence, SampleIndex);
+				SampleLight(Ray, RayHitInfo, RandSample, LightId, LightUV, NeePdf);
+
+				// Fire visibility ray
+				if (NeePdf > 0.0)
+				{
+					RayDesc LightRay;
+					GenerateLightRay(Ray, LightId, LightUV, LightRay);
+
+					float SignedPositionBias = 1.0;
+					float NoL = dot(Payload.WorldNormal, LightRay.Direction);
+					if (ENABLE_TRANSMISSION && HasTransmission(LightId) && IsMaterialTransmissive(RayHitInfo) && NoL < 0.0)
+					{
+						SignedPositionBias = -1.0;
+					}
+					ApplyPositionBias(LightRay, SignedPositionBias * Payload.WorldNormal, AdaptiveSamplingData.MaxNormalBias);
+
+					const uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						RayFlags,
+						InstanceInclusionMask,
+						RenderTargetPos,
+						LightRay);
+					RayCounter++;
+
+					if (NeePayload.IsMiss())
+					{
+						FMaterialClosestHitPayload RayHitInfo = Payload; 
+#if 0
+						// DEBUG: Validate NEE PDF
+						float NeePdfTmp;
+						PdfLight(Ray, RayHitInfo, LightId, LightUV, NeePdfTmp);
+						if (abs(NeePdf - NeePdfTmp) > 0.0001)
+						{
+							Irradiance = float3(-10, -10, -10);
+							break;
+						}
+#endif
+						// Evaluate radiance
+						float3 Radiance;
+						EvalLight(LightId, LightUV, LightRay, Radiance);
+
+						// Evaluate material
+						float Ior1 = 1.0;
+						float3 MaterialThroughput;
+						float MaterialEvalPdf = 0.0;
+						EvalMaterial(Ray.Direction, LightRay.Direction, RayHitInfo, Ior1, false, MaterialThroughput, MaterialEvalPdf);
+
+						// Apply material Pdf for correct MIS weight
+						float MisWeight = 1.0;
+						if (IsUnidirectionalEnabled && IsPhysicalLight(LightId))
+						{
+#if 0
+							// DEBUG: Validate Material PDF
+							float MaterialPdfTmp;
+							PdfMaterial(Ray.Direction, LightRay, RayHitInfo, Ior1, false, MaterialPdfTmp);
+							if (abs(MaterialPdf - MaterialPdfTmp) > 0.0001)
+							{
+								MaterialThroughput *= -1.f;
+							}
+#endif
+
+							MisWeight = NeePdf / (NeePdf + MaterialEvalPdf);
+						}
+
+						// Record the contribution
+						Irradiance += Radiance * MaterialThroughput * RayThroughput * MisWeight / (NeePdf * RayPdf);
+					}
+				}
+			}
+
+			// Sample material
+			float Ior1 = 1.0;
+			float3 Direction;
+			float3 Throughput;
+			float4 RandSample = RandomSequence_GenerateSample4D(RandSequence, SampleIndex);
+			float SignedPositionBias;
+			float SamplePdf;
+			SampleMaterial(Ray.Direction, RayHitInfo, Ior1, RandSample, false, Direction, Throughput, SamplePdf, SignedPositionBias);
+			if (SamplePdf == 0.0)
+			{
+				break;
+			}
+
+			PdfMaterial(Ray.Direction, Direction, Payload, Ior1, false, MaterialPdf);
+			// Debug: Evaluation of a candidate sample direction should maintain energy balance with pathspace MIS
+			// EvalMaterial(Ray.Direction, Direction, RayHitInfo, Ior1, false, Throughput, MaterialPdf);
+			// SamplePdf = MaterialPdf;
+
+			// Update ray
+			Ray.Direction = Direction;
+			ApplyPositionBias(Ray, SignedPositionBias * Payload.WorldNormal, AdaptiveSamplingData.MaxNormalBias);
+			RayThroughput *= Throughput;
+			RayPdf *= SamplePdf;
+
+			// Russian roulette
+			float PathEnergy = max(max(RayThroughput.x, RayThroughput.y), RayThroughput.z);
+			float EnergyThreshold = 1.0; 
+			if (PathEnergy < EnergyThreshold && Bounces > 4)
+			{
+				float Q = 1.0 - PathEnergy;
+				if (RandomSequence_GenerateSample1D(RandSequence, SampleIndex) < Q)
+				{
+					break;
+				}
+
+				RayThroughput /= (1.0 - Q);
+			}
+
+			// Firefly rejection
+			PathEnergy = max(max(RayThroughput.x, RayThroughput.y), RayThroughput.z);
+			float FireflyThreshold = 5.0;
+			if (PathEnergy / RayPdf > FireflyThreshold)
+			{
+				break;
+			}
+
+			// Trace again
+			const uint RayFlags = 0;
+			const uint InstanceInclusionMask = RAY_TRACING_MASK_ALL;
+			const bool bDisableSkyLightContribution = false;
+
+			PrevMaterialPayload = Payload;
+			Payload = TraceMaterialRay(
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				Ray,
+				RayCone,
+				RenderTargetPos,
+				bDisableSkyLightContribution,
+				bIgnoreTranslucentMaterials);
+			RayCounter++;
+		}
+
+		RadianceRT[RenderTargetPos].rgb += Irradiance;
+		SampleCountRT[RenderTargetPos] += 1;
+		PixelPositionRT[RenderTargetPos] = Pixel.y * BufferSize.x + Pixel.x;
+		RayCountPerPixelRT[RenderTargetPos] += RayCounter;
+	}
+}

@@ -1,0 +1,305 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "TAACommon.ush"
+
+
+//------------------------------------------------------- ENUMS
+
+/** Kernel enum */
+	#define KERNEL_1X1 0
+	#define KERNEL_3X3 1
+	#define KERNEL_STACKOWIAK 2
+
+
+//------------------------------------------------------- CONFIG
+
+#define TILE_SIZE 8
+
+#define CONFIG_ACCUMULATE_KARIS_COLOR 0
+
+#define CONFIG_ACCUMULATE_KARIS_WEIGHTING 1
+
+#define CONFIG_KERNEL_SPREAD_FACTOR 3
+#define CONFIG_KERNEL (KERNEL_3X3)
+
+
+//------------------------------------------------------- CONSTANTS
+
+static const float2 kStackowiakSampleSet0[56 * 4] =
+{
+	float2(-0.5, -0.5), float2(+0.5, -0.5), float2(-0.5, +0.5), float2(+0.5, +0.5),
+	float2(-1.5, +0.5), float2(-1.5, -0.5), float2(-0.5, +1.5), float2(+1.5, -0.5),
+	float2(+0.5, -1.5), float2(+2.5, -0.5), float2(+1.5, +0.5), float2(-0.5, -1.5),
+	float2(-1.5, -2.5), float2(-0.5, -2.5), float2(-1.5, -1.5), float2(-0.5, +2.5),
+	float2(-1.5, +1.5), float2(+1.5, -2.5), float2(-1.5, +2.5), float2(+1.5, +2.5),
+	float2(+0.5, -2.5), float2(-2.5, -0.5), float2(-2.5, -1.5), float2(-2.5, +0.5),
+	float2(+0.5, +1.5), float2(+0.5, +2.5), float2(-3.5, +0.5), float2(+0.5, +3.5),
+	float2(+1.5, -1.5), float2(+3.5, -0.5), float2(+2.5, +1.5), float2(+3.5, +0.5),
+	float2(+1.5, +1.5), float2(-2.5, +1.5), float2(-3.5, +2.5), float2(+3.5, +1.5),
+	float2(-3.5, -0.5), float2(-1.5, -3.5), float2(-2.5, -2.5), float2(-2.5, +2.5),
+	float2(+2.5, +0.5), float2(+2.5, +2.5), float2(+1.5, +3.5), float2(+3.5, -1.5),
+	float2(-3.5, -2.5), float2(+3.5, -2.5), float2(+2.5, -1.5), float2(+0.5, -3.5),
+	float2(-0.5, +3.5), float2(-0.5, -4.5), float2(-4.5, +0.5), float2(+4.5, +0.5),
+	float2(-4.5, -1.5), float2(-3.5, +1.5), float2(-0.5, -3.5), float2(+1.5, -3.5),
+	float2(+0.5, -4.5), float2(-1.5, +3.5), float2(+0.5, +4.5), float2(-3.5, -1.5),
+	float2(-4.5, +1.5), float2(+2.5, -4.5), float2(+2.5, -2.5), float2(-1.5, +4.5),
+	float2(-2.5, -4.5), float2(+4.5, -2.5), float2(+2.5, +3.5), float2(-3.5, +3.5),
+	float2(-2.5, +3.5), float2(+0.5, -5.5), float2(-4.5, +3.5), float2(-2.5, -3.5),
+	float2(-4.5, +2.5), float2(+3.5, +3.5), float2(+2.5, -3.5), float2(+4.5, +3.5),
+	float2(+3.5, -3.5), float2(+4.5, +2.5), float2(-5.5, +1.5), float2(-4.5, -0.5),
+	float2(+3.5, +2.5), float2(-0.5, +4.5), float2(-1.5, +5.5), float2(+1.5, +5.5),
+	float2(+4.5, -0.5), float2(+5.5, +0.5), float2(+4.5, +1.5), float2(-1.5, -4.5),
+	float2(-1.5, -5.5), float2(-4.5, -2.5), float2(-2.5, +5.5), float2(+2.5, +5.5),
+	float2(+1.5, +4.5), float2(+5.5, +1.5), float2(+1.5, -4.5), float2(-3.5, -3.5),
+	float2(+3.5, -4.5), float2(-3.5, -4.5), float2(+4.5, -1.5), float2(+4.5, -3.5),
+	float2(-3.5, -5.5), float2(-2.5, -5.5), float2(-4.5, -3.5), float2(+4.5, +4.5),
+	float2(-3.5, +4.5), float2(-2.5, +4.5), float2(-5.5, -2.5), float2(-5.5, +0.5),
+	float2(+2.5, -5.5), float2(+3.5, +4.5), float2(-0.5, -5.5), float2(-0.5, +6.5),
+	float2(+2.5, +4.5), float2(-5.5, -0.5), float2(-6.5, -1.5), float2(+1.5, -5.5),
+	float2(-6.5, -0.5), float2(+0.5, +5.5), float2(+1.5, +6.5), float2(+6.5, +1.5),
+	float2(-0.5, +5.5), float2(+6.5, -0.5), float2(-4.5, -4.5), float2(-5.5, +2.5),
+	float2(+5.5, -0.5), float2(-5.5, -1.5), float2(-6.5, +3.5), float2(-1.5, +6.5),
+	float2(-6.5, +0.5), float2(+4.5, -5.5), float2(-3.5, +6.5), float2(+6.5, -1.5),
+	float2(+0.5, -6.5), float2(-5.5, -3.5), float2(+5.5, -2.5), float2(+4.5, -4.5),
+	float2(+5.5, -1.5), float2(+3.5, -6.5), float2(+5.5, +3.5), float2(+3.5, -5.5),
+	float2(-5.5, -4.5), float2(+6.5, -3.5), float2(-0.5, -6.5), float2(+3.5, +6.5),
+	float2(-5.5, +3.5), float2(+0.5, +6.5), float2(+6.5, +0.5), float2(+6.5, -2.5),
+	float2(-6.5, -3.5), float2(-4.5, +4.5), float2(-7.5, -0.5), float2(+7.5, +0.5),
+	float2(+5.5, +2.5), float2(-0.5, -7.5), float2(+0.5, +7.5), float2(-4.5, +5.5),
+	float2(+3.5, +5.5), float2(-3.5, +5.5), float2(-4.5, -5.5), float2(+4.5, +6.5),
+	float2(+5.5, -4.5), float2(+4.5, +5.5), float2(-4.5, +6.5), float2(+6.5, +4.5),
+	float2(-7.5, +1.5), float2(-6.5, +1.5), float2(+5.5, -3.5), float2(-6.5, +2.5),
+	float2(-2.5, +6.5), float2(-1.5, -7.5), float2(+5.5, +4.5), float2(-1.5, -6.5),
+	float2(-3.5, -7.5), float2(+2.5, -7.5), float2(-7.5, +2.5), float2(-6.5, -2.5),
+	float2(-5.5, +5.5), float2(+2.5, +6.5), float2(-2.5, -6.5), float2(-7.5, +0.5),
+	float2(-0.5, +7.5), float2(+7.5, -2.5), float2(-2.5, +7.5), float2(+0.5, -7.5),
+	float2(-4.5, -7.5), float2(+7.5, +1.5), float2(+1.5, -6.5), float2(-6.5, +4.5),
+	float2(-1.5, +7.5), float2(-5.5, -5.5), float2(+6.5, +2.5), float2(-3.5, -6.5),
+	float2(+3.5, -7.5), float2(-5.5, +4.5), float2(+2.5, -6.5), float2(+1.5, -7.5),
+	float2(+6.5, +3.5), float2(+5.5, -6.5), float2(-6.5, +5.5), float2(+7.5, +4.5),
+	float2(+7.5, -1.5), float2(-7.5, -1.5), float2(+3.5, +7.5), float2(-5.5, +6.5),
+	float2(+1.5, +7.5), float2(+7.5, +3.5), float2(+7.5, -0.5), float2(-7.5, -2.5),
+	float2(+5.5, +5.5), float2(+6.5, +5.5), float2(+5.5, -5.5), float2(-2.5, -7.5),
+	float2(+2.5, +7.5), float2(-7.5, -3.5), float2(-7.5, -4.5), float2(-6.5, -4.5),
+	float2(+7.5, -3.5), float2(+5.5, +6.5), float2(-5.5, -6.5), float2(-4.5, -6.5),
+	float2(+7.5, +2.5), float2(-7.5, +3.5), float2(+4.5, -6.5), float2(+7.5, -4.5),
+};
+
+
+//------------------------------------------------------- PARAMETERS
+
+float3 OutputQuantizationError;
+
+Texture2D<taa_half3> InputTexture;
+Texture2D<taa_half3> PredictionSceneColorTexture;
+Texture2D<taa_half> ParallaxRejectionMaskTexture;
+
+RWTexture2D<taa_half3> FilteredInputOutput;
+RWTexture2D<taa_half3> FilteredPredictionSceneColorOutput;
+
+
+//------------------------------------------------------- FUNCTIONS
+
+taa_half ComputeColorWeight(taa_half3 Color)
+#if CONFIG_ACCUMULATE_KARIS_WEIGHTING
+{
+	return HdrWeight4(Color);
+}
+#else
+{
+	return taa_half(1);
+}
+#endif
+
+taa_half ParallaxRejectionMaskToHistoryValidity(taa_half ParallaxRejectionMask)
+{
+	return (ParallaxRejectionMask < taa_half(PARALLAX_REJECTION_MASK_THRESHOLD)) ? taa_half(0.0) : taa_half(1.0);
+}
+
+//------------------------------------------------------- ENTRY POINT
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	float4 Debug = 0.0;
+
+	uint2 DispatchThreadId = (
+		ZOrder2D(GroupThreadIndex, log2(TILE_SIZE)) +
+		GroupId * uint2(TILE_SIZE, TILE_SIZE));
+
+	uint2 InputPixelPos = InputInfo_ViewportMin + DispatchThreadId;
+
+	float2 InputBufferUV = (InputPixelPos + 0.5) * InputInfo_ExtentInverse;
+
+	// Fetch center of the kernel
+	taa_half3 CenterInput;
+	taa_half3 FilteredInput;
+	taa_half FilteredInputWeight;
+	taa_half3 FilteredHistory;
+	taa_half FilteredHistoryWeight;
+
+	{
+		taa_half SampleSpatialWeight = 1.0;
+
+		taa_half3 InputSample = InputTexture.SampleLevel(GlobalPointClampedSampler, InputBufferUV, 0);
+		taa_half3 HistorySample = PredictionSceneColorTexture.SampleLevel(GlobalPointClampedSampler, InputBufferUV, 0);
+		taa_half HistorySampleValidity = ParallaxRejectionMaskToHistoryValidity(
+			ParallaxRejectionMaskTexture.SampleLevel(GlobalPointClampedSampler, InputBufferUV, 0));
+		
+		taa_half InputWeight = ComputeColorWeight(InputSample);
+		taa_half HistoryWeight = HistorySampleValidity * ComputeColorWeight(HistorySample);
+		
+		#if CONFIG_ACCUMULATE_KARIS_COLOR
+			InputSample *= 10.0 * HdrWeight4(InputSample);
+			HistorySample *= 10.0 * HdrWeight4(HistorySample);
+		#endif
+
+		CenterInput = InputSample;
+
+		FilteredInput       = (SampleSpatialWeight * InputWeight) * InputSample;
+		FilteredInputWeight = (SampleSpatialWeight * InputWeight);
+		
+		FilteredHistory       = (SampleSpatialWeight * HistoryWeight) * HistorySample;
+		FilteredHistoryWeight = (SampleSpatialWeight * HistoryWeight);
+	}
+	
+	uint StartSampleId;
+	uint SampleCount;
+	uint SampleTrackId;
+	float2 KernelCenterUV;
+	
+	#if CONFIG_KERNEL == KERNEL_1X1
+	{
+		StartSampleId = 0;
+		SampleCount = 0;
+		KernelCenterUV = InputBufferUV;
+	}
+	#elif CONFIG_KERNEL == KERNEL_3X3
+	{
+		StartSampleId = 0;
+		SampleCount = 9;
+		KernelCenterUV = InputBufferUV;
+	}
+	#elif CONFIG_KERNEL == KERNEL_STACKOWIAK
+	{
+		StartSampleId = 1;
+		SampleCount = 16;
+		KernelCenterUV = float2(InputPixelPos | 1) * InputInfo_ExtentInverse;
+		SampleTrackId = ((InputPixelPos.x & 1) | ((InputPixelPos.y & 1) << 1));
+	}
+	#else
+		#error Unknown kernel
+	#endif
+
+	// Fetch neighborhood of the kernel
+	UNROLL
+	for (uint SampleId = StartSampleId; SampleId < SampleCount; SampleId++)
+	{
+		#if CONFIG_KERNEL_1x1
+			continue;
+		#endif
+
+		float2 Offset;
+		float SampleSpatialWeight;
+		
+		#if CONFIG_KERNEL == KERNEL_1X1
+		{
+			Offset = 0.0;
+			SampleSpatialWeight = 1.0;
+		}
+		#elif CONFIG_KERNEL == KERNEL_3X3
+		{
+			if (SampleId == 4)
+			{
+				continue;
+			}
+			Offset = kOffsets3x3[SampleId];
+			
+			//if (abs(Offset.x) + abs(Offset.y) > 1)
+			//{
+			//	continue;
+			//}
+			
+			#if 0
+				SampleSpatialWeight = 1.0;
+			#elif 1
+				SampleSpatialWeight = rcp(abs(Offset.x) + 1.0) * rcp(abs(Offset.y) + 1.0);
+			#else
+				SampleSpatialWeight = rcp(abs(Offset.x) + abs(Offset.y));
+			#endif
+		}
+		#elif CONFIG_KERNEL == KERNEL_STACKOWIAK
+		{
+			Offset = kStackowiakSampleSet0[4 * SampleId + SampleTrackId];
+			
+			#if 1
+				SampleSpatialWeight = 1.0;
+			#elif 1
+				SampleSpatialWeight = rcp(abs(Offset.x) + 1.0) * rcp(abs(Offset.y) + 1.0);
+			#else
+				SampleSpatialWeight = rcp(abs(Offset.x) + abs(Offset.y));
+			#endif
+		}
+		#else
+			#error Unknown kernel
+		#endif
+
+		float2 SampleInputBufferUV = InputBufferUV + float2(CONFIG_KERNEL_SPREAD_FACTOR * Offset) * InputInfo_ExtentInverse;
+		SampleInputBufferUV = clamp(SampleInputBufferUV, InputInfo_UVViewportBilinearMin, InputInfo_UVViewportBilinearMax);
+
+		taa_half3 InputSample = InputTexture.SampleLevel(GlobalPointClampedSampler, SampleInputBufferUV, 0);
+		taa_half3 HistorySample = PredictionSceneColorTexture.SampleLevel(GlobalPointClampedSampler, SampleInputBufferUV, 0);
+		taa_half HistorySampleValidity = ParallaxRejectionMaskToHistoryValidity(
+			ParallaxRejectionMaskTexture.SampleLevel(GlobalPointClampedSampler, SampleInputBufferUV, 0));
+		
+		taa_half InputWeight = HistorySampleValidity * ComputeColorWeight(InputSample);
+		taa_half HistoryWeight = HistorySampleValidity * ComputeColorWeight(HistorySample);
+		
+		#if CONFIG_ACCUMULATE_KARIS_COLOR
+			InputSample *= 10.0 * HdrWeight4(InputSample);
+			HistorySample *= 10.0 * HdrWeight4(HistorySample);
+		#endif
+
+		FilteredInput       += (SampleSpatialWeight * InputWeight) * InputSample;
+		FilteredInputWeight += (SampleSpatialWeight * InputWeight);
+		
+		FilteredHistory       += (SampleSpatialWeight * HistoryWeight) * HistorySample;
+		FilteredHistoryWeight += (SampleSpatialWeight * HistoryWeight);
+	}
+
+	{
+		FilteredInput *= SafeRcp(FilteredInputWeight);
+		FilteredHistory *= SafeRcp(FilteredHistoryWeight);
+	}
+	
+	#if 1
+		uint2 OutputPixelPos = uint2(InputBufferUV * InputInfo_Extent);
+	#else
+		uint2 OutputPixelPos = InputPixelPos;
+	#endif
+
+	#if CONFIG_ENABLE_STOCASTIC_QUANTIZATION
+	{
+		uint2 Random = Rand3DPCG16(int3(OutputPixelPos, View.StateFrameIndexMod8)).xy;
+		float2 E = Hammersley16(0, 1, Random);
+
+		FilteredInput += FilteredInput * (E.x * OutputQuantizationError);
+		FilteredHistory += FilteredHistory * (E.x * OutputQuantizationError);
+	}
+	#endif
+
+
+	if (all(OutputPixelPos < InputInfo_ViewportMax))
+	{
+		FilteredInputOutput[OutputPixelPos] = FilteredInput; // * (HdrWeight4(FilteredInput) * 10);
+		FilteredPredictionSceneColorOutput[OutputPixelPos] = FilteredHistory; // * (HdrWeight4(FilteredHistory) * 10);
+		
+		#if DEBUG_OUTPUT
+		{
+			DebugOutput[OutputPixelPos - InputInfo_ViewportMin] = Debug;
+		}
+		#endif
+	}
+}

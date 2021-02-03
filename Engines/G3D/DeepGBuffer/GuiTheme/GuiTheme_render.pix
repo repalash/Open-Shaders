@@ -1,0 +1,13 @@
+#version 120 // -*- c++ -*-
+/**
+  \file GuiTheme_render.pix
+
+  Apply a color and texture.
+  */
+
+varying vec2      texCoord;
+uniform sampler2D textureMap;
+
+void main(void) {
+    gl_FragColor = texture2D(textureMap, texCoord);
+}

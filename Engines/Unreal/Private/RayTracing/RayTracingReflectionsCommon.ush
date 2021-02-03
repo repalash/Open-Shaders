@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayTracingReflectionsCommon.ush: Common functions for ray traced Reflections
+===============================================================================================*/
+
+#pragma once
+
+#include "../Common.ush"
+
+// Note that the values stored in this will be accumulations across all valid samples and will not be normalized or averaged
+// until after splitting into their own individual textures
+struct FImaginaryReflectionGBufferData
+{
+	float3 WorldNormal;
+	// Not DeviceZ so that it can be linearly interpolated in world space
+	float SceneDepth;
+	float2 Velocity;
+	// Required for averaging to account for the fact that not all samples may hit a valid imaginary surface
+	uint ValidSamples;
+};
+
+float GetRoughnessFade(float Roughness, float MaxRoughness)
+{
+	float RoughnessMaskScale = -2.0 / MaxRoughness;
+	return saturate(Roughness * RoughnessMaskScale + 2.0);
+}

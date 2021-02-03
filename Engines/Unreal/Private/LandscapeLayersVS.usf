@@ -1,0 +1,15 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+float4x4 Transform;
+
+void VSMain(in float4 InPosition : ATTRIBUTE0,
+			in float2 InTextureCoordinate : ATTRIBUTE1,
+			out float2 OutTextureCoordinate : TEXCOORD0,
+			out float4 OutPosition : SV_POSITION)
+{
+	//OutPosition = float4(InPosition.xy, 0, 1);
+	OutPosition = mul(InPosition, Transform);
+	OutTextureCoordinate = InTextureCoordinate;
+}

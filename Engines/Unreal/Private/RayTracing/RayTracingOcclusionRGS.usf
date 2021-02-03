@@ -1,0 +1,685 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../LightShaderParameters.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../TransmissionCommon.ush"
+#include "../HairStrands/HairStrandsVisibilityCommon.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+#include "RayTracingDirectionalLight.ush"
+#include "RayTracingRectLight.ush"
+#include "RayTracingSphereLight.ush"
+#include "RayTracingSpotLight.ush"
+#include "RayTracingPointLight.ush"
+
+/** Light types */
+#define LIGHT_TYPE_DIRECTIONAL 0
+#define LIGHT_TYPE_POINT 1
+#define LIGHT_TYPE_SPOT 2
+#define LIGHT_TYPE_RECT 3
+
+#define ShadowMaskType_Opaque 0
+#define ShadowMaskType_Hair 1
+
+RaytracingAccelerationStructure TLAS;
+RWTexture2D<float4> RWOcclusionMaskUAV;
+RWTexture2D<float> RWRayDistanceUAV;
+RWTexture2D<float4> RWSubPixelOcclusionMaskUAV;
+
+uint LightingChannelMask;
+uint SamplesPerPixel;
+float NormalBias;
+int4 LightScissor;
+int2 PixelOffset;
+float TraceDistance;
+float LODTransitionStart;
+float LODTransitionEnd;
+uint bTransmissionSamplingDistanceCulling;
+uint TransmissionSamplingTechnique;
+uint RejectionSamplingTrials;
+
+#define TransmissionSampling_ConstantTrackingInfiniteDomain 0
+#define TransmissionSampling_ConstantTrackingFiniteDomain 1
+
+#if USE_HAIR_LIGHTING
+#include "../HairStrands/HairStrandsRaytracing.ush"
+uint				bUseHairVoxel;
+float				HairOcclusionThreshold;
+Texture2D<uint4>	HairCategorizationTexture;
+Texture2D<uint>		HairLightChannelMaskTexture;
+
+void NeedTraceHair(
+	in uint2 PixelCoord,
+	inout bool bTraceHairRay,
+	inout float HairDeviceZ)
+{
+	const FCategorizationData Categorization = DecodeCategorizationData(HairCategorizationTexture.Load(uint3(PixelCoord, 0)));
+	bTraceHairRay = false;
+	HairDeviceZ = 0;
+	if (Categorization.PixelCoverage > 0)
+	{
+		const uint HairLightChannel = HairLightChannelMaskTexture.Load(uint3(PixelCoord, 0));
+		HairDeviceZ = Categorization.ClosestDepth;
+		bTraceHairRay = (HairLightChannel & LightingChannelMask) != 0;
+	}
+}
+#endif
+
+bool GenerateOcclusionRay(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax
+)
+{
+	#if LIGHT_TYPE == LIGHT_TYPE_DIRECTIONAL
+	{
+		GenerateDirectionalLightOcclusionRay(
+			LightParameters,
+			WorldPosition, WorldNormal,
+			RandSample,
+			/* out */ RayOrigin,
+			/* out */ RayDirection,
+			/* out */ RayTMin,
+			/* out */ RayTMax);
+	}
+	#elif LIGHT_TYPE == LIGHT_TYPE_POINT
+	{
+		if (LightParameters.SourceRadius == 0)
+		{
+			return GeneratePointLightOcclusionRay(
+				LightParameters,
+				WorldPosition, WorldNormal,
+				RandSample,
+				/* out */ RayOrigin,
+				/* out */ RayDirection,
+				/* out */ RayTMin,
+				/* out */ RayTMax);
+		}
+		else
+		{
+			float RayPdf;
+			//return GenerateSphereLightOcclusionRayWithAreaSampling(
+			return GenerateSphereLightOcclusionRayWithSolidAngleSampling(
+				LightParameters,
+				WorldPosition, WorldNormal,
+				RandSample,
+				/* out */ RayOrigin,
+				/* out */ RayDirection,
+				/* out */ RayTMin,
+				/* out */ RayTMax,
+				/* out */ RayPdf);
+		}
+	}
+	#elif LIGHT_TYPE == LIGHT_TYPE_SPOT
+	{
+		return GenerateSpotLightOcclusionRay(
+			LightParameters,
+			WorldPosition, WorldNormal,
+			RandSample,
+			/* out */ RayOrigin,
+			/* out */ RayDirection,
+			/* out */ RayTMin,
+			/* out */ RayTMax);
+	}
+	#elif LIGHT_TYPE == LIGHT_TYPE_RECT
+	{
+		float RayPdf = 0.0;
+		return GenerateRectLightOcclusionRay(
+			LightParameters,
+			WorldPosition, WorldNormal,
+			RandSample,
+			/* out */ RayOrigin,
+			/* out */ RayDirection,
+			/* out */ RayTMin,
+			/* out */ RayTMax,
+			/* out */ RayPdf);
+	}
+	#else
+		#error Unknown light type.
+	#endif
+	return true;
+}
+
+float ComputeDiffuseTransmission(
+	float3 V, float3 P, float3 N,
+	float MeanFreePath, float Eta,
+	FLightShaderParameters LightParameters, float2 LightSample,
+	inout RandomSequence RandSequence, 
+	uint RejectionRetryMax, uint2 PixelCoord)
+{
+	float TransmissionDistance = SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE;
+	float RcpMeanFreePath = rcp(MeanFreePath);
+
+	// Refract inward and force a scattering event
+	float3 Tr = refract(V, N, Eta);
+
+	// Find bounding sub-surface ray extent
+	const uint RayFlags = 0;
+	const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+	float TMax = SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE;
+	if (bTransmissionSamplingDistanceCulling)
+	{
+		RayDesc RejectionTestRay;
+		RejectionTestRay.Origin = P;
+		RejectionTestRay.Direction = Tr;
+		RejectionTestRay.TMin = 0.01;
+		RejectionTestRay.TMax = TMax;
+
+		FMinimalPayload RejectionTestPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			RejectionTestRay);
+		TMax = (RejectionTestPayload.IsHit() ? RejectionTestPayload.HitT : RejectionTestRay.TMax);
+	}
+
+	uint DummyVariable;
+	float RandSample = RandomSequence_GenerateSample1D(RandSequence, DummyVariable);
+
+	float ScatterDistance = SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE;
+	float ScatterDistancePdf = 0.0;
+	if (TransmissionSamplingTechnique == TransmissionSampling_ConstantTrackingFiniteDomain)
+	{
+		// Use constant tracking through homogeneous media, but renormalize to force a scatter event within the interval: [0, TMax]
+		float NormalizationConstant = 1.0 - exp(-RcpMeanFreePath * TMax);
+		ScatterDistance = -log(1.0 - RandSample * NormalizationConstant) * MeanFreePath;
+		ScatterDistancePdf = RcpMeanFreePath * exp(-RcpMeanFreePath * ScatterDistance) * rcp(NormalizationConstant);
+	}
+	else // TransmissionSamplingTechnique = TransmissionSampling_ConstantTrackingInfiniteDomain
+	{
+		// Use constant tracking through homogeneous media, with rejection sampling to force a scatter event
+		ScatterDistance = -log(RandSample) * MeanFreePath;
+		ScatterDistancePdf = RcpMeanFreePath * exp(-ScatterDistance * RcpMeanFreePath);
+
+		// Reject scatter distances which penetrate through the medium
+		uint RetryCount = 0;
+		while (ScatterDistance > TMax && RetryCount < RejectionSamplingTrials)
+		{
+			RandSample = RandomSequence_GenerateSample1D(RandSequence, DummyVariable);
+			ScatterDistance = -log(RandSample) * MeanFreePath;
+			ScatterDistancePdf = RcpMeanFreePath * exp(-ScatterDistance * RcpMeanFreePath);
+			RetryCount++;
+		}
+		if (ScatterDistance > TMax)	return 0.0;
+	}
+
+	ScatterDistance /= ScatterDistancePdf;
+
+	// Build sub-surface scattering ray
+	RayDesc SSSRay;
+	SSSRay.Origin = P + Tr * ScatterDistance;
+	GenerateOcclusionRay(LightParameters, SSSRay.Origin, N, LightSample, SSSRay.Origin, SSSRay.Direction, SSSRay.TMin, SSSRay.TMax);
+
+	// Clip the ray length by the maximum transmission distance
+	float LightTMax = SSSRay.TMax;
+	SSSRay.TMax = SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE - ScatterDistance;
+
+	FMinimalPayload SSSPayload = TraceVisibilityRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		PixelCoord,
+		SSSRay);
+
+	if (SSSPayload.IsHit())
+	{
+		// Confirm that there is not an actual occluder beyond the maximum transmission distance
+		SSSRay.TMin = SSSPayload.HitT + 0.01;
+		SSSRay.TMax = LightTMax;
+		FMinimalPayload VisibilityPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			SSSRay);
+		if (VisibilityPayload.IsMiss())
+		{
+			TransmissionDistance = ScatterDistance + SSSPayload.HitT;
+		}
+	}
+
+	// Conversion to raster model: 1.0 - (distance / SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE)
+	return EncodeThickness(TransmissionDistance / SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE);
+}
+
+struct FOcclusionResult
+{
+	float Visibility;
+	float SumRayDistance;
+	float ClosestRayDistance;
+	float TransmissionDistance;
+	float HitCount;
+	float RayCount;
+};
+
+FOcclusionResult InitOcclusionResult()
+{
+	FOcclusionResult Out;
+
+	Out.Visibility = 0.0;
+	Out.SumRayDistance = 0.0;
+	Out.ClosestRayDistance = DENOISER_INVALID_HIT_DISTANCE;
+	Out.TransmissionDistance = 0.0;
+	Out.HitCount = 0.0;
+	Out.RayCount = 0.0;
+
+	return Out;
+}
+
+float OcclusionToShadow(FOcclusionResult In, uint LocalSamplesPerPixel)
+{
+	return (LocalSamplesPerPixel > 0) ? In.Visibility / LocalSamplesPerPixel : In.Visibility;
+}
+
+RayDesc Invert(in RayDesc Ray)
+{
+	RayDesc InvertedRay;
+	InvertedRay.TMin = Ray.TMin;
+	InvertedRay.TMax = Ray.TMax;
+#if LIGHT_TYPE == LIGHT_TYPE_DIRECTIONAL
+	InvertedRay.TMax = min(InvertedRay.TMax, TraceDistance);
+#endif
+	InvertedRay.Origin = Ray.Origin + Ray.Direction * InvertedRay.TMax;
+	InvertedRay.Direction = -Ray.Direction;
+
+	return InvertedRay;
+}
+
+FOcclusionResult ComputeOcclusion(
+	const uint2 PixelCoord,
+	RandomSequence RandSequence,
+	const uint ShadingModelID,
+	const uint RaytracingMask,
+	const float DeviceZ,
+	float3 WorldNormal,
+	const FLightShaderParameters LightParameters,
+	const FTransmissionProfileParams TransmissionProfileParams,
+	const uint LocalSamplesPerPixel)
+{
+	FOcclusionResult Out = InitOcclusionResult();
+
+	const float3 WorldPosition = ReconstructWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+
+	// For hair shading model, WorldNormal is actually the shading tangent.
+	// To generate proper bias, we compute a normal oriented toward the light.
+	// Normal clipping is removed from hair since the BSDF is spherical, rather 
+	// than hemispherical
+	//
+	// Note: 
+	// Since we don't have a notion of backfacing here, there is no correct way 
+	// to avoid self-intersection with hair. Either we push towards the light, 
+	// (this creates some issue in triangle facing back the light), or we push 
+	// toward the view point (this create issue for transmitted light)
+	// It seems having proper transmission is more important, thus the light 
+	// version is enabled by default
+	bool bApplyNormalCulling = true;
+	if (ShadingModelID == SHADINGMODELID_HAIR)
+	{
+	#if LIGHT_TYPE == LIGHT_TYPE_DIRECTIONAL
+		const float3 LightDirection = LightParameters.Direction;
+	#else
+		const float3 LightDirection = normalize(LightParameters.Position - WorldPosition);
+	#endif
+		WorldNormal = LightDirection;
+		bApplyNormalCulling = false;
+	}
+	else if (ShadingModelID == SHADINGMODELID_EYE || ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE || ShadingModelID == SHADINGMODELID_SUBSURFACE)
+	{
+		bApplyNormalCulling = false;
+	}
+
+	// Disable normal culling for RectLights
+	if (LIGHT_TYPE == LIGHT_TYPE_RECT)
+	{
+		bApplyNormalCulling = false;
+	}
+
+#if ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+	LOOP for (uint SampleIndex = 0; SampleIndex < LocalSamplesPerPixel; ++SampleIndex)
+#else // ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+	do if (LocalSamplesPerPixel > 0)
+#endif // ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+	{
+		uint DummyVariable;
+		float2 RandSample = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+
+		#if !ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+		{
+			uint2 RandomSeed = Rand3DPCG16(int3(PixelCoord, View.StateFrameIndex % 17)).xy;
+			
+			RandSample = Hammersley16(0, 1, RandomSeed);
+		}
+		#endif // !ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+
+		RayDesc Ray;
+		bool bIsValidRay = GenerateOcclusionRay(
+			LightParameters,
+			WorldPosition, WorldNormal,
+			RandSample,
+			/* out */ Ray.Origin,
+			/* out */ Ray.Direction,
+			/* out */ Ray.TMin,
+			/* out */ Ray.TMax);
+			
+
+		uint Stencil = SceneStencilTexture.Load(int3(PixelCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+		bool bDitheredLODFadingOut = Stencil & 1;
+		
+#if	ENABLE_TRANSMISSION
+		float NoL = dot(WorldNormal, Ray.Direction);
+		if (NoL > 0.0)
+		{
+			ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, NormalBias + (bDitheredLODFadingOut ? 0.8f : 0.0f));
+		}
+		else
+		{
+			ApplyPositionBias(Ray, -WorldNormal, NormalBias);
+		}
+#else
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, NormalBias + (bDitheredLODFadingOut ? 0.8f : 0.0f));
+#endif
+
+		BRANCH
+		if (!bIsValidRay && (DIM_DENOISER_OUTPUT == 0))
+		{
+			// The denoiser must still trace invalid rays to get the correct closest-hit distance
+			continue;
+		}
+		else if (bApplyNormalCulling && dot(WorldNormal, Ray.Direction) <= 0.0)
+		{
+			continue;
+		}
+
+		// Attenuation check
+		if (LightParameters.InvRadius > 0.0)
+		{
+			const float MaxAttenuationDistance = 1.0 / LightParameters.InvRadius;
+			if (Ray.TMax > MaxAttenuationDistance)
+			{
+				continue;
+			}
+		}
+
+		uint RayFlags = 0;
+
+	#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	#endif
+
+		if (ShadingModelID == SHADINGMODELID_HAIR)
+		{
+			// Denoiser mode 0 doesn't use depth, so take first hit
+			RayFlags |= RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+		}
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			RaytracingMask,
+			PixelCoord,
+			Ray);
+
+		#if USE_HAIR_LIGHTING
+		if (ShadingModelID != SHADINGMODELID_HAIR && bUseHairVoxel)
+		{
+			MinimalPayload.HitT = TraverseHair(PixelCoord, RandSequence, Ray.Origin, Ray.Direction, MinimalPayload.HitT, VirtualVoxel.Raytracing_ShadowOcclusionThreshold);
+		}
+		#endif
+
+		Out.RayCount += 1.0;
+		if (MinimalPayload.IsHit())
+		{
+			float HitT = MinimalPayload.HitT;
+
+			Out.ClosestRayDistance =
+				(Out.ClosestRayDistance == DENOISER_INVALID_HIT_DISTANCE) ||
+				(HitT < Out.ClosestRayDistance) ? HitT : Out.ClosestRayDistance;
+			Out.SumRayDistance += HitT;
+			Out.HitCount += 1.0;
+
+			if ((ShadingModelID == SHADINGMODELID_SUBSURFACE))
+			{
+				// Reverse the ray to support sub-surface casts
+				RayDesc InvertedRay = Invert(Ray);
+				FMinimalPayload SubsurfacePayload = TraceVisibilityRay(
+					TLAS,
+					RayFlags,
+					RaytracingMask,
+					PixelCoord,
+					InvertedRay);
+
+				if (SubsurfacePayload.IsHit())
+				{
+
+					float3 HitPosition = InvertedRay.Origin + InvertedRay.Direction * SubsurfacePayload.HitT;
+					float Opacity = TransmissionProfileParams.ExtinctionScale;
+					float Density = -.05f * log(1 - min(Opacity, .999f));
+					float ExtinctionCoefficient = Density;
+					float Thickness = length(HitPosition - WorldPosition);
+					float Transmission = saturate(exp(-ExtinctionCoefficient * Thickness));
+
+					if (Transmission == 1.0)
+					{
+						Out.ClosestRayDistance = (Out.ClosestRayDistance == DENOISER_INVALID_HIT_DISTANCE) ? DENOISER_MISS_HIT_DISTANCE : Out.ClosestRayDistance;
+						Out.SumRayDistance -= HitT;
+						Out.HitCount -= 1.0;
+						Out.TransmissionDistance += 1.0;
+						Out.Visibility += 1.0;
+					}
+
+					Out.TransmissionDistance += Transmission;
+				}
+			}
+		}
+		else
+		{
+			Out.ClosestRayDistance = (Out.ClosestRayDistance == DENOISER_INVALID_HIT_DISTANCE) ? DENOISER_MISS_HIT_DISTANCE : Out.ClosestRayDistance;
+			Out.TransmissionDistance += 1.0;
+			Out.Visibility += 1.0;
+		}
+	}
+#if !ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+	while (0);
+#endif // ENABLE_MULTIPLE_SAMPLES_PER_PIXEL
+
+	if (ENABLE_TRANSMISSION && LocalSamplesPerPixel > 0 && ShadingModelID == SHADINGMODELID_SUBSURFACE_PROFILE)
+	{
+		// Snag two variables to fix light sampling for all computations..
+		uint DummyVariable;
+		const float2 LightSample = RandomSequence_GenerateSample2D(RandSequence, DummyVariable);
+		const float3 V = normalize(WorldPosition - View.WorldViewOrigin);
+
+		const float MeanFreePath = TransmissionProfileParams.ExtinctionScale;
+		const float Eta = TransmissionProfileParams.OneOverIOR;
+		const uint RejectionRetryMax = LocalSamplesPerPixel - 1;
+
+		Out.TransmissionDistance = ComputeDiffuseTransmission(V, WorldPosition, WorldNormal, MeanFreePath, Eta, LightParameters, LightSample, RandSequence, RejectionRetryMax, PixelCoord);
+	}
+	else if (ShadingModelID == SHADINGMODELID_SUBSURFACE)
+	{
+		float Depth = length(WorldPosition - View.WorldCameraOrigin);
+		float Range = LODTransitionEnd - LODTransitionStart;
+		if (Depth > LODTransitionStart && Range > 0.0)
+		{
+			float Alpha = saturate((Depth - LODTransitionStart) / Range);
+			Out.Visibility = lerp(Out.Visibility, Out.TransmissionDistance, Alpha);
+		}
+		Out.TransmissionDistance = (LocalSamplesPerPixel > 0) ? Out.TransmissionDistance / LocalSamplesPerPixel : Out.TransmissionDistance;
+	}
+	else // if ((ShadingModelID == SHADINGMODELID_EYE) || (ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE))
+	{
+		Out.TransmissionDistance = (LocalSamplesPerPixel > 0) ? Out.Visibility / LocalSamplesPerPixel : Out.Visibility;
+	}
+	return Out;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(OcclusionRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy + PixelOffset;
+
+	FOcclusionResult Occlusion = InitOcclusionResult();
+	FOcclusionResult HairOcclusion = InitOcclusionResult();
+
+	const uint RequestedSamplePerPixel = ENABLE_MULTIPLE_SAMPLES_PER_PIXEL ? SamplesPerPixel : 1;
+	uint LocalSamplesPerPixel = RequestedSamplePerPixel;
+
+	if (all(PixelCoord >= LightScissor.xy) && all(PixelCoord <= LightScissor.zw))
+	{
+		RandomSequence RandSequence;
+		uint LinearIndex = CalcLinearIndex(PixelCoord);
+		RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex);
+
+		FLightShaderParameters LightParameters = GetRootLightShaderParameters();
+
+		// Get G-Buffer surface data
+		float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+		float2 BufferUV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+		float3 WorldNormal = 0;
+		uint ShadingModelID = SHADINGMODELID_UNLIT;
+		FTransmissionProfileParams TransmissionProfileParams = (FTransmissionProfileParams)0;
+		{
+#if 0
+			FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+			//#dxr-todo: workaround for flickering. UE-87281
+			FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+			ShadingModelID = GBufferData.ShadingModelID;
+			WorldNormal = GBufferData.WorldNormal;
+			if (ENABLE_TRANSMISSION)
+			{
+				TransmissionProfileParams = GetTransmissionProfileParams(GBufferData);
+			}
+
+			if (ShadingModelID == SHADINGMODELID_SUBSURFACE)
+			{
+				TransmissionProfileParams.ExtinctionScale = GBufferData.CustomData.a;
+			}
+		}
+
+		// Mask out depth values that are infinitely far away
+
+#if 0
+		float DeviceZ = SceneDepthTexture.SampleLevel(SceneDepthTextureSampler, BufferUV, 0).r;
+#else
+		//#dxr-todo: workaround for flickering. UE-87281
+		float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+#endif
+		const bool bIsDepthValid = SceneDepthTexture.Load(int3(PixelCoord, 0)).r > 0.0;
+		const bool bIsValidPixel = ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+		const uint LightChannel = GetSceneLightingChannel(PixelCoord);
+		const bool bTraceRay = bIsValidPixel && (LightChannel & LightingChannelMask) != 0;
+		if (!bTraceRay)
+		{
+			LocalSamplesPerPixel = 0;
+		}
+
+	#if USE_HAIR_LIGHTING
+		bool bTraceHairRay = false;
+		float HairDeviceZ = 0;
+		NeedTraceHair(PixelCoord, bTraceHairRay, HairDeviceZ);
+	#endif
+
+		Occlusion = ComputeOcclusion(
+			PixelCoord,
+			RandSequence,
+			ShadingModelID,
+			RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW,
+			DeviceZ,
+			WorldNormal,
+			LightParameters, 
+			TransmissionProfileParams,
+			LocalSamplesPerPixel);
+
+		#if USE_HAIR_LIGHTING
+		if (bTraceHairRay)
+		{
+			HairOcclusion = ComputeOcclusion(
+				PixelCoord,
+				RandSequence,
+				SHADINGMODELID_HAIR,
+				RAY_TRACING_MASK_SHADOW,
+				HairDeviceZ,
+				float3(1,0,0),
+				LightParameters,
+				TransmissionProfileParams,
+				RequestedSamplePerPixel);
+		}
+		#endif
+	}
+
+	// Opaque shadow on ray does not need any denoising due to the high frequency nature of hair.
+	#if USE_HAIR_LIGHTING
+	{
+		// the channel assignment is documented in ShadowRendering.cpp (look for Light Attenuation channel assignment)
+		const float HairShadow = OcclusionToShadow(HairOcclusion, RequestedSamplePerPixel);
+		const float FadedShadow = Square(HairShadow);
+		const float4 OutColor = EncodeLightAttenuation(FadedShadow.xxxx);
+		RWSubPixelOcclusionMaskUAV[PixelCoord] = OutColor;
+	}
+	#endif
+
+	const float Shadow = OcclusionToShadow(Occlusion, LocalSamplesPerPixel);
+
+	if (DIM_DENOISER_OUTPUT == 2)
+	{
+		RWOcclusionMaskUAV[PixelCoord] = float4(
+			Shadow,
+			Occlusion.ClosestRayDistance,
+			0,
+			Occlusion.TransmissionDistance);
+
+	}
+	else if (DIM_DENOISER_OUTPUT == 1)
+	{
+		float AvgHitDistance = -1.0;
+		if (Occlusion.HitCount > 0.0)
+		{
+			AvgHitDistance = Occlusion.SumRayDistance / Occlusion.HitCount;
+		}
+		else if (Occlusion.RayCount > 0.0)
+		{
+			AvgHitDistance = 1.0e27;
+		}
+
+		// TODO(Denoiser): the denoiser would much prefer a single RG texture.
+		RWOcclusionMaskUAV[PixelCoord] = float4(Shadow, Occlusion.TransmissionDistance, Shadow, Occlusion.TransmissionDistance);
+		RWRayDistanceUAV[PixelCoord] = AvgHitDistance;
+	}
+	else
+	{
+		const float ShadowFadeFraction = 1;
+		float SSSTransmission = Occlusion.TransmissionDistance;
+
+		// 0 is shadowed, 1 is unshadowed
+		// RETURN_COLOR not needed unless writing to SceneColor;
+		float FadedShadow = lerp(1.0f, Square(Shadow), ShadowFadeFraction);
+		float FadedSSSShadow = lerp(1.0f, Square(SSSTransmission), ShadowFadeFraction);
+
+		// the channel assignment is documented in ShadowRendering.cpp (look for Light Attenuation channel assignment)
+		float4 OutColor;
+		if (LIGHT_TYPE == LIGHT_TYPE_DIRECTIONAL)
+		{
+			OutColor = EncodeLightAttenuation(half4(FadedShadow, FadedSSSShadow, 1.0, FadedSSSShadow));
+		}
+		else
+		{
+			OutColor = EncodeLightAttenuation(half4(FadedShadow, FadedSSSShadow, FadedShadow, FadedSSSShadow));
+		}
+
+		RWOcclusionMaskUAV[PixelCoord] = OutColor;
+	}
+}

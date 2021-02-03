@@ -1,0 +1,28 @@
+#version 330
+/**
+  \file data-files/shader/Draw/Draw_sphereSection.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+in vec3         g3d_Vertex;
+
+out vec3        csNormal;
+out vec3        csPosition;
+
+void main() {
+#   if BOTTOM
+       // Flip to negative Y hemisphere, and then fix winding direction by flipping X coordinate as well
+       vec4 vertex = vec4(-g3d_Vertex.x, -g3d_Vertex.y, g3d_Vertex.z, 1.0); 
+#   else
+       vec4 vertex = vec4(g3d_Vertex, 1.0);
+#   endif
+
+    // On a sphere, the object-space vertex IS the normal
+    csNormal = g3d_ObjectToCameraNormalMatrix * vertex.xyz;
+    csPosition = (g3d_ObjectToCameraMatrix * vertex).xyz;
+    gl_Position = vertex * g3d_ObjectToScreenMatrixTranspose;
+}

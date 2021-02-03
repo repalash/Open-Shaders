@@ -1,0 +1,401 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../Random.ush"
+#include "../TextureSampling.ush"
+#include "../FastMath.ush"
+#include "../MonteCarlo.ush"
+
+
+//------------------------------------------------------- COMPILER CONFIG
+
+// Generate vector truncation warnings to errors.
+#pragma warning(error: 3206)
+
+
+//------------------------------------------------------- CONFIG
+
+#define DEBUG_OUTPUT 0
+
+#if PLATFORM_SUPPORTS_REAL_TYPES && 1
+	#define CONFIG_COMPILE_FP16 1
+#else
+	#define CONFIG_COMPILE_FP16 0
+#endif
+
+#define CONFIG_ENABLE_STOCASTIC_QUANTIZATION 1
+
+
+//------------------------------------------------------- CONSTANTS
+
+/* Maximum number of sample. */
+#define MAX_SAMPLE_COUNT 8
+
+#define MAX_FALLBACK_SAMPLE_COUNT 20
+
+#define PREDICTOR_RES_MULTIPLIER 2
+
+
+#define PARALLAX_REJECTION_MASK_THRESHOLD 0.5
+
+// K = Center of the nearest input pixel.
+// O = Center of the output pixel.
+//
+//          |           |
+//    0     |     1     |     2
+//          |           |
+//          |           |
+//  --------+-----------+--------
+//          |           |
+//          | O         |
+//    3     |     K     |     5
+//          |           |
+//          |           |
+//  --------+-----------+--------
+//          |           |
+//          |           |
+//    6     |     7     |     8
+//          |           |
+//
+static const int2 kOffsets3x3[9] =
+{
+	int2(-1, -1),
+	int2(0, -1),
+	int2(1, -1),
+	int2(-1,  0),
+	int2(0,  0), // K
+	int2(1,  0),
+	int2(-1,  1),
+	int2(0,  1),
+	int2(1,  1),
+};
+
+// Indexes of the 3x3 square.
+static const uint kSquareIndexes3x3[9] = { 4, 0, 1, 2, 3, 5, 6, 7, 8 };
+
+// Indexes of the offsets to have plus + shape.
+static const uint kPlusIndexes3x3[5] = { 4, 1, 3, 5, 7 };
+
+
+#if CONFIG_COMPILE_FP16
+	#define taa_half half
+	#define taa_half2 half2
+	#define taa_half3 half3
+	#define taa_half4 half4
+#else
+	#define taa_half float
+	#define taa_half2 float2
+	#define taa_half3 float3
+	#define taa_half4 float4
+#endif
+
+
+//------------------------------------------------------- PARAMETERS
+
+
+float2 InputInfo_Extent;
+float2 InputInfo_ExtentInverse;
+float2 InputInfo_ScreenPosToViewportScale;
+float2 InputInfo_ScreenPosToViewportBias;
+uint2  InputInfo_ViewportMin;
+uint2  InputInfo_ViewportMax;
+float2 InputInfo_ViewportSize;
+float2 InputInfo_ViewportSizeInverse;
+float2 InputInfo_UVViewportMin;
+float2 InputInfo_UVViewportMax;
+float2 InputInfo_UVViewportSize;
+float2 InputInfo_UVViewportSizeInverse;
+float2 InputInfo_UVViewportBilinearMin;
+float2 InputInfo_UVViewportBilinearMax;
+float2 InputJitter;
+
+float2 LowFrequencyInfo_Extent;
+float2 LowFrequencyInfo_ExtentInverse;
+float2 LowFrequencyInfo_ScreenPosToViewportScale;
+float2 LowFrequencyInfo_ScreenPosToViewportBias;
+uint2  LowFrequencyInfo_ViewportMin;
+uint2  LowFrequencyInfo_ViewportMax;
+float2 LowFrequencyInfo_ViewportSize;
+float2 LowFrequencyInfo_ViewportSizeInverse;
+float2 LowFrequencyInfo_UVViewportMin;
+float2 LowFrequencyInfo_UVViewportMax;
+float2 LowFrequencyInfo_UVViewportSize;
+float2 LowFrequencyInfo_UVViewportSizeInverse;
+float2 LowFrequencyInfo_UVViewportBilinearMin;
+float2 LowFrequencyInfo_UVViewportBilinearMax;
+
+float2 RejectionInfo_Extent;
+float2 RejectionInfo_ExtentInverse;
+float2 RejectionInfo_ScreenPosToViewportScale;
+float2 RejectionInfo_ScreenPosToViewportBias;
+uint2  RejectionInfo_ViewportMin;
+uint2  RejectionInfo_ViewportMax;
+float2 RejectionInfo_ViewportSize;
+float2 RejectionInfo_ViewportSizeInverse;
+float2 RejectionInfo_UVViewportMin;
+float2 RejectionInfo_UVViewportMax;
+float2 RejectionInfo_UVViewportSize;
+float2 RejectionInfo_UVViewportSizeInverse;
+float2 RejectionInfo_UVViewportBilinearMin;
+float2 RejectionInfo_UVViewportBilinearMax;
+
+float2 HistoryInfo_Extent;
+float2 HistoryInfo_ExtentInverse;
+float2 HistoryInfo_ScreenPosToViewportScale;
+float2 HistoryInfo_ScreenPosToViewportBias;
+uint2  HistoryInfo_ViewportMin;
+uint2  HistoryInfo_ViewportMax;
+float2 HistoryInfo_ViewportSize;
+float2 HistoryInfo_ViewportSizeInverse;
+float2 HistoryInfo_UVViewportMin;
+float2 HistoryInfo_UVViewportMax;
+float2 HistoryInfo_UVViewportSize;
+float2 HistoryInfo_UVViewportSizeInverse;
+float2 HistoryInfo_UVViewportBilinearMin;
+float2 HistoryInfo_UVViewportBilinearMax;
+
+float2 PrevHistoryInfo_Extent;
+float2 PrevHistoryInfo_ExtentInverse;
+float2 PrevHistoryInfo_ScreenPosToViewportScale;
+float2 PrevHistoryInfo_ScreenPosToViewportBias;
+uint2  PrevHistoryInfo_ViewportMin;
+uint2  PrevHistoryInfo_ViewportMax;
+float2 PrevHistoryInfo_ViewportSize;
+float2 PrevHistoryInfo_ViewportSizeInverse;
+float2 PrevHistoryInfo_UVViewportMin;
+float2 PrevHistoryInfo_UVViewportMax;
+float2 PrevHistoryInfo_UVViewportSize;
+float2 PrevHistoryInfo_UVViewportSizeInverse;
+float2 PrevHistoryInfo_UVViewportBilinearMin;
+float2 PrevHistoryInfo_UVViewportBilinearMax;
+
+#if DEBUG_OUTPUT
+	RWTexture2D<float4> DebugOutput;
+#endif
+
+
+//------------------------------------------------------- FUNCTIONS
+	
+uint2 ZOrder2D(uint Index, const uint SizeLog2)
+{
+	uint2 Coord = 0; 
+
+	UNROLL
+	for (uint i = 0; i < SizeLog2; i++)
+	{
+		Coord.x |= ((Index >> (2 * i + 0)) & 0x1) << i;
+		Coord.y |= ((Index >> (2 * i + 1)) & 0x1) << i;
+	}
+
+	return Coord;
+}
+
+float SafeRcp(float x)
+{
+	return x > 0.0 ? rcp(x) : 0.0;
+}
+
+#if CONFIG_COMPILE_FP16
+
+half SafeRcp(half x)
+{
+	return x > half(0.0) ? min(rcp(x), taa_half(MaxHalfFloat)) : half(0.0);
+}
+
+#endif
+
+taa_half3 RGBToYCoCg(taa_half3 RGB)
+{
+	taa_half Y = dot(RGB, taa_half3(1, 2, 1));
+	taa_half Co = dot(RGB, taa_half3(2, 0, -2));
+	taa_half Cg = dot(RGB, taa_half3(-1, 2, -1));
+
+	taa_half3 YCoCg = taa_half3(Y, Co, Cg);
+	return YCoCg;
+}
+
+taa_half3 YCoCgToRGB(taa_half3 YCoCg)
+{
+	taa_half Y =  YCoCg.x * taa_half(0.25);
+	taa_half Co = YCoCg.y * taa_half(0.25);
+	taa_half Cg = YCoCg.z * taa_half(0.25);
+
+	taa_half R = Y + Co - Cg;
+	taa_half G = Y + Cg;
+	taa_half B = Y - Co - Cg;
+
+	taa_half3 RGB = taa_half3(R, G, B);
+	return RGB;
+}
+
+taa_half3 YCoCgToLCoCg(taa_half3 YCoCg)
+{
+	return taa_half3(YCoCg.x, YCoCg.yz * SafeRcp(YCoCg.x));
+}
+
+taa_half3 LCoCgToYCoCg(taa_half3 LCoCg)
+{
+	return taa_half3(LCoCg.x, LCoCg.x * LCoCg.yz);
+}
+
+taa_half3 RGBToLCoCg(taa_half3 RGB)
+{
+	return YCoCgToLCoCg(RGBToYCoCg(RGB));
+}
+
+taa_half3 LCoCgToRGB(taa_half3 LCoCg)
+{
+	return YCoCgToRGB(LCoCgToYCoCg(LCoCg));
+}
+
+// Some bright pixel can cause HdrWeight to get nullified under fp16 representation. So clamping this to a value close to the minimum float float positive value (0.000061).
+#define HDR_WEIGHT_SAFE_MIN_VALUE 0.0001
+
+// Faster but less accurate luma computation. 
+// Luma includes a scaling by 4.
+taa_half Luma4(taa_half3 Color)
+{
+	return (Color.g * taa_half(2.0)) + (Color.r + Color.b);
+}
+
+taa_half HdrWeightY(taa_half Color)
+{
+	taa_half Exposure = taa_half(1.0);
+
+	return max(taa_half(HDR_WEIGHT_SAFE_MIN_VALUE), rcp(Color * Exposure + taa_half(4.0)));
+}
+
+taa_half HdrWeightInvY(taa_half Color) 
+{
+	return taa_half(4.0) * rcp(taa_half(1.0) - Color);
+}
+
+// Optimized HDR weighting function.
+taa_half HdrWeight4(taa_half3 Color)
+{
+	return HdrWeightY(Luma4(Color));
+}
+
+// Returns the weight of a pixels at a coordinate <PixelDelta> from the PDF highest point.
+taa_half ComputeSampleWeigth(taa_half UpscaleFactor, taa_half2 PixelDelta, const float MinimalContribution)
+{
+	taa_half u2 = UpscaleFactor * UpscaleFactor;
+
+	// 1 - 1.9 * x^2 + 0.9 * x^4
+	taa_half x2 = saturate(u2 * dot(PixelDelta, PixelDelta));
+	return taa_half(((float(0.9) + MinimalContribution) * x2 - float(1.9)) * x2 + float(1.0));
+}
+
+taa_half2 WeightedLerpFactors(taa_half WeightA, taa_half WeightB, taa_half Blend)
+{
+	taa_half BlendA = (taa_half(1.0) - Blend) * WeightA;
+	taa_half BlendB = Blend * WeightB;
+	taa_half RcpBlend = SafeRcp(BlendA + BlendB);
+	BlendA *= RcpBlend;
+	BlendB *= RcpBlend;
+	return taa_half2(BlendA, BlendB);
+}
+
+bool TakeOnlyOneSamplePair(float2 Offset)
+{
+	return Offset.y > 0.0 || (Offset.x > 0.0 && Offset.y == 0.0);
+}
+
+
+// For motion vector, use camera/dynamic motion from min depth pixel in pattern around pixel.
+// This enables better quality outline on foreground against different motion background.
+// Larger 2 pixel distance "x" works best (because AA dilates surface).
+void FindClosestDepthOffset(Texture2D Texture, uint2 PixelPos, float DeviceZ, int PixelRadius, out float2 VelocityPixelOffset, out float ClosestDeviceZ)
+{
+	float4 Depths;
+	Depths.x = Texture[int2(PixelPos) + int2(-PixelRadius, -PixelRadius)].r;
+	Depths.y = Texture[int2(PixelPos) + int2( PixelRadius, -PixelRadius)].r;
+	Depths.z = Texture[int2(PixelPos) + int2(-PixelRadius,  PixelRadius)].r;
+	Depths.w = Texture[int2(PixelPos) + int2( PixelRadius,  PixelRadius)].r;
+
+	float2 DepthOffset = float2(PixelRadius, PixelRadius);
+	float DepthOffsetXx = float(PixelRadius);
+	// Nearest depth is the largest depth (depth surface 0=far, 1=near).
+	if(Depths.x > Depths.y) 
+	{
+		DepthOffsetXx = -PixelRadius;
+	}
+	if(Depths.z > Depths.w) 
+	{
+		DepthOffset.x = -PixelRadius;
+	}
+	float DepthsXY = max(Depths.x, Depths.y);
+	float DepthsZW = max(Depths.z, Depths.w);
+	if (DepthsXY > DepthsZW) 
+	{
+		DepthOffset.y = -PixelRadius;
+		DepthOffset.x = DepthOffsetXx; 
+	}
+	float DepthsXYZW = max(DepthsXY, DepthsZW);
+	
+	ClosestDeviceZ = DeviceZ;
+	VelocityPixelOffset = 0.0;
+
+	// If the pixel is closer in neighborhood, take it.
+	FLATTEN
+	if(DepthsXYZW > DeviceZ)
+	{
+		VelocityPixelOffset = DepthOffset;
+		ClosestDeviceZ = DepthsXYZW;
+	}
+}
+
+float2 ComputeStaticVelocity(float2 ScreenPos, float DeviceZ)
+{
+	float3 PosN = float3(ScreenPos, DeviceZ);
+
+	float4 ThisClip = float4(PosN, 1);
+	float4 PrevClip = mul( ThisClip, View.ClipToPrevClip );
+	float2 PrevScreen = PrevClip.xy / PrevClip.w;
+	return PosN.xy - PrevScreen;
+}
+
+taa_half ComputePredictionCompleteness(taa_half SampleHistoryValidity)
+{
+	return saturate(SampleHistoryValidity * taa_half(MAX_SAMPLE_COUNT) - taa_half(0.2));
+}
+
+bool IsOffScreen(uint bCameraCut, float2 ScreenPos, taa_half ParallaxRejectionMask)
+{
+	bool bIsCameraCut = bCameraCut != 0;
+	bool bIsOutOfBounds = max(abs(ScreenPos.x), abs(ScreenPos.y)) >= 1.0;
+	bool bIsParallaxRejected = ParallaxRejectionMask < taa_half(PARALLAX_REJECTION_MASK_THRESHOLD);
+
+	return (bIsCameraCut || bIsOutOfBounds || bIsParallaxRejected);
+}
+
+taa_half MeasureRejectionFactor(taa_half3 PrevYCoCg, taa_half3 ClampedPrevYCoCg, taa_half3 InputCenterYCoCg, taa_half3 InputMinYCoCg, taa_half3 InputMaxYCoCg)
+{
+	taa_half3 BoxSize = InputMaxYCoCg - InputMinYCoCg;
+
+	taa_half3 ClampedEnergy = abs(ClampedPrevYCoCg - PrevYCoCg);
+	taa_half3 Delta = abs(InputCenterYCoCg - PrevYCoCg);
+
+	taa_half3 ClampError;
+	#if 0
+	{
+		ClampError = BoxSize * taa_half(0.25);
+	}
+	#else
+	{
+		taa_half Luma = max(ClampedPrevYCoCg.x, PrevYCoCg.x);
+
+		// Measure the error due to the quantization of the color in channels.
+		taa_half Tonemap = Luma * HdrWeightY(Luma) + taa_half(0.5 / 1024.0);
+		taa_half PixelColorQuantizationError = abs(Tonemap * HdrWeightInvY(Tonemap) - Luma);
+		
+		ClampError = max(BoxSize * taa_half(0.25), PixelColorQuantizationError);
+	}
+	#endif
+
+	taa_half3 Factor = taa_half(1.0) - saturate(max(ClampedEnergy - ClampError, taa_half(0.0)) / max(Delta, BoxSize));
+
+	taa_half Rejection = min3(Factor.r, Factor.g, Factor.b);
+	
+	return Rejection;
+}

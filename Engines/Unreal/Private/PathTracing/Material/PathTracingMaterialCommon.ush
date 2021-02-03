@@ -1,0 +1,149 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+PathTracingMaterialCommon.usf: Brdf utility functions
+===============================================================================================*/
+
+#pragma once
+
+#include "../PathTracingCommon.ush"
+#include "/Engine/Private/BRDF.ush"
+
+float3 GetMaterialEmission(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.Radiance;
+}
+
+float3 GetBaseColor(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.BaseColor;
+}
+
+float3 GetDiffuseColor(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.DiffuseColor;
+}
+
+float3 GetSpecularColor(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.SpecularColor;
+}
+
+float GetRoughness(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.Roughness;
+}
+
+float GetMetallic(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.Metallic;
+}
+
+float GetClearCoat(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.CustomData.x;
+}
+
+float GetClearCoatRoughness(FMaterialClosestHitPayload HitInfo)
+{
+	return max(HitInfo.CustomData.y, 0.02);
+}
+
+float3 GetClearCoatBottomNormal(FMaterialClosestHitPayload HitInfo)
+{
+	float3 N = HitInfo.WorldNormal;
+#ifdef PATH_TRACING
+	#if CLEAR_COAT_BOTTOM_NORMAL
+	// Functionally inverse of behavior in RayTracingMaterialHitShader.usf
+	float2 oct2 = UnitVectorToOctahedron(HitInfo.WorldNormal);
+	float2 oct3 = float2(HitInfo.CustomData.a, HitInfo.CustomData.z);
+	float2 oct1 = (oct3 - (128.0 / 255.0)) * 2.0 + oct2;
+
+	N = OctahedronToUnitVector(oct1);
+	#endif
+#endif
+	return N;
+}
+
+float GetClearCoatThickness(FMaterialClosestHitPayload HitInfo)
+{
+	// Assume normalized thickness
+	return 1.0;
+}
+
+float GetClearCoatIor(FMaterialClosestHitPayload HitInfo)
+{
+	return 1.5;
+}
+
+float GetIor(FMaterialClosestHitPayload HitInfo)
+{
+	return DielectricF0ToIor(DielectricSpecularToF0(HitInfo.Specular));
+}
+
+float3 GetSubsurfaceColor(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.CustomData.xyz;
+}
+
+float3 GetWorldNormal(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.WorldNormal;
+}
+
+bool IsPureSpecular(FMaterialClosestHitPayload HitInfo)
+{
+	return GetRoughness(HitInfo) < GLOSSY_MIN_ROUGHNESS;
+}
+
+bool IsPureSpecularReflection(FMaterialClosestHitPayload HitInfo)
+{
+	return IsPureSpecular(HitInfo) && HitInfo.BlendingMode == 0 && HitInfo.Metallic == 1;
+}
+
+bool IsPureSpecularTransmission(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.BlendingMode > RAY_TRACING_BLEND_MODE_OPAQUE;
+}
+
+bool IsLambert(FMaterialClosestHitPayload HitInfo)
+{
+	return GetRoughness(HitInfo) > GLOSSY_MAX_ROUGHNESS;
+}
+
+bool IsDefaultLitMaterial(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.ShadingModelID == SHADINGMODELID_DEFAULT_LIT;
+}
+
+bool IsClearCoatMaterial(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.ShadingModelID == SHADINGMODELID_CLEAR_COAT;
+}
+
+bool IsTwoSidedFoliageMaterial(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE;
+}
+
+bool IsMaterialTransmissive(FMaterialClosestHitPayload HitInfo)
+{
+	return HitInfo.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE;
+}
+
+bool BSDF_Refract(float3 V, float3 N, float Eta, out float3 L)
+{
+	const float CosThetaI = dot(V, N);
+	const float CosThetaT2 = 1.f - Eta * Eta * (1.0f - CosThetaI * CosThetaI);
+	if (CosThetaT2 < 0.0f)
+	{
+		// Total internal reflection
+		L = reflect(-V, N);
+		return false;
+	}
+
+	const float CosThetaT = -(CosThetaI >= 0.0f ? 1.0f : -1.0f) * sqrt(CosThetaT2);
+	L = (Eta * CosThetaI + CosThetaT) * N - Eta * V;
+
+	return true;
+}

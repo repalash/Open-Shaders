@@ -1,0 +1,25 @@
+#version 460
+
+#include <textureFilter.glsl>
+
+uniform sampler2D srcTexture;
+uniform vec2 scale;
+out vec3 dst;
+
+void main() {
+    // bicubic (Looks no better):
+    //    dst = texture2DLod_bicubic(srcTexture, gl_FragCoord.xy / g3d_FragCoordExtent.xy, 0, textureSize(srcTexture, 0), 1.0 / textureSize(srcTexture, 0)).rgb;     
+
+    // bilinear:
+    dst = texture2D(srcTexture, gl_FragCoord.xy / g3d_FragCoordExtent.xy).rgb;     
+
+    // Blured:
+    /*
+    vec2 inv = 1.0 / g3d_FragCoordExtent.xy;
+    vec2 tap = gl_FragCoord.xy * inv;
+    vec2 step = 1.5 / textureSize(srcTexture, 0);
+    dst = (texture2D(srcTexture, tap + step).rgb +
+           texture2D(srcTexture, tap).rgb * 2 +
+           texture2D(srcTexture, tap - step).rgb) * 0.25;
+    */
+}

@@ -1,0 +1,101 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../SceneTextureParameters.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+
+#if USE_HAIR_LIGHTING
+#include "../HairStrands/HairStrandsRaytracing.ush"
+#endif
+
+#include "RayTracingSkyLightEvaluation.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+
+uint UpscaleFactor;
+
+RaytracingAccelerationStructure TLAS;
+
+RWTexture2D<float4> RWSkyOcclusionMaskUAV;
+RWTexture2D<float2> RWSkyOcclusionRayDistanceUAV;
+
+RAY_TRACING_ENTRY_RAYGEN(SkyLightRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+
+	// Get G-Buffer surface data
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(UV);
+
+#if 0
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+	//#dxr-todo: workaround for flickering. UE-87281
+	FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	float3 WorldNormal = GBufferData.WorldNormal;
+	float3 Albedo = GBufferData.DiffuseColor;
+
+	// Recalculate DiffuseColor if subsurface reverted the contribution within the G-Buffer
+	if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+	{
+		Albedo = GBufferData.StoredBaseColor - GBufferData.StoredBaseColor * GBufferData.Metallic;
+		GBufferData.DiffuseColor = Albedo;
+	}
+
+	// Mask out depth values that are infinitely far away
+	bool IsFiniteDepth = DeviceZ > 0.0;
+	bool bTraceRay = (
+		IsFiniteDepth &&
+		GBufferData.ShadingModelID != SHADINGMODELID_UNLIT);
+	uint SamplesPerPixel = SkyLight.SamplesPerPixel;
+	if (!bTraceRay)
+	{
+		SamplesPerPixel = 0;
+	}
+
+	// Evaluate the Sky Light at the surface point
+	const bool bGBufferSampleOrigin = true;
+	const bool bDecoupleSampleGeneration = DECOUPLE_SAMPLE_GENERATION != 0;
+	float3 ExitantRadiance;
+	float3 DiffuseExitantRadiance;
+	float AmbientOcclusion;
+	float HitDistance;
+
+	SkyLightEvaluate(
+		DispatchThreadId,
+		PixelCoord,
+		SamplesPerPixel,
+		WorldPosition,
+		WorldNormal,
+		CameraDirection,
+		GBufferData,
+		TLAS,
+		bGBufferSampleOrigin,
+		DeviceZ,
+		bDecoupleSampleGeneration,
+		ExitantRadiance,
+		DiffuseExitantRadiance,
+		AmbientOcclusion,
+		HitDistance);
+
+	// Pre-divide by albedo, to be recovered in compositing
+	DiffuseExitantRadiance.r = Albedo.r > 0.0 ? DiffuseExitantRadiance.r / Albedo.r : DiffuseExitantRadiance.r;
+	DiffuseExitantRadiance.g = Albedo.g > 0.0 ? DiffuseExitantRadiance.g / Albedo.g : DiffuseExitantRadiance.g;
+	DiffuseExitantRadiance.b = Albedo.b > 0.0 ? DiffuseExitantRadiance.b / Albedo.b : DiffuseExitantRadiance.b;
+
+#if USE_PREEXPOSURE
+	DiffuseExitantRadiance.rgb *= View.PreExposure;
+#endif
+
+	RWSkyOcclusionMaskUAV[DispatchThreadId] = float4(ClampToHalfFloatRange(DiffuseExitantRadiance.rgb), AmbientOcclusion);
+	RWSkyOcclusionRayDistanceUAV[DispatchThreadId] = float2(HitDistance, SamplesPerPixel);
+}

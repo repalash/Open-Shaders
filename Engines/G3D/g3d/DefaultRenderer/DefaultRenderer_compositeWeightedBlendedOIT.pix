@@ -1,0 +1,171 @@
+#version 410
+/**
+  \file data-files/shader/DefaultRenderer/DefaultRenderer_compositeWeightedBlendedOIT.pix
+
+  This shader corresponds to listing 2 of:
+
+  McGuire and Mara, A Phenomenological Scattering Model for Order-Independent Transparency, 
+  Proceedings of the ACM Symposium on Interactive 3D Graphics and Games (I3D), Feburary 28, 2016
+
+  http://graphics.cs.williams.edu/papers/TransparencyI3D16/
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+
+
+uniform ivec2 trimBandThickness;
+
+// Total stretch of diffusion, including stride
+const int maxDiffusionPixels = 16;
+
+// Step size in pixels between taps. Total pixels read are bounded above by 
+// (2 * (maxDiffusionPixels/diffusionStridePixels) + 1)^2 and cut out into a circle.
+// ("stride" in the original paper).
+const int diffusionStridePixels = 2;
+
+
+/* sum(rgb * a, a). Named accum in the paper */
+uniform Texture2D accumTexture;
+
+/* (Beta_r, Beta_g, Beta_b, diffusion) in the paper */
+uniform Texture2D backgroundModulationAndDiffusionTexture;
+
+/** (delta_x, delta_y) */
+uniform Texture2D deltaTexture;
+
+uniform Texture2D backgroundTexture;
+
+/* Convert diffusion standard deviation to pixels.
+   (pixels / one diffusion standard deviation)^2. */
+uniform float pixelsPerDiffusion2;
+
+out Color3 result;
+
+vec3 spectralWeight(float t) {
+    vec3 w;
+    w.r = smoothstep(0.5, 1./3, t);
+    w.b = smoothstep(0.5, 2./3., t);
+    w.g = 1.0 - w.r - w.b;
+    return w;
+}
+
+void main() {
+    // Center tap
+    int2 C = int2(gl_FragCoord.xy);
+
+    vec4 backgroundModulationAndDiffusion = texelFetch(backgroundModulationAndDiffusionTexture.sampler, C, 0);
+    Color3 backgroundModulation = backgroundModulationAndDiffusion.rgb;
+
+    if (minComponent(backgroundModulation) == 1.0) {
+        // Save the color texture fetch cost; there is no transparency
+        // at this pixel (assumes that refractive surfaces perform at least some
+        // modulation of the background)
+        result = texelFetch(backgroundTexture.sampler, C, 0).rgb;
+        return;
+    }
+
+    // Diffusion radius squared in pixels
+    float diffusion2 = backgroundModulationAndDiffusion.a * pixelsPerDiffusion2;
+    Vector2 delta = 3.0 * texelFetch(deltaTexture.sampler, C, 0).xy * (1.0 / 8.0);
+    float4 accum = texelFetch(accumTexture.sampler, C, 0);
+
+    
+    // In the case where the denominator overflowed, at least preserve some color
+    // instead of writing zero by dividing through by infinity
+    if (isinf(accum.a)) {
+        accum.a = maxComponent(accum.rgb);
+    }
+
+    // Suppress overflow of the numerator by outputting white
+    if (isinf(maxComponent(accum.rgb))) {
+        accum = float4(isinf(accum.a) ? 1.0 : accum.a);
+    }
+
+    // Attempt to fake transmission on the additive term by blending in a little bit of the 
+    // background modulation.
+    {
+        const float epsilon = 0.001;
+        accum.rgb *= Color3(0.5) + max(backgroundModulation, vec3(epsilon)) / (2.0 * max(epsilon, maxComponent(backgroundModulation)));
+    }
+
+    Color3 background = Color3(0);
+
+    // Blur the background
+    if (diffusion2 > 0) {
+        C += int2(delta * backgroundTexture.size);
+
+        const int stride = diffusionStridePixels;
+
+        // Kernel radius
+        int R = int(min(pow(diffusion2, 0.25), maxDiffusionPixels) / float(stride)) * stride;
+        float weightSum = 0;
+
+        for (Point2 q = Point2(-R); q.x <= R; q.x += stride) {
+            for (q.y = -R; q.y <= R; q.y += stride) {
+
+                float radius2 = dot(q, q);
+
+                if (radius2 <= diffusion2) {
+                    int2 tap = C + ivec2(q);
+
+                    // Diffusion radius of the pixel under the tap
+                    float backgroundBlurRadius2 = texelFetch(backgroundModulationAndDiffusionTexture.sampler, tap, 0).a * pixelsPerDiffusion2;
+
+                    if (radius2 <= backgroundBlurRadius2) {
+                        // Disk weight
+                        float weight = 1.0 / (backgroundBlurRadius2 + 1e-5) + 1e-5;
+
+                        // Gaussian weight (slightly higher quality but much slower
+                        // float weight = exp(-radius2 / (8 * backgroundBlurRadius2)) / sqrt(4 * pi * backgroundBlurRadius2);
+
+                        // We can't use a bilinear tap here because it is a bilateral filter
+                        background += weight * texelFetch(backgroundTexture.sampler, tap, 0).rgb;
+                        weightSum += weight;        
+                    }
+                }           
+            }
+        }
+
+        // Guaranteed to not divide by zero because the above loop always samples the center pixel
+        background /= weightSum;
+    } else {
+        vec2 MIN = vec2(trimBandThickness + 0.5);
+        vec2 MAX = backgroundTexture.size - vec2(trimBandThickness * 2.0 - 0.5f);
+
+        float deltaMag = dot(delta, delta);
+        if (deltaMag > 0) {
+            // Chromatic abberation
+            vec3 weightSum = vec3(0);
+            background = vec3(0);
+
+            // Take 2 * R + 1 samples
+            const int R = 2;
+
+            // Spread the samples by this percentage of delta
+            const float scale = 0.05;
+            for (int i = -R; i <= R; ++i) {
+                vec3 weight = spectralWeight(0.5 + float(i) / float(R));
+                vec2 texCoord = clamp(delta * backgroundTexture.size * (1.0 + float(i) * scale / float(R)) + gl_FragCoord.xy, MIN, MAX) * backgroundTexture.invSize;
+                background += weight * texture(backgroundTexture.sampler, texCoord).rgb;
+                weightSum += weight;
+            }
+
+            background /= weightSum;
+
+        } else {
+            background = texture(backgroundTexture.sampler, clamp(delta * backgroundTexture.size + gl_FragCoord.xy, MIN, MAX) * backgroundTexture.invSize).rgb;
+        }
+    }
+
+    // dst' =  (accum.rgb / accum.a) * (1 - backgroundModulation) + dst
+    // [dst has already been modulated by the transmission colors and coverage and the blend mode
+    // inverts revealage for us] 
+    result = background * backgroundModulation + (Color3(1) - backgroundModulation) * accum.rgb * (1.0 / max(accum.a, 0.00001));
+}

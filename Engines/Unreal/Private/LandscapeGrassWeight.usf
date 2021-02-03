@@ -1,0 +1,178 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+struct FLandscapeGrassWeightInterpolantsVSToPS
+{
+	float4 Position : SV_POSITION;
+	FVertexFactoryInterpolantsVSToPS FactoryInterpolants;
+	float4 PositionPreOffset : TEXCOORD9;
+};
+
+#if VERTEXSHADER
+
+float2 RenderOffset;
+
+/** Vertex Shader */
+void VSMain(
+	FVertexFactoryInput Input,
+	out FLandscapeGrassWeightInterpolantsVSToPS Output
+	)
+{
+	ResolvedView = ResolveView();
+
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+	float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+	half3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);
+	
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPosition.xyz, TangentToLocal);
+	
+	// We can't deal correctly with horizontal WPO. We can choose to either:
+	// (i) only take the offset in the direction of the heightfield which means that grass can mismatch on some slopes, or
+	// (ii) take the full offset which means that grass can be missing or corrupt at edges of each tile.
+	// We choose (i) here.
+	float3 WPO = GetMaterialWorldPositionOffset(VertexParameters);
+	WPO = mul(WPO, (float3x3)Primitive.WorldToLocal) * float3(0, 0, 1);
+	WPO = mul(WPO, (float3x3)Primitive.LocalToWorld);
+	WorldPosition.xyz += WPO;
+
+	Output.FactoryInterpolants = VertexFactoryGetInterpolantsVSToPS(Input, VFIntermediates, VertexParameters);
+
+	float4 RasterizedWorldPosition = VertexFactoryGetRasterizedWorldPosition(Input, VFIntermediates, WorldPosition);
+	Output.PositionPreOffset = mul(RasterizedWorldPosition, ResolvedView.TranslatedWorldToClip);
+	Output.Position = Output.PositionPreOffset + float4(RenderOffset, 0, 0);
+}
+
+#elif PIXELSHADER
+
+int OutputPass;
+
+// Pixel Shader
+void PSMain( 
+	FLandscapeGrassWeightInterpolantsVSToPS Interpolants
+	OPTIONAL_IsFrontFace,
+	out half4 OutColor	: SV_Target0
+	)
+{
+	ResolvedView = ResolveView();
+
+	// Build the SvPosition without RenderOffset so that we correctly reproject WorldPosition etc.
+	float4 SvPositionPreOffset = Interpolants.PositionPreOffset / Interpolants.PositionPreOffset.w;
+	SvPositionPreOffset.xy = (SvPositionPreOffset.xy * float2(0.5f, -0.5f) + 0.5f) * ResolvedView.ViewSizeAndInvSize.xy;
+
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants.FactoryInterpolants, SvPositionPreOffset);
+	FPixelMaterialInputs PixelMaterialInputs;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPositionPreOffset, bIsFrontFace);
+
+	// Calculate and pack landscape height.
+	float3 LocalPos = mul(float4(MaterialParameters.AbsoluteWorldPosition, 1), Primitive.WorldToLocal).xyz;
+	float Height = clamp(round(LocalPos.z / TERRAIN_ZSCALE) + 32768.0, 0, 65535);
+	float2 PackedHeight = float2(floor(Height / 256), fmod(Height, 256)) / 255;
+
+#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 2
+	switch(OutputPass)
+	{
+	case 0:
+#endif
+		// Height, outputs 1 & 2
+		OutColor.xy = PackedHeight;
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 0
+			OutColor.z = GetGrassWeight0(MaterialParameters);
+			#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 1
+				OutColor.w = GetGrassWeight1(MaterialParameters);
+			#else
+				OutColor.w = 0;
+			#endif
+		#else
+			OutColor.z = 0;
+			OutColor.w = 0;
+		#endif
+#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 2
+		break;
+	case 1:
+		OutColor.x = GetGrassWeight2(MaterialParameters);
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 3
+			OutColor.y = GetGrassWeight3(MaterialParameters);
+		#else
+			OutColor.y = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 4
+			OutColor.z = GetGrassWeight4(MaterialParameters);
+		#else
+			OutColor.z = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 5
+			OutColor.w = GetGrassWeight5(MaterialParameters);
+		#else
+			OutColor.w = 0;
+		#endif
+		break;
+#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 6
+	case 2:
+		OutColor.x = GetGrassWeight6(MaterialParameters);
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 7
+			OutColor.y = GetGrassWeight7(MaterialParameters);
+		#else
+			OutColor.y = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 8
+			OutColor.z = GetGrassWeight8(MaterialParameters);
+		#else
+			OutColor.z = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 9
+			OutColor.w = GetGrassWeight9(MaterialParameters);
+		#else
+			OutColor.w = 0;
+		#endif
+		break;
+#endif // NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 6
+#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 10
+	case 3:
+		OutColor.x = GetGrassWeight10(MaterialParameters);
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 11
+			OutColor.y = GetGrassWeight11(MaterialParameters);
+		#else
+			OutColor.y = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 12
+			OutColor.z = GetGrassWeight12(MaterialParameters);
+		#else
+			OutColor.z = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 13
+			OutColor.w = GetGrassWeight13(MaterialParameters);
+		#else
+			OutColor.w = 0;
+		#endif
+		break;
+#endif // NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 10
+#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 14
+	case 4:
+		OutColor.x = GetGrassWeight14(MaterialParameters);
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 15
+			OutColor.y = GetGrassWeight15(MaterialParameters);
+		#else
+			OutColor.y = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 16
+			OutColor.z = GetGrassWeight16(MaterialParameters);
+		#else
+			OutColor.z = 0;
+		#endif
+		#if NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 17
+			OutColor.w = GetGrassWeight17(MaterialParameters);
+		#else
+			OutColor.w = 0;
+		#endif
+		break;
+#endif // NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 14
+	default:
+		OutColor = float4(0,0,0,0);
+		break;
+	}
+#endif // NUM_MATERIAL_OUTPUTS_GETGRASSWEIGHT > 2
+}
+#endif

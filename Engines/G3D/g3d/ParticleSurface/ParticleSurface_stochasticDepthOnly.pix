@@ -1,0 +1,42 @@
+#version 410 or 460
+/**
+  \file data-files/shader/ParticleSurface/ParticleSurface_stochasticDepthOnly.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#if __VERSION__ > 440
+// Disabled because on NVIDIA cards this causes
+// depth to write even when the fragment discards
+//layout(early_fragment_tests) in;
+
+#endif
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <UniversalMaterial/UniversalMaterial.glsl>
+#include <UniversalMaterial/UniversalMaterial_sample.glsl>
+
+uniform UniversalMaterial2DArray material;
+
+// This reduces the darkness of stochastic shadows cast by particle systems,
+// which tends to improve their overall appearance.
+const float shadowCastingFactor = 0.25;
+
+in Point3                   wsPosition;
+in Point3                   texCoord;
+
+float random(Point3 p) {
+    return frac(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3 + p.z * 1e2) * 1e3);
+}
+
+void main() {
+    float alpha = sampleTexture(material.lambertian, texCoord).a;
+
+    // Selectively kill based on a random number vs. alpha.
+    if (random(wsPosition.xyz) > alpha * shadowCastingFactor) {
+        discard;
+    }
+}

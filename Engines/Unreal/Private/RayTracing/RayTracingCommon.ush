@@ -1,0 +1,671 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	RayTracingCommon.ush: common header used in multiple ray generation shaders
+=============================================================================*/
+
+#pragma once
+
+#ifndef RAYTRACINGCOMMON_USH_INCLUDED
+#define RAYTRACINGCOMMON_USH_INCLUDED // Workarround for UE-66460
+
+// Make sure we recompile ray tracing shaders if the main shader version changes
+#include "/Engine/Public/ShaderVersion.ush"
+
+#include "../ShadingCommon.ush"
+#include "/Engine/Shared/RayTracingDefinitions.h"
+
+#ifdef OVERRIDE_RAYTRACING_USH
+#include "/Platform/Private/RayTracing.ush"
+#endif // OVERRIDE_RAYTRACING_USH
+
+// Certain DXR system value intrinsics are explicitly disallowed in Unreal Engine entirely.
+// Supported cross-platform system value intrinsics:
+//                                  RayGen   Intersection   AnyHit  ClosestHit  Miss  Callable
+// uint3 DispatchRaysIndex()          YES         -           -          -        -       -
+// uint3 DispatchRaysDimensions()     YES         -           -          -        -       -
+// float3 WorldRayOrigin()             -         YES*        YES        YES      YES      -
+// float3 WorldRayDirection()          -         YES*        YES        YES      YES      -
+// float RayTMin()                     -          -           -          -        -       -
+// float RayTCurrent()                 -         YES*        YES        YES      YES      -
+// float RayFlags()                    -          -           -          -        -       -
+// uint InstanceIndex()                -         YES*        YES        YES       -       -
+// uint InstanceID()                   -         YES*        YES        YES       -       -
+// uint GeometryIndex()                -          -           -          -        -       -
+// uint PrimitiveIndex()               -         YES*        YES        YES       -       -
+// float3 ObjectRayOrigin()            -          -           -          -        -       -
+// float3 ObjectRayDirection()         -          -           -          -        -       -
+// float3x4 ObjectToWorld3x4()         -          -           -          -        -       -
+// float4x3 ObjectToWorld4x3()         -          -           -          -        -       -
+// float3x4 WorldToObject3x4()         -          -           -          -        -       -
+// float4x3 WorldToObject4x3()         -          -           -          -        -       -
+// uint HitKind()                      -          -          YES        YES       -       -
+// * NOTE: Intersection shaders are only supported in DXR.
+
+#define ALLOW_ALL_DXR_INTRINSICS 1
+
+#if !ALLOW_ALL_DXR_INTRINSICS
+#if !RAYGENSHADER
+// These intrinsics are allowed by DXR in all shader types, but we only support them in RayGen.
+// If values are required, they must be explicitly passed through the payload structure.
+#define DispatchRaysIndex()      DispatchRaysIndex_is_only_supported_in_raygen_shaders
+#define DispatchRaysDimensions() DispatchRaysDimensions_is_only_supported_in_raygen_shaders
+#endif // !RAYGENSHADER
+
+// These DXR intrinsics are disallowed for better cross-platform compatibility and performance.
+#define RayTMin()                RayTMin_is_not_supported
+#define RayFlags()               RayFlags_is_not_supported
+#define GeometryIndex()          GeometryIndex_is_not_supported
+#define ObjectRayOrigin()        ObjectRayOrigin_is_not_supported
+#define ObjectRayDirection()     ObjectRayDirection_is_not_supported
+#define ObjectToWorld3x4()       ObjectToWorld3x4_is_not_supported
+#define ObjectToWorld4x3()       ObjectToWorld4x3_is_not_supported
+#define WorldToObject3x4()       WorldToObject3x4_is_not_supported
+#define WorldToObject4x3()       WorldToObject4x3_is_not_supported
+#endif // !ALLOW_ALL_DXR_INTRINSICS
+
+// Define generic wrappers for ray tracing shader entry points, if not already overriden
+
+#ifndef RAY_TRACING_ENTRY_RAYGEN
+#define RAY_TRACING_ENTRY_RAYGEN(name)\
+[shader("raygeneration")] void name()
+#endif // RAY_TRACING_ENTRY_RAYGEN
+
+#ifndef RAY_TRACING_ENTRY_CLOSEST_HIT
+#define RAY_TRACING_ENTRY_CLOSEST_HIT(name, payload_type, payload_name, attributes_type, attributes_name)\
+[shader("closesthit")] void name(inout payload_type payload_name, in attributes_type attributes_name)
+#endif //RAY_TRACING_ENTRY_CLOSEST_HIT
+
+#ifndef RAY_TRACING_ENTRY_ANY_HIT
+#define RAY_TRACING_ENTRY_ANY_HIT(name, payload_type, payload_name, attributes_type, attributes_name)\
+[shader("anyhit")] void name(inout payload_type payload_name, in attributes_type attributes_name)
+#endif // RAY_TRACING_ENTRY_ANY_HIT
+
+#ifndef RAY_TRACING_ENTRY_MISS
+#define RAY_TRACING_ENTRY_MISS(name, payload_type, payload_name)\
+[shader("miss")] void name(inout payload_type payload_name)
+#endif //RAY_TRACING_ENTRY_MISS
+
+// 
+
+struct FBasicRayData
+{
+	float3 Origin;
+	uint Mask;
+	float3 Direction;
+	float TFar;
+};
+
+struct FMinimalPayload
+{
+	float HitT; // Distance from ray origin to the intersection point in the ray direction. Negative on miss.
+
+	bool IsMiss() { return HitT < 0; }
+	bool IsHit() { return !IsMiss(); }
+
+	void SetMiss() { HitT = -1; }
+};
+
+struct FIntersectionPayload : FMinimalPayload
+{
+	uint   PrimitiveIndex; // Index of the primitive within the geometry inside the bottom-level acceleration structure instance. Undefined on miss.
+	uint   InstanceIndex;  // Index of the current instance in the top-level structure. Undefined on miss.
+	float2 Barycentrics;   // Primitive barycentric coordinates of the intersection point. Undefined on miss.
+};
+
+struct FDefaultPayload : FIntersectionPayload
+{
+	uint   InstanceID; // Value of FRayTracingGeometryInstance::UserData. Undefined on miss.
+};
+
+#define RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID   0xFFFFFFFF
+#define RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS  0xFFFFFFFE
+
+struct FDeferredMaterialPayload : FMinimalPayload
+{
+	uint   SortKey;          // MaterialID by default
+	uint   PixelCoordinates; // X in low 16 bits, Y in high 16 bits
+};
+
+struct FDefaultAttributes
+{
+	float2 Barycentrics;
+};
+
+struct FRayCone
+{
+	float Width;
+	float SpreadAngle;
+};
+
+FRayCone UnpackRayCone(uint PackedRayCone)
+{
+	FRayCone Result;
+	Result.Width       = f16tof32(PackedRayCone & 0xFFFF);
+	Result.SpreadAngle = f16tof32(PackedRayCone >> 16);
+	return Result;
+}
+
+uint PackRayCone(FRayCone RayCone)
+{
+	return f32tof16(RayCone.Width) | (f32tof16(RayCone.SpreadAngle) << 16);
+}
+
+FRayCone PropagateRayCone(in FRayCone Cone, in float SurfaceSpreadAngle, in float  HitT)
+{
+	FRayCone NewCone;
+	NewCone.Width = Cone.SpreadAngle * HitT + Cone.Width;
+	NewCone.SpreadAngle = Cone.SpreadAngle + SurfaceSpreadAngle;
+	return NewCone;
+}
+
+float3 ReconstructWorldPositionFromDeviceZ(uint2 PixelCoord, float DeviceZ)
+{
+	float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	return TranslatedWorldPosition.xyz + View.WorldCameraOrigin;
+}
+
+void ReconstructWorldPositionAndCameraDirectionFromDeviceZ(uint2 PixelCoord, float DeviceZ, out float3 OutWorldPosition, out float3 OutCameraDirection)
+{
+	float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	OutWorldPosition = TranslatedWorldPosition.xyz + View.WorldCameraOrigin;
+	OutCameraDirection = normalize(TranslatedWorldPosition.xyz - View.TranslatedWorldCameraOrigin);
+}
+
+float3 ReconstructTranslatedWorldPositionFromDeviceZ(uint2 PixelCoord, float DeviceZ)
+{
+	float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	return TranslatedWorldPosition.xyz;
+}
+
+float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
+{
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), View.ScreenToWorld);
+	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+
+	return WorldPosition;
+}
+
+uint CalcLinearIndex(uint2 PixelCoord)
+{
+	return PixelCoord.y * uint(View.BufferSizeAndInvSize.x) + PixelCoord.x;
+}
+
+uint2 GetPixelCoord(uint2 DispatchThreadId, uint UpscaleFactor)
+{
+	uint UpscaleFactorPow2 = UpscaleFactor * UpscaleFactor;
+
+	// TODO(Denoiser): find a way to not interfer with TAA's jittering.
+	uint SubPixelId = View.StateFrameIndex & (UpscaleFactorPow2 - 1);
+
+	return DispatchThreadId * UpscaleFactor + uint2(SubPixelId & (UpscaleFactor - 1), SubPixelId / UpscaleFactor);
+}
+
+#define RAY_TRACING_BLEND_MODE_OPAQUE				0
+#define RAY_TRACING_BLEND_MODE_ALPHA_COMPOSITE		1
+#define RAY_TRACING_BLEND_MODE_TRANSLUCENT			2
+#define RAY_TRACING_BLEND_MODE_ADDITIVE				3
+#define RAY_TRACING_BLEND_MODE_MODULATE				4
+#define RAY_TRACING_BLEND_MODE_ALPHA_HOLDOUT		5
+
+// Check how Flags are packed in the FPackedMaterialClosestHitPayload before adding to ensure bits are free
+#define RAY_TRACING_PAYLOAD_FLAG_FRONT_FACE                    (1 << 0) // Indicates that ray has hit front face of a primitive. Set by closest hit shader.
+#define RAY_TRACING_PAYLOAD_FLAG_MINIMAL_PAYLOAD               (1 << 1) // Indicates that closest hit shader should only fill FMinimalPayload (HitT), skipping full material evaluation. Set by RayGen shader, before TraceRay().
+#define RAY_TRACING_PAYLOAD_FLAG_ENABLE_SKY_LIGHT_CONTRIBUTION (1 << 2) // Indicates that hit shaders should add in the Sky Light contribution in their output. Set by RayGen shader, before TraceRay().
+#define RAY_TRACING_PAYLOAD_FLAG_IGNORE_TRANSLUCENT            (1 << 3) // Indicates that translucent materials should be ignored by IgnoreHit() in anyhit shaders.
+
+struct FMaterialClosestHitPayload : FMinimalPayload
+{
+										// Unpacked  Packed
+										// offset    bytes
+	// float FMinimalPayload::HitT		// 0         4       32bits
+	FRayCone RayCone;					// 4         8       64bits
+	float3 Radiance;					// 8         6       48bits
+	float3 WorldNormal;					// 24        6       48bits
+	float3 BaseColor;					// 36        6       48bits
+	float3 DiffuseColor;				// 48        0       (derived)
+	float3 SpecularColor;				// 60        0       (derived)
+	float Opacity;						// 72        2       16bits
+	float Metallic;						// 76        1       8bits
+	float Specular;						// 80        1       8bits
+	float Roughness;					// 84        2       16bits
+	float Ior;							// 88        2       16bits
+	uint ShadingModelID;				// 92        1       4bits
+	uint BlendingMode;					// 96        0       4bits (packed with ShadingModelID)
+	uint PrimitiveLightingChannelMask;	// 100       0       3bits (packed with ShadingModelID)
+	float4 CustomData;					// 104       4       32bits
+	float GBufferAO;					// 120       0       (removed)
+	float3 IndirectIrradiance;			// 124       0       48bits -- gbuffer only has float payload and there are truncation HLSL warnings
+
+	// Quite some code assume FRayHitInfo has a WorldPos
+	// So keep it here and force to re-construct it in Unpack call using ray information.
+	// It is not packed in FRayHitInfoPacked
+	float3 WorldPos;					// 136       0       (derived)
+	uint Flags;							// 148       0       5bits (packed with ShadingModelID)
+	float3 WorldTangent;				// 152       6       48bits
+	float Anisotropy;					// 164       2       16bits (packed with WorldTangent)
+										// 166 total
+
+	void SetMinimalPayloadMode() { Flags |= RAY_TRACING_PAYLOAD_FLAG_MINIMAL_PAYLOAD; }
+	bool IsMinimalPayloadMode() { return (Flags & RAY_TRACING_PAYLOAD_FLAG_MINIMAL_PAYLOAD) != 0; }
+
+	void SetFrontFace() { Flags |= RAY_TRACING_PAYLOAD_FLAG_FRONT_FACE; }
+	bool IsFrontFace() { return (Flags & RAY_TRACING_PAYLOAD_FLAG_FRONT_FACE) != 0; }
+
+	void SetEnableSkyLightContribution() { Flags |= RAY_TRACING_PAYLOAD_FLAG_ENABLE_SKY_LIGHT_CONTRIBUTION; }
+	bool IsEnableSkyLightContribution() { return (Flags & RAY_TRACING_PAYLOAD_FLAG_ENABLE_SKY_LIGHT_CONTRIBUTION) != 0; }
+
+	void SetIgnoreTranslucentMaterials() { Flags |= RAY_TRACING_PAYLOAD_FLAG_IGNORE_TRANSLUCENT; }
+	bool IsIgnoreTranslucentMaterials() { return (Flags & RAY_TRACING_PAYLOAD_FLAG_IGNORE_TRANSLUCENT) != 0; }
+
+	FRayCone GetRayCone() { return RayCone; }
+	void SetRayCone(FRayCone NewRayCone) { RayCone = NewRayCone; }
+
+	bool HasAnisotropy() { return abs(Anisotropy) >= 0.001f; }
+};
+
+// WorldNormal is the vector towards which the ray position will be offseted.
+void ApplyPositionBias(inout float3 RayOrigin, float3 RayDirection, const float3 WorldNormal, const float MaxNormalBias)
+{
+	// Apply normal perturbation when defining ray to:
+	// * avoid self intersection with current underlying triangle
+	// * hide mismatch between shading surface & geometric surface
+	//
+	// While using shading normal is not correct (we should use the 
+	// geometry normal, but it is not available atm/too costly to compute), 
+	// it is good enough for a cheap solution
+	const float MinBias = 0.01f;
+	const float MaxBias = max(MinBias, MaxNormalBias);
+	const float NormalBias = lerp(MaxBias, MinBias, saturate(dot(WorldNormal, RayDirection)));
+
+	RayOrigin += WorldNormal * NormalBias;
+}
+
+void ApplyCameraRelativeDepthBias(inout float3 RayOrigin, float3 RayDirection, uint2 PixelCoord, float DeviceZ, const float3 WorldNormal, const float AbsoluteNormalBias)
+{
+	float3 WorldPosition = ReconstructTranslatedWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+	float3 CameraDirection = WorldPosition - View.TranslatedWorldCameraOrigin;
+	float DistanceToCamera = length(CameraDirection);
+	CameraDirection = normalize(CameraDirection);
+	float Epsilon = 1.0e-4;
+	float RelativeBias = DistanceToCamera * Epsilon;
+	//float ProjectedBias = RelativeBias / dot(RayDirection, WorldNormal);
+
+	float RayBias = max(RelativeBias, AbsoluteNormalBias);
+	RayOrigin -= CameraDirection * RayBias;
+	ApplyPositionBias(RayOrigin, RayDirection, WorldNormal, RayBias);
+}
+
+#if !COMPUTESHADER
+
+RayDesc CreatePrimaryRay(float2 UV)
+{
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float3 RayStart_TranslatedWorld = View.TranslatedWorldCameraOrigin;
+	float4 RayEnd_TranslatedWorld = mul(float4(ScreenPosition, 1, 1), View.ScreenToTranslatedWorld);
+	RayEnd_TranslatedWorld *= rcp(RayEnd_TranslatedWorld.w);
+
+	RayDesc Ray;
+	Ray.Origin = View.WorldCameraOrigin;
+	Ray.Direction = normalize(RayEnd_TranslatedWorld.xyz - RayStart_TranslatedWorld);
+	Ray.TMin = 0.0;
+	Ray.TMax = 1.0e27;
+	return Ray;
+}
+
+struct FPackedMaterialClosestHitPayload : FMinimalPayload
+{
+	// float FMinimalPayload::HitT                       // 4  bytes
+
+	uint PackedRayCone;                                  // 4 bytes (fp16 width, fp16 spread)
+	float MipBias;                                       // 4 bytes (can be packed into only 4 bits if necessary)
+
+	uint RadianceAndNormal[3];                           // 12 bytes
+	uint BaseColorAndOpacity[2];                         // 8  bytes
+	uint MetallicAndSpecularAndRoughness;                // 4  bytes
+	uint IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask;    // 4  bytes
+	uint PackedIndirectIrradiance[2];                    // 8  bytes
+	uint PackedCustomData;                               // 4  bytes
+	uint WorldTangentAndAnisotropy[2];                   // 8  bytes
+	uint PackedPixelCoord;                               // 4  bytes
+	                                                     // 64 bytes total
+
+	void SetPixelCoord(uint2 PixelCoord) { PackedPixelCoord = (PixelCoord.x & 0xFFFF) | (PixelCoord.y << 16); }
+	uint2 GetPixelCoord() { return uint2(PackedPixelCoord & 0xFFFF, PackedPixelCoord >> 16); }
+
+	void SetMinimalPayloadMode() { IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= RAY_TRACING_PAYLOAD_FLAG_MINIMAL_PAYLOAD << 24; }
+	bool IsMinimalPayloadMode() { return ((IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 24) & RAY_TRACING_PAYLOAD_FLAG_MINIMAL_PAYLOAD) != 0; }
+
+	void SetEnableSkyLightContribution() { IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= RAY_TRACING_PAYLOAD_FLAG_ENABLE_SKY_LIGHT_CONTRIBUTION << 24; }
+	bool IsEnableSkyLightContribution() { return ((IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 24) & RAY_TRACING_PAYLOAD_FLAG_ENABLE_SKY_LIGHT_CONTRIBUTION) != 0; }
+
+	void SetIgnoreTranslucentMaterials() { IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= RAY_TRACING_PAYLOAD_FLAG_IGNORE_TRANSLUCENT << 24; }
+	bool IsIgnoreTranslucentMaterials() { return ((IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 24) & RAY_TRACING_PAYLOAD_FLAG_IGNORE_TRANSLUCENT) != 0; }
+
+	FRayCone GetRayCone() { return UnpackRayCone(PackedRayCone); }
+	void SetRayCone(FRayCone NewRayCone) { PackedRayCone = PackRayCone(NewRayCone); }
+
+	float GetMipBias() { return MipBias; }
+	void SetMipBias(float NewMipBias) { MipBias = NewMipBias; }
+
+	void SetRadiance(in float3 InRadiance)
+	{
+		RadianceAndNormal[0] = f32tof16(InRadiance.x) | (f32tof16(InRadiance.y) << 16);
+		RadianceAndNormal[1] &= 0xffff << 16; // Clear the radiance (low bits), keep packed normal component (high bits)
+		RadianceAndNormal[1] |= f32tof16(InRadiance.z);
+	}
+
+	float3 GetRadiance()
+	{
+		float3 Result;
+		Result.x = f16tof32(RadianceAndNormal[0]);
+		Result.y = f16tof32(RadianceAndNormal[0] >> 16);
+		Result.z = f16tof32(RadianceAndNormal[1]);
+		return Result;
+	}
+
+	void SetIndirectIrradiance(float3 InIndirectIrradiance)
+	{
+		PackedIndirectIrradiance[0] = f32tof16(InIndirectIrradiance.x);
+		PackedIndirectIrradiance[0] |= f32tof16(InIndirectIrradiance.y) << 16;
+		PackedIndirectIrradiance[1] = f32tof16(InIndirectIrradiance.z);
+	}
+
+	float3 GetIndirectIrradiance()
+	{
+		float3 Result;
+		Result.x = f16tof32(PackedIndirectIrradiance[0]);
+		Result.y = f16tof32(PackedIndirectIrradiance[0] >> 16);
+		Result.z = f16tof32(PackedIndirectIrradiance[1]);
+		return Result;
+	}
+
+	float3 GetWorldNormal()
+	{
+		float3 Result;
+		Result.x = f16tof32(RadianceAndNormal[1] >> 16);
+		Result.y = f16tof32(RadianceAndNormal[2]);
+		Result.z = f16tof32(RadianceAndNormal[2] >> 16);
+		return Result;
+	}
+
+	float4 GetCustomData()
+	{
+		float4 Result;
+		Result.x = PackedCustomData & 0xFF;
+		Result.y = (PackedCustomData >> 8) & 0xFF;
+		Result.z = (PackedCustomData >> 16) & 0xFF;
+		Result.w = (PackedCustomData >> 24) & 0xFF;
+		Result /= 255.0;
+		return Result;
+	}	
+
+	float3 GetBaseColor()
+	{
+		float3 Result;
+		Result.x = f16tof32(BaseColorAndOpacity[0]);
+		Result.y = f16tof32(BaseColorAndOpacity[0] >> 16);
+		Result.z = f16tof32(BaseColorAndOpacity[1]);
+		return Result;
+	}
+	
+	float3 GetWorldTangent()
+	{
+		float3 Result;
+		Result.x = f16tof32(WorldTangentAndAnisotropy[0]);
+		Result.y = f16tof32(WorldTangentAndAnisotropy[0] >> 16);
+		Result.z = f16tof32(WorldTangentAndAnisotropy[1]);
+		return Result;
+	}
+
+	float GetOpacity()       { return f16tof32(BaseColorAndOpacity[1] >> 16); }
+	float GetMetallic()      { return float(MetallicAndSpecularAndRoughness & 0xFF) / 255.0f; }
+	float GetSpecular()      { return float((MetallicAndSpecularAndRoughness >> 8) & 0xFF) / 255.0f; }
+	float GetRoughness()     { return f16tof32(MetallicAndSpecularAndRoughness >> 16); }
+	float GetIor()           { return f16tof32(IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask); }
+	uint GetShadingModelID() { return (IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 16) & 0xF; }
+	uint GetBlendingMode()   { return (IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 20) & 0xF; }
+	uint GetFlags()          { return (IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 24) & 0x1F; }
+	uint GetPrimitiveLightingChannelMask() { return (IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask >> 29) & 0x7; }
+	float GetAnisotropy()    { return f16tof32(WorldTangentAndAnisotropy[1] >> 16); }
+
+	float3 GetDiffuseColor() { return GetBaseColor() - GetBaseColor() * GetMetallic(); }
+	float3 GetSpecularColor() { return ComputeF0(GetSpecular(), GetBaseColor(), GetMetallic()); }
+
+};
+
+FPackedMaterialClosestHitPayload PackRayTracingPayload(FMaterialClosestHitPayload Input, in FRayCone RayCone)
+{
+	FPackedMaterialClosestHitPayload Output = (FPackedMaterialClosestHitPayload)0;
+	Output.HitT = Input.HitT;
+	Output.SetRayCone(RayCone);
+	Output.RadianceAndNormal[0]  = f32tof16(Input.Radiance.x);
+	Output.RadianceAndNormal[0] |= f32tof16(Input.Radiance.y) << 16;
+	Output.RadianceAndNormal[1]  = f32tof16(Input.Radiance.z);
+	Output.RadianceAndNormal[1] |= f32tof16(Input.WorldNormal.x) << 16;
+	Output.RadianceAndNormal[2]  = f32tof16(Input.WorldNormal.y);
+	Output.RadianceAndNormal[2] |= f32tof16(Input.WorldNormal.z) << 16;
+	Output.BaseColorAndOpacity[0]  = f32tof16(Input.BaseColor.x);
+	Output.BaseColorAndOpacity[0] |= f32tof16(Input.BaseColor.y) << 16;
+	Output.BaseColorAndOpacity[1]  = f32tof16(Input.BaseColor.z);
+	Output.BaseColorAndOpacity[1] |= f32tof16(Input.Opacity) << 16;
+	Output.MetallicAndSpecularAndRoughness  = (uint(round(Input.Metallic * 255.0f)) & 0xFF);
+	Output.MetallicAndSpecularAndRoughness |= (uint(round(Input.Specular * 255.0f)) & 0xFF) << 8;
+	Output.MetallicAndSpecularAndRoughness |= f32tof16(Input.Roughness) << 16;
+	Output.IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask  = f32tof16(Input.Ior);                              // 16 bits
+	Output.IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= (Input.ShadingModelID & 0xF) << 16;               // 4 bits
+	Output.IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= (Input.BlendingMode & 0xF) << 20;                 // 4 bits
+	Output.IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= (Input.Flags & 0x1F) << 24;                       // 5 bits
+	Output.IorAndShadingModelIDAndBlendingModeAndFlagsAndPrimitiveLightingChannelMask |= (Input.PrimitiveLightingChannelMask & 0x7) << 29; // 3 bits
+	Output.PackedIndirectIrradiance[0] = f32tof16(Input.IndirectIrradiance.x);
+	Output.PackedIndirectIrradiance[0] |= f32tof16(Input.IndirectIrradiance.y) << 16;
+	Output.PackedIndirectIrradiance[1] = f32tof16(Input.IndirectIrradiance.z);
+	int4 CustomData = round(Input.CustomData * 255);
+	Output.PackedCustomData = CustomData.x | (CustomData.y << 8) | (CustomData.z << 16) | (CustomData.w << 24);
+	Output.WorldTangentAndAnisotropy[0]  = f32tof16(Input.WorldTangent.x);
+	Output.WorldTangentAndAnisotropy[0] |= f32tof16(Input.WorldTangent.y) << 16;
+	Output.WorldTangentAndAnisotropy[1]  = f32tof16(Input.WorldTangent.z);
+	Output.WorldTangentAndAnisotropy[1] |= f32tof16(Input.Anisotropy) << 16;
+
+	return Output;
+}
+
+FMaterialClosestHitPayload UnpackRayTracingPayload(FPackedMaterialClosestHitPayload Input, RayDesc Ray)
+{
+	FMaterialClosestHitPayload Output = (FMaterialClosestHitPayload)0;
+
+	Output.HitT = Input.HitT;
+	Output.RayCone            = Input.GetRayCone(); 
+	Output.Radiance           = Input.GetRadiance();
+	Output.WorldNormal        = Input.GetWorldNormal();
+	Output.BaseColor          = Input.GetBaseColor();
+	Output.Opacity	          = Input.GetOpacity();
+	Output.Metallic	          = Input.GetMetallic();
+	Output.Specular           = Input.GetSpecular();
+    Output.Roughness          = Input.GetRoughness();
+	Output.Ior                = Input.GetIor();
+	Output.ShadingModelID     = Input.GetShadingModelID();
+	Output.BlendingMode	      = Input.GetBlendingMode();
+	Output.PrimitiveLightingChannelMask = Input.GetPrimitiveLightingChannelMask();
+	Output.Flags              = Input.GetFlags();
+	Output.IndirectIrradiance = Input.GetIndirectIrradiance();
+	Output.CustomData         = Input.GetCustomData();
+	Output.WorldTangent		  = Input.GetWorldTangent();
+	Output.Anisotropy         = Input.GetAnisotropy();
+
+	Output.DiffuseColor  = Output.BaseColor - Output.BaseColor * Output.Metallic;
+	Output.SpecularColor = ComputeF0(Output.Specular, Output.BaseColor, Output.Metallic);
+	Output.WorldPos		 = Ray.Origin + Output.HitT * Ray.Direction;
+
+	return Output;
+}
+
+void ApplyPositionBias(inout RayDesc Ray, const float3 WorldNormal, const float MaxNormalBias)
+{
+	ApplyPositionBias(Ray.Origin, Ray.Direction, WorldNormal, MaxNormalBias);
+}
+
+void ApplyCameraRelativeDepthBias(inout RayDesc Ray, uint2 PixelCoord, float DeviceZ, const float3 WorldNormal, const float AbsoluteNormalBias)
+{
+	ApplyCameraRelativeDepthBias(Ray.Origin, Ray.Direction, PixelCoord, DeviceZ, WorldNormal, AbsoluteNormalBias);
+}
+
+void TraceVisibilityRayPacked(
+	inout FPackedMaterialClosestHitPayload PackedPayload,
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in uint2 PixelCoord,
+	in RayDesc Ray)
+{
+	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_SHADOW;
+	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+	const uint MissShaderIndex = 0;
+
+	// By enabling minimal payload mode all other payload information is ignored, meaning these functions need no payload inputs
+	PackedPayload.SetMinimalPayloadMode();
+	PackedPayload.HitT = 0;
+
+	PackedPayload.SetPixelCoord(PixelCoord);
+
+	// Trace the ray
+
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RayContributionToHitGroupIndex,
+		MultiplierForGeometryContributionToShaderIndex,
+		MissShaderIndex,
+		Ray,
+		PackedPayload);
+}
+
+FMinimalPayload TraceVisibilityRay(
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in uint2 PixelCoord,
+	in RayDesc Ray)
+{
+	FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+	PackedPayload.SetIgnoreTranslucentMaterials();
+
+	TraceVisibilityRayPacked(PackedPayload, TLAS, RayFlags, InstanceInclusionMask, PixelCoord, Ray);
+
+	// Unpack the payload
+
+	FMinimalPayload MinimalPayload = (FMinimalPayload)0;
+
+	// In theory this unpacking setp is not needed as FPackedMaterialClosestHitPayload derives from FMinimalPayload,
+	// but the compiler currently dislikes a direct cast between them. Additionally in the future if HitT is ever packed
+	// differently and the FMinimalPayload is not directly inherited from this will need to change.
+	MinimalPayload.HitT = PackedPayload.HitT;
+
+	return MinimalPayload;
+}
+
+void TraceMaterialRayPacked(
+	inout FPackedMaterialClosestHitPayload Payload,
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in RayDesc Ray,
+	// Payload Inputs
+	inout FRayCone RayCone,
+	in uint2 PixelCoord,
+	in bool bEnableSkyLightContribution)
+{
+	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_MATERIAL;
+	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+	const uint MissShaderIndex = 0;
+
+	// Set payload inputs
+
+	Payload.SetRayCone(RayCone);
+	Payload.SetPixelCoord(PixelCoord);
+
+	if (bEnableSkyLightContribution)
+	{
+		// Enable Sky Light contribution in the payload if requested
+		Payload.SetEnableSkyLightContribution();
+	}
+
+
+	// Trace the ray
+
+	Payload.HitT = 0;
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RayContributionToHitGroupIndex,
+		MultiplierForGeometryContributionToShaderIndex,
+		MissShaderIndex,
+		Ray,
+		Payload);
+
+	RayCone = Payload.GetRayCone();
+}
+
+FMaterialClosestHitPayload TraceMaterialRay(
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in RayDesc Ray,
+	// Payload Inputs
+	inout FRayCone RayCone,
+	in uint2 PixelCoord,
+	in bool bEnableSkyLightContribution,
+	in bool bIgnoreTranslucentMaterials)
+{
+	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_MATERIAL;
+	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+	const uint MissShaderIndex = 0;
+
+	FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+
+	// Set payload inputs
+
+	PackedPayload.SetRayCone(RayCone);
+	PackedPayload.SetPixelCoord(PixelCoord);
+
+	if (bEnableSkyLightContribution)
+	{
+		// Enable Sky Light contribution in the payload if requested
+		PackedPayload.SetEnableSkyLightContribution();
+	}
+	
+	if (bIgnoreTranslucentMaterials)
+	{
+		PackedPayload.SetIgnoreTranslucentMaterials();
+	}
+
+	// Trace the ray
+
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RayContributionToHitGroupIndex,
+		MultiplierForGeometryContributionToShaderIndex,
+		MissShaderIndex,
+		Ray,
+		PackedPayload);
+
+	// Unpack the payload
+
+	FMaterialClosestHitPayload Payload = UnpackRayTracingPayload(PackedPayload, Ray);
+
+	RayCone = Payload.GetRayCone();
+
+	return Payload;
+}
+
+#endif // !COMPUTESHADER
+
+#endif // RAYTRACINGCOMMON_USH_INCLUDED // Workarround for UE-66460

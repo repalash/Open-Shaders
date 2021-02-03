@@ -1,0 +1,1801 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PlatformCommon.usf: Common shader code
+=============================================================================*/
+
+#pragma once
+
+#include "../Public/Platform.ush"
+// These types are used for material translator generated code, or any functions the translated code can call
+#if PIXELSHADER
+	#define MaterialFloat half
+	#define MaterialFloat2 half2
+	#define MaterialFloat3 half3
+	#define MaterialFloat4 half4
+	#define MaterialFloat3x3 half3x3
+	#define MaterialFloat4x4 half4x4 
+	#define MaterialFloat4x3 half4x3 
+#else
+	// Material translated vertex shader code always uses floats, 
+	// Because it's used for things like world position and UVs
+	#define MaterialFloat float
+	#define MaterialFloat2 float2
+	#define MaterialFloat3 float3
+	#define MaterialFloat4 float4
+	#define MaterialFloat3x3 float3x3
+	#define MaterialFloat4x4 float4x4 
+	#define MaterialFloat4x3 float4x3 
+#endif
+
+#if POST_PROCESS_ALPHA
+#define SceneColorLayout float4
+#define CastFloat4ToSceneColorLayout(x) (x)
+#define SetSceneColorLayoutToFloat4(dest,value) dest = (value)
+#else
+#define SceneColorLayout float3
+#define CastFloat4ToSceneColorLayout(x) ((x).rgb)
+#define SetSceneColorLayoutToFloat4(dest,value) dest.rgb = (value).rgb
+#endif
+
+#define SUPPORTS_TEXTURE_EXTERNAL		(COMPILER_GLSL_ES3_1 || COMPILER_VULKAN)
+
+#if !SUPPORTS_TEXTURE_EXTERNAL
+#define TextureExternal Texture2D
+#endif
+
+#ifndef REGISTER
+	#if COMPILER_HLSLCC
+		#define REGISTER(x)
+	#else
+		#define REGISTER(x)		: register(x)
+	#endif
+#endif
+
+#ifndef SUPPORTS_TEXTURECUBE_ARRAY
+#define SUPPORTS_TEXTURECUBE_ARRAY (FEATURE_LEVEL >= FEATURE_LEVEL_SM5)
+#endif
+
+#if SUPPORTS_TEXTURECUBE_ARRAY == 0
+	// Define TextureCubeArray to something which will compile so we can use it in uniform buffers
+	#define TextureCubeArray TextureCube
+#endif
+
+// Generated file that contains uniform buffer declarations needed by the shader being compiled 
+#include "/Engine/Generated/GeneratedUniformBuffers.ush" 
+
+// uniform buffers specifics
+#include "CommonViewUniformBuffer.ush"
+
+#include "InstancedStereo.ush"
+
+#include "Definitions.usf"
+
+#define METAL_TESSELLATION_PROFILE ((METAL_PROFILE || METAL_SM5_PROFILE) && USING_TESSELLATION)
+
+// Using SV_ClipDistance has overhead (15% slower base pass in triangle bound test scene on PS4) so projects have to opt-in
+#define USE_GLOBAL_CLIP_PLANE (PLATFORM_SUPPORTS_GLOBAL_CLIP_PLANE && PROJECT_ALLOW_GLOBAL_CLIP_PLANE && !MATERIAL_DOMAIN_POSTPROCESS && !MATERIAL_DOMAIN_UI)
+
+#define POSITIVE_INFINITY (asfloat(0x7F800000))
+#define NEGATIVE_INFINITY (asfloat(0xFF800000))
+
+#define NearDepthValue (HAS_INVERTED_Z_BUFFER ? 1.0f : 0.0f)
+#define FarDepthValue  (HAS_INVERTED_Z_BUFFER ? 0.0f : 1.0f)
+
+const static MaterialFloat PI = 3.1415926535897932f;
+const static float MaxHalfFloat = 65504.0f;
+const static float Max10BitsFloat = 64512.0f;
+
+// Control MIP level used for material texture fetches. By default only raytracing 
+// shaders (i.e., !PIXELSHADER) use manual MIP level selection. A material shader 
+// can opt. in to force a specific MIP level.
+//
+// * USE_FORCE_TEXTURE_MIP : enable/disable manual MIP level selection
+// * FORCED_TEXTURE_MIP    : force a specific MIP level
+//
+#if !PIXELSHADER && !defined(USE_FORCE_TEXTURE_MIP)
+	#define USE_FORCE_TEXTURE_MIP 1
+#endif
+#ifndef USE_FORCE_TEXTURE_MIP
+	#define USE_FORCE_TEXTURE_MIP 0
+#endif
+#ifndef FORCED_TEXTURE_MIP
+	#define FORCED_TEXTURE_MIP 0.0f
+#endif
+
+#ifndef USE_RAYTRACED_TEXTURE_RAYCONE_LOD
+#define USE_RAYTRACED_TEXTURE_RAYCONE_LOD (RAYHITGROUPSHADER)
+#endif // USE_RAYTRACED_TEXTURE_RAYCONE_LOD
+
+static float GlobalTextureMipBias = 0;
+static float GlobalRayCone_TexArea = 0;
+float ComputeRayConeLod(Texture2D Tex)
+{
+#if USE_RAYTRACED_TEXTURE_RAYCONE_LOD
+	uint2 Dimensions;
+	Tex.GetDimensions(Dimensions.x, Dimensions.y);
+	int TexArea = Dimensions.x * Dimensions.y;
+	return 0.5f * log2(GlobalRayCone_TexArea * TexArea);
+#else
+    return FORCED_TEXTURE_MIP;
+#endif
+}
+
+float  ClampToHalfFloatRange(float  X) { return clamp(X, float(0), MaxHalfFloat); }
+float2 ClampToHalfFloatRange(float2 X) { return clamp(X, float(0).xx, MaxHalfFloat.xx); }
+float3 ClampToHalfFloatRange(float3 X) { return clamp(X, float(0).xxx, MaxHalfFloat.xxx); }
+float4 ClampToHalfFloatRange(float4 X) { return clamp(X, float(0).xxxx, MaxHalfFloat.xxxx); }
+
+// This would need to be a #define in GLSL to ignore the SamplerState, however, it is currently a function call in HLSL
+// for type checking of the parameters - ironically the type checking is really only needed in GLSL!
+MaterialFloat4 Texture1DSample(Texture1D Tex, SamplerState Sampler, float UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat4 Texture2DSample(Texture2D Tex, SamplerState Sampler, float2 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, ComputeRayConeLod(Tex) + GlobalTextureMipBias);
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat Texture2DSample_A8(Texture2D Tex, SamplerState Sampler, float2 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, ComputeRayConeLod(Tex) + GlobalTextureMipBias) A8_SAMPLE_MASK;
+#else
+	return Tex.Sample(Sampler, UV) A8_SAMPLE_MASK;
+#endif
+}
+MaterialFloat4 Texture3DSample(Texture3D Tex, SamplerState Sampler, float3 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat4 TextureCubeSample(TextureCube Tex, SamplerState Sampler, float3 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat4 Texture2DArraySample(Texture2DArray Tex, SamplerState Sampler, float3 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat4 Texture1DSampleLevel(Texture1D Tex, SamplerState Sampler, float UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+MaterialFloat4 Texture2DSampleLevel(Texture2D Tex, SamplerState Sampler, float2 UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+MaterialFloat4 Texture2DSampleBias(Texture2D Tex, SamplerState Sampler, float2 UV, MaterialFloat MipBias)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, ComputeRayConeLod(Tex) + MipBias + GlobalTextureMipBias);
+#else
+	return Tex.SampleBias(Sampler, UV, MipBias);
+#endif
+}
+MaterialFloat4 Texture2DSampleGrad(Texture2D Tex, SamplerState Sampler, float2 UV, MaterialFloat2 DDX, MaterialFloat2 DDY)
+{
+	return Tex.SampleGrad(Sampler, UV, DDX, DDY);
+}
+MaterialFloat4 Texture3DSampleLevel(Texture3D Tex, SamplerState Sampler, float3 UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+MaterialFloat4 Texture3DSampleBias(Texture3D Tex, SamplerState Sampler, float3 UV, MaterialFloat MipBias)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.SampleBias(Sampler, UV, MipBias);
+#endif
+}
+MaterialFloat4 Texture3DSampleGrad(Texture3D Tex, SamplerState Sampler, float3 UV, MaterialFloat3 DDX, MaterialFloat3 DDY)
+{
+	return Tex.SampleGrad(Sampler, UV, DDX, DDY);
+}
+MaterialFloat4 TextureCubeSampleLevel(TextureCube Tex, SamplerState Sampler, float3 UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+MaterialFloat TextureCubeSampleDepthLevel(TextureCube TexDepth, SamplerState Sampler, float3 UV, MaterialFloat Mip)
+{
+	return TexDepth.SampleLevel(Sampler, UV, Mip).x;
+}
+MaterialFloat4 TextureCubeSampleBias(TextureCube Tex, SamplerState Sampler, float3 UV, MaterialFloat MipBias)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.SampleBias(Sampler, UV, MipBias);
+#endif
+}
+MaterialFloat4 TextureCubeSampleGrad(TextureCube Tex, SamplerState Sampler, float3 UV, MaterialFloat3 DDX, MaterialFloat3 DDY)
+{
+	return Tex.SampleGrad(Sampler, UV, DDX, DDY);
+}
+MaterialFloat4 TextureExternalSample(TextureExternal Tex, SamplerState Sampler, float2 UV)
+{
+#if USE_FORCE_TEXTURE_MIP
+	#if SUPPORTS_TEXTURE_EXTERNAL
+		return Tex.SampleLevel(Sampler, UV, 0);
+	#else
+		return Tex.SampleLevel(Sampler, UV, ComputeRayConeLod(Tex) + GlobalTextureMipBias);
+	#endif
+#else
+	return Tex.Sample(Sampler, UV);
+#endif
+}
+MaterialFloat4 TextureExternalSampleGrad(TextureExternal Tex, SamplerState Sampler, float2 UV, MaterialFloat2 DDX, MaterialFloat2 DDY)
+{
+	return Tex.SampleGrad(Sampler, UV, DDX, DDY);
+}
+MaterialFloat4 TextureExternalSampleLevel(TextureExternal Tex, SamplerState Sampler, float2 UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+
+// Re-routed texture sampling for decals
+// On iOS and Android MALI devices decal UVs has issues with deriavatives on polygon edges resulting in 'wireframe' rendering artifacts (UE-50971)
+// to workaround we always sample top mip level
+MaterialFloat4 Texture1DSample_Decal(Texture1D Tex, SamplerState Sampler, float UV)
+{
+	return Texture1DSample(Tex, Sampler, UV);
+}
+MaterialFloat4 Texture2DSample_Decal(Texture2D Tex, SamplerState Sampler, float2 UV)
+{
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1
+	return Texture2DSampleGrad(Tex, Sampler, UV, 0.f, 0.f);
+#else
+	return Texture2DSample(Tex, Sampler, UV);
+#endif
+}
+MaterialFloat4 Texture3DSample_Decal(Texture3D Tex, SamplerState Sampler, float3 UV)
+{
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1
+	return Texture3DSampleGrad(Tex, Sampler, UV, 0.f, 0.f);
+#else
+	return Texture3DSample(Tex, Sampler, UV);
+#endif
+}
+MaterialFloat4 TextureCubeSample_Decal(TextureCube Tex, SamplerState Sampler, float3 UV)
+{
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1
+	return TextureCubeSampleGrad(Tex, Sampler, UV, 0.f, 0.f);
+#else
+	return TextureCubeSample(Tex, Sampler, UV);
+#endif
+}
+MaterialFloat4 TextureExternalSample_Decal(TextureExternal Tex, SamplerState Sampler, float2 UV)
+{
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1
+	return TextureExternalSampleGrad(Tex, Sampler, UV, 0.f, 0.f);
+#else
+	return TextureExternalSample(Tex, Sampler, UV);
+#endif
+}
+
+MaterialFloat4 Texture2DArraySampleLevel(Texture2DArray Tex, SamplerState Sampler, float3 UV, MaterialFloat Mip)
+{
+	return Tex.SampleLevel(Sampler, UV, Mip);
+}
+MaterialFloat4 Texture2DArraySampleBias(Texture2DArray Tex, SamplerState Sampler, float3 UV, MaterialFloat MipBias)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return Tex.SampleLevel(Sampler, UV, 0);
+#else
+	return Tex.SampleBias(Sampler, UV, MipBias);
+#endif
+}
+MaterialFloat4 Texture2DArraySampleGrad(Texture2DArray Tex, SamplerState Sampler, float3 UV, MaterialFloat2 DDX, MaterialFloat2 DDY)
+{
+	return Tex.SampleGrad(Sampler, UV, DDX, DDY);
+}
+
+//converts an input 1d to 2d position. Useful for locating z frames that have been laid out in a 2d grid like a flipbook.
+float2 Tile1Dto2D(float xsize, float idx)
+{
+	float2 xyidx = 0;
+	xyidx.y = floor(idx / xsize);
+	xyidx.x = idx - xsize * xyidx.y;
+
+	return xyidx;
+}
+
+// return a pseudovolume texture sample.
+// useful for simulating 3D texturing with a 2D texture or as a texture flipbook with lerped transitions
+// treats 2d layout of frames a 3d texture and performs bilinear filtering by blending with an offset Z frame.
+// Wrap repeat mode along XY is not seamless. This is however enough for current sampling use cases all in [0,1].
+// @param Tex          = Input Texture Object storing Volume Data
+// @param inPos        = Input float3 for Position, 0-1
+// @param xysize       = Input float for num frames in x,y directions
+// @param numframes    = Input float for num total frames
+// @param mipmode      = Sampling mode: 0 = use miplevel, 1 = use UV computed gradients, 2 = Use gradients (default=0)
+// @param miplevel     = MIP level to use in mipmode=0 (default 0)
+// @param InDDX, InDDY = Texture gradients in mipmode=2
+float4 PseudoVolumeTexture(Texture2D Tex, SamplerState TexSampler, float3 inPos, float2 xysize, float numframes,
+	uint mipmode = 0, float miplevel = 0, float2 InDDX = 0, float2 InDDY = 0)
+{
+	float z = inPos.z - 0.5f / numframes;	// This offset is needed to have a behavior consistent with hardware sampling (voxel value is at their center)
+	float zframe = floor(z * numframes);
+	float zphase = frac(z * numframes);
+
+	float2 uv = frac(inPos.xy) / xysize;
+
+	float2 curframe = Tile1Dto2D(xysize.x, zframe) / xysize;
+	float2 nextframe = Tile1Dto2D(xysize.x, zframe + 1) / xysize;
+
+	float2 uvCurFrame = uv + curframe;
+	float2 uvNextFrame = uv + nextframe;
+
+	#if COMPILER_GLSL_ES3_1
+	uvCurFrame.y = 1.0 - uvCurFrame.y;
+	uvNextFrame.y = 1.0 - uvNextFrame.y;
+	#endif
+
+	float4 sampleA = 0, sampleB = 0;
+	switch (mipmode)
+	{
+	case 0: // Mip level
+		sampleA = Tex.SampleLevel(TexSampler, uvCurFrame, miplevel);
+		sampleB = Tex.SampleLevel(TexSampler, uvNextFrame, miplevel);
+		break;
+	case 1: // Gradients automatic from UV
+		sampleA = Texture2DSample(Tex, TexSampler, uvCurFrame);
+		sampleB = Texture2DSample(Tex, TexSampler, uvNextFrame);
+		break;
+	case 2: // Deriviatives provided
+		sampleA = Tex.SampleGrad(TexSampler, uvCurFrame,  InDDX, InDDY);
+		sampleB = Tex.SampleGrad(TexSampler, uvNextFrame, InDDX, InDDY);
+		break;
+	default:
+		break;
+	}
+
+	return lerp(sampleA, sampleB, zphase);
+}
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5 // Cubemap arrays are not supported in SM4 feature level
+	MaterialFloat4 TextureCubeArraySampleLevel(TextureCubeArray Tex, SamplerState Sampler, float3 UV, float ArrayIndex, MaterialFloat Mip)
+	{
+		return Tex.SampleLevel(Sampler, float4(UV, ArrayIndex), Mip);
+	}
+#endif
+
+// TANGENTTOWORLD0 is the first row of the tangent to world matrix, w might be needed for padding and is not used yet.
+// TANGENTTOWORLD2 is the last row of the tangent to world matrix, determinant of tangent basis in w
+	
+// Helper macro to determine whether we need to separately interpolate the world vertex normal to the pixel center.
+// Currently only curvature-to-roughness needs this interpolation, so disable it when it's not used to save on interpolants.
+#define USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION	(FEATURE_LEVEL >= FEATURE_LEVEL_SM5 && MATERIAL_NORMAL_CURVATURE_TO_ROUGHNESS)
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5
+
+	#define TANGENTTOWORLD0					TEXCOORD10
+	#define TANGENTTOWORLD2					TEXCOORD11
+
+	// _centroid is needed to get better quality with MSAA
+
+	// The D3D shader compiler combines _centroid and non centroid. Using float3 would result in a internal
+	// shader compiler error. This block is using float4 to prevent that.
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+	#define TANGENTTOWORLD_INTERPOLATOR_BLOCK	float4 TangentToWorld0 : TEXCOORD10_centroid; float4	TangentToWorld2	: TEXCOORD11_centroid; \
+		float4	TangentToWorld2_Center	: TEXCOORD15;
+#else
+	#define TANGENTTOWORLD_INTERPOLATOR_BLOCK	float4 TangentToWorld0 : TEXCOORD10_centroid; float4	TangentToWorld2	: TEXCOORD11_centroid;
+#endif
+
+#else
+
+	#define TANGENTTOWORLD0					TEXCOORD10_centroid
+	#define TANGENTTOWORLD2					TEXCOORD11_centroid
+
+	// TangentToWorld0 is float4 only to match D3D11
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1 || VULKAN_PROFILE
+		//@todo-rco: FIXME!
+		#define TANGENTTOWORLD_INTERPOLATOR_BLOCK	float4 TangentToWorld0 : TANGENTTOWORLD0; float4	TangentToWorld2	: TANGENTTOWORLD2;
+#else
+	#define TANGENTTOWORLD_INTERPOLATOR_BLOCK	MaterialFloat4 TangentToWorld0 : TANGENTTOWORLD0; MaterialFloat4	TangentToWorld2	: TANGENTTOWORLD2;
+#endif
+#endif
+
+MaterialFloat Luminance( MaterialFloat3 LinearColor )
+{
+	return dot( LinearColor, MaterialFloat3( 0.3, 0.59, 0.11 ) );
+}
+
+MaterialFloat length2(MaterialFloat2 v)
+{
+	return dot(v, v);
+}
+MaterialFloat length2(MaterialFloat3 v)
+{
+	return dot(v, v);
+}
+MaterialFloat length2(MaterialFloat4 v)
+{
+	return dot(v, v);
+}
+
+uint Mod(uint a, uint b)
+{
+#if FEATURE_LEVEL >= FEATURE_LEVEL_ES3_1
+	return a % b;
+#else
+	return a - (b * (uint)((float)a / (float)b));
+#endif
+}
+
+uint2 Mod(uint2 a, uint2 b)
+{
+#if FEATURE_LEVEL >= FEATURE_LEVEL_ES3_1
+	return a % b;
+#else
+	return a - (b * (uint2)((float2)a / (float2)b));
+#endif
+}
+
+uint3 Mod(uint3 a, uint3 b)
+{
+#if FEATURE_LEVEL >= FEATURE_LEVEL_ES3_1
+	return a % b;
+#else
+	return a - (b * (uint3)((float3)a / (float3)b));
+#endif
+}
+
+MaterialFloat UnClampedPow(MaterialFloat X, MaterialFloat Y)
+{
+	return pow(X, INVARIANT(Y));
+}
+MaterialFloat2 UnClampedPow(MaterialFloat2 X, MaterialFloat2 Y)
+{
+	return pow(X, INVARIANT(Y));
+}
+MaterialFloat3 UnClampedPow(MaterialFloat3 X, MaterialFloat3 Y)
+{
+	return pow(X, INVARIANT(Y));
+}
+MaterialFloat4 UnClampedPow(MaterialFloat4 X, MaterialFloat4 Y)
+{
+	return pow(X, INVARIANT(Y));
+}
+
+#define POW_CLAMP 0.000001f
+
+// Clamp the base, so it's never <= 0.0f (INF/NaN).
+MaterialFloat ClampedPow(MaterialFloat X,MaterialFloat Y)
+{
+	return pow(max(abs(X),POW_CLAMP),Y);
+}
+MaterialFloat2 ClampedPow(MaterialFloat2 X,MaterialFloat2 Y)
+{
+	return pow(max(abs(X),MaterialFloat2(POW_CLAMP,POW_CLAMP)),Y);
+}
+MaterialFloat3 ClampedPow(MaterialFloat3 X,MaterialFloat3 Y)
+{
+	return pow(max(abs(X),MaterialFloat3(POW_CLAMP,POW_CLAMP,POW_CLAMP)),Y);
+}  
+MaterialFloat4 ClampedPow(MaterialFloat4 X,MaterialFloat4 Y)
+{
+	return pow(max(abs(X),MaterialFloat4(POW_CLAMP,POW_CLAMP,POW_CLAMP,POW_CLAMP)),Y);
+} 
+
+/* Pow function that will return 0 if Base is <=0. This ensures that no compiler expands pow into exp(Exponent * log(Base)) with Base=0 */
+MaterialFloat PositiveClampedPow(MaterialFloat Base, MaterialFloat Exponent)
+{
+	return (Base <= 0.0f) ? 0.0f : pow(Base, Exponent);
+}
+MaterialFloat2 PositiveClampedPow(MaterialFloat2 Base, MaterialFloat2 Exponent)
+{
+	return MaterialFloat2(PositiveClampedPow(Base.x, Exponent.x), PositiveClampedPow(Base.y, Exponent.y)); 
+}
+MaterialFloat3 PositiveClampedPow(MaterialFloat3 Base, MaterialFloat3 Exponent)
+{
+	return MaterialFloat3(PositiveClampedPow(Base.xy, Exponent.xy), PositiveClampedPow(Base.z, Exponent.z)); 
+}  
+MaterialFloat4 PositiveClampedPow(MaterialFloat4 Base, MaterialFloat4 Exponent)
+{
+	return MaterialFloat4(PositiveClampedPow(Base.xy, Exponent.xy), PositiveClampedPow(Base.zw, Exponent.zw)); 
+} 
+
+float DDX(float Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddx(Input);
+#endif
+}
+
+float2 DDX(float2 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddx(Input);
+#endif
+}
+
+float3 DDX(float3 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddx(Input);
+#endif
+}
+
+float4 DDX(float4 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddx(Input);
+#endif
+}
+
+float DDY(float Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddy(Input);
+#endif
+}
+
+float2 DDY(float2 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddy(Input);
+#endif
+}
+
+float3 DDY(float3 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddy(Input);
+#endif
+}
+
+float4 DDY(float4 Input)
+{
+#if USE_FORCE_TEXTURE_MIP
+	return 0;
+#else
+	return ddy(Input);
+#endif
+}
+
+#include "FastMath.ush"
+#include "Random.ush"	// used by MaterialExpressionNoise
+  
+/** 
+ * Use this function to compute the pow() in the specular computation.
+ * This allows to change the implementation depending on platform or it easily can be replaced by some approxmation.
+ */
+MaterialFloat PhongShadingPow(MaterialFloat X, MaterialFloat Y)
+{
+	// The following clamping is done to prevent NaN being the result of the specular power computation.
+	// Clamping has a minor performance cost.
+
+	// In HLSL pow(a, b) is implemented as exp2(log2(a) * b).
+
+	// For a=0 this becomes exp2(-inf * 0) = exp2(NaN) = NaN.
+
+	// As seen in #TTP 160394 "QA Regression: PS3: Some maps have black pixelated artifacting."
+	// this can cause severe image artifacts (problem was caused by specular power of 0, lightshafts propagated this to other pixels).
+	// The problem appeared on PlayStation 3 but can also happen on similar PC NVidia hardware.
+
+	// In order to avoid platform differences and rarely occuring image atrifacts we clamp the base.
+
+	// Note: Clamping the exponent seemed to fix the issue mentioned TTP but we decided to fix the root and accept the
+	// minor performance cost.
+
+	return ClampedPow(X, Y);
+}
+
+#if FEATURE_LEVEL < FEATURE_LEVEL_ES3_1 && !COMPILER_METAL
+	// DX11 (feature levels >= 10) feature sets natively supports uints in shaders; we just use floats on other platforms.
+	#define uint4	int4
+#endif
+
+// Optional VertexID - used by tessellation to uniquely identify control points.
+#if USING_TESSELLATION && DISPLACEMENT_ANTICRACK
+	#define OPTIONAL_VertexID			uint VertexID : SV_VertexID,
+	#define OPTIONAL_VertexID_PARAM		VertexID,
+	#define OPTIONAL_VertexID_VS_To_DS	uint VertexID : VS_To_DS_VertexID;
+	#define OutputVertexID( Out ) Out.VertexID = VertexID
+#else // #if USING_TESSELLATION && DISPLACEMENT_ANTICRACK
+	#define OPTIONAL_VertexID
+	#define OPTIONAL_VertexID_PARAM
+	#define OPTIONAL_VertexID_VS_To_DS
+	#define OutputVertexID( Out )
+#endif // #if USING_TESSELLATION && DISPLACEMENT_ANTICRACK
+
+// Helper macro used to interpolate the given member
+#define TESSELLATION_INTERPOLATE_MEMBER(member) O.member = a.member * aInterp + b.member * bInterp
+
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
+	/** 
+		* Number of MSAA samples supported by deferred passes in D3D11. 
+		* This is hardcoded because it allows deferred passes to optimize for the given value (for example, unrolling a loop).
+		*/
+	#define NumMSAASamples 4
+#endif
+
+// shadow and light function
+Texture2D		LightAttenuationTexture;
+SamplerState	LightAttenuationTextureSampler;
+
+// We don't use an inline function so we can avoid type promotion/ coercion.
+#define RETURN_COLOR( Color ) ( Color )
+
+// Convert from unorm to snorm and viceversa
+float ConvertTangentUnormToSnorm8(float Input)
+{
+	int IntVal = int(round(Input * 255.0f));
+	//negate
+	IntVal = (IntVal > 127) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 127.0f, -1, 1);
+}
+
+float2 ConvertTangentUnormToSnorm8(float2 Input)
+{
+	int2 IntVal = int2(round(Input * 255.0f));
+	//negate
+	IntVal = (IntVal > 127) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 127.0f, -1, 1);
+}
+
+float3 ConvertTangentUnormToSnorm8(float3 Input)
+{
+	int3 IntVal = int3(round(Input * 255.0f));
+	IntVal = (IntVal > 127) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 127.0f, -1, 1);
+}
+
+float4 ConvertTangentUnormToSnorm8(float4 Input)
+{
+	int4 IntVal = int4(round(Input * 255.0f));
+	//negate
+	IntVal = (IntVal > 127) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 127.0f, -1, 1);
+}
+
+float ConvertTangentUnormToSnorm16(float Input)
+{
+	int IntVal = int(round(Input * 65535.0f));
+	//negate
+	IntVal = (IntVal > 32767) ? (IntVal | 0xFFFF8000) : IntVal;
+	return clamp(IntVal / 32767.0f, -1, 1);
+}
+
+float2 ConvertTangentUnormToSnorm16(float2 Input)
+{
+	int2 IntVal = int2(round(Input * 65535.0f));
+	//negate
+	IntVal = (IntVal > 32767) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 32767.0f, -1, 1);
+}
+
+float3 ConvertTangentUnormToSnorm16(float3 Input)
+{
+	int3 IntVal = int3(round(Input * 65535.0f));
+	IntVal = (IntVal > 32767) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 32767.0f, -1, 1);
+}
+
+float4 ConvertTangentUnormToSnorm16(float4 Input)
+{
+	int4 IntVal = int4(round(Input * 65535.0f));
+	//negate
+	IntVal = (IntVal > 32767) ? (IntVal | 0xFFFFFF80) : IntVal;
+	return clamp(IntVal / 32767.0f, -1, 1);
+}
+
+float ConvertTangentSnormToUnorm8(float Input)
+{
+	float Res = Input >= 0.0f ? Input * 127 : ((Input + 1.0) * 127) + 128;
+	return clamp(Res / 255, 0.0f, 0.99f);
+}
+
+float2 ConvertTangentSnormToUnorm8(float2 Input)
+{
+	float2 Res = Input >= 0.0f ? Input * 127 : ((Input + 1.0) * 127) + 128;
+	return clamp(Res / 255, 0.0f, 0.99f);
+}
+
+float3 ConvertTangentSnormToUnorm8(float3 Input)
+{
+	float3 Res = Input >= 0.0f ? Input * 127 : ((Input + 1.0) * 127) + 128;
+	return clamp(Res / 255, 0.0f, 0.99f);
+}
+
+float4 ConvertTangentSnormToUnorm8(float4 Input)
+{
+	float4 Res = Input >= 0.0f ? Input * 127 : ((Input + 1.0) * 127) + 128;
+	return clamp(Res / 255, 0.0f, 0.99f);
+}
+
+float ConvertTangentSnormToUnorm16(float Input)
+{
+	float Res = Input >= 0.0f ? Input * 32767 : ((Input + 1.0) * 32767) + 32768;
+	return clamp(Res / 65535, 0.0f, 0.99f);
+}
+
+float2 ConvertTangentSnormToUnorm16(float2 Input)
+{
+	float2 Res = Input >= 0.0f ? Input * 32767 : ((Input + 1.0) * 32767) + 32768;
+	return clamp(Res / 65535, 0.0f, 0.99f);
+}
+
+float3 ConvertTangentSnormToUnorm16(float3 Input)
+{
+	float3 Res = Input >= 0.0f ? Input * 32767 : ((Input + 1.0) * 32767) + 32768;
+	return clamp(Res / 65535, 0.0f, 0.99f);
+}
+
+float4 ConvertTangentSnormToUnorm16(float4 Input)
+{
+	float4 Res = Input >= 0.0f ? Input * 32767 : ((Input + 1.0) * 32767) + 32768;
+	return clamp(Res / 65535, 0.0f, 0.99f);
+}
+
+// Tangent space bias/unbias
+// We don't use a function so we can avoid type promotion/ coercion.
+#define TangentBias(X)		(X)
+#define TangentUnbias(X)	(X)
+
+float Square( float x )
+{
+	return x*x;
+}
+
+float2 Square( float2 x )
+{
+	return x*x;
+}
+
+float3 Square( float3 x )
+{
+	return x*x;
+}
+
+float4 Square( float4 x )
+{
+	return x*x;
+}
+
+float Pow2( float x )
+{
+	return x*x;
+}
+
+float2 Pow2( float2 x )
+{
+	return x*x;
+}
+
+float3 Pow2( float3 x )
+{
+	return x*x;
+}
+
+float4 Pow2( float4 x )
+{
+	return x*x;
+}
+
+float Pow3( float x )
+{
+	return x*x*x;
+}
+
+float2 Pow3( float2 x )
+{
+	return x*x*x;
+}
+
+float3 Pow3( float3 x )
+{
+	return x*x*x;
+}
+
+float4 Pow3( float4 x )
+{
+	return x*x*x;
+}
+
+float Pow4( float x )
+{
+	float xx = x*x;
+	return xx * xx;
+}
+
+float2 Pow4( float2 x )
+{
+	float2 xx = x*x;
+	return xx * xx;
+}
+
+float3 Pow4( float3 x )
+{
+	float3 xx = x*x;
+	return xx * xx;
+}
+
+float4 Pow4( float4 x )
+{
+	float4 xx = x*x;
+	return xx * xx;
+}
+
+float Pow5( float x )
+{
+	float xx = x*x;
+	return xx * xx * x;
+}
+
+float2 Pow5( float2 x )
+{
+	float2 xx = x*x;
+	return xx * xx * x;
+}
+
+float3 Pow5( float3 x )
+{
+	float3 xx = x*x;
+	return xx * xx * x;
+}
+
+float4 Pow5( float4 x )
+{
+	float4 xx = x*x;
+	return xx * xx * x;
+}
+
+float Pow6( float x )
+{
+	float xx = x*x;
+	return xx * xx * xx;
+}
+
+float2 Pow6( float2 x )
+{
+	float2 xx = x*x;
+	return xx * xx * xx;
+}
+
+float3 Pow6( float3 x )
+{
+	float3 xx = x*x;
+	return xx * xx * xx;
+}
+
+float4 Pow6( float4 x )
+{
+	float4 xx = x*x;
+	return xx * xx * xx;
+}
+
+// Only valid for x >= 0
+MaterialFloat AtanFast( MaterialFloat x )
+{
+	// Minimax 3 approximation
+	MaterialFloat3 A = x < 1 ? MaterialFloat3( x, 0, 1 ) : MaterialFloat3( 1/x, 0.5 * PI, -1 );
+	return A.y + A.z * ( ( ( -0.130234 * A.x - 0.0954105 ) * A.x + 1.00712 ) * A.x - 0.00001203333 );
+}
+
+/** Converts a linear input value into a value to be stored in the light attenuation buffer. */
+MaterialFloat EncodeLightAttenuation(MaterialFloat InColor)
+{
+	// Apply a 1/2 power to the input, which allocates more bits for the darks and prevents banding
+	// Similar to storing colors in gamma space, except this uses less instructions than a pow(x, 1/2.2)
+	return sqrt(InColor);
+}
+
+/** Converts a linear input value into a value to be stored in the light attenuation buffer. */
+MaterialFloat4 EncodeLightAttenuation(MaterialFloat4 InColor)
+{
+	return sqrt(InColor);
+}
+
+// Like RGBM but this can be interpolated.
+MaterialFloat4 RGBTEncode(MaterialFloat3 Color)
+{
+	MaterialFloat4 RGBT;
+	MaterialFloat Max = max(max(Color.r, Color.g), max(Color.b, 1e-6));
+	MaterialFloat RcpMax = rcp(Max);
+	RGBT.rgb = Color.rgb * RcpMax;
+	RGBT.a = Max * rcp(1.0 + Max);
+	return RGBT;
+}
+
+MaterialFloat3 RGBTDecode(MaterialFloat4 RGBT)
+{
+	RGBT.a = RGBT.a * rcp(1.0 - RGBT.a);
+	return RGBT.rgb * RGBT.a;
+}
+
+
+
+MaterialFloat4 RGBMEncode( MaterialFloat3 Color )
+{
+	Color *= 1.0 / 64.0;
+	
+	float4 rgbm;
+	rgbm.a = saturate( max( max( Color.r, Color.g ), max( Color.b, 1e-6 ) ) );
+	rgbm.a = ceil( rgbm.a * 255.0 ) / 255.0;
+	rgbm.rgb = Color / rgbm.a;
+	return rgbm;
+}
+
+MaterialFloat4 RGBMEncodeFast( MaterialFloat3 Color )
+{
+	// 0/0 result written to fixed point buffer goes to zero
+	MaterialFloat4 rgbm;
+	rgbm.a = dot( Color, 255.0 / 64.0 );
+	rgbm.a = ceil( rgbm.a );
+	rgbm.rgb = Color / rgbm.a;
+	rgbm *= MaterialFloat4( 255.0 / 64.0, 255.0 / 64.0, 255.0 / 64.0, 1.0 / 255.0 );
+	return rgbm;
+}
+
+MaterialFloat3 RGBMDecode( MaterialFloat4 rgbm, MaterialFloat MaxValue )
+{
+	return rgbm.rgb * (rgbm.a * MaxValue);
+}
+
+MaterialFloat3 RGBMDecode( MaterialFloat4 rgbm )
+{
+	return rgbm.rgb * (rgbm.a * 64.0f);
+}
+
+MaterialFloat4 RGBTEncode8BPC(MaterialFloat3 Color, MaterialFloat Range)
+{
+	MaterialFloat Max = max(max(Color.r, Color.g), max(Color.b, 1e-6));
+	Max = min(Max, Range);
+
+	MaterialFloat4 RGBT;
+	RGBT.a = (Range + 1) / Range *  Max / (1 + Max);
+
+	// quantise alpha to 8 bit.
+	RGBT.a = ceil(RGBT.a*255.0) / 255.0;
+	Max = RGBT.a / (1 + 1 / Range - RGBT.a);
+
+	MaterialFloat RcpMax = rcp(Max);
+	RGBT.rgb = Color.rgb * RcpMax;
+	return RGBT;
+}
+
+MaterialFloat3 RGBTDecode8BPC(MaterialFloat4 RGBT, MaterialFloat Range)
+{
+	RGBT.a = RGBT.a / (1 + 1 / Range - RGBT.a);
+	return RGBT.rgb * RGBT.a;
+}
+
+/** Get render target write mask value
+  * This gets a bit from a write mask texture created with FRTWriteMaskDecodeCS. Only supprted on some platforms.
+  */
+#if PLATFORM_SUPPORTS_RENDERTARGET_WRITE_MASK
+uint DecodeRTWriteMask(float2 ScreenPos, Texture2D<uint> RTWriteMaskTexture, uint NumEncodedTextures)
+{
+	uint2 InPos = uint2(ScreenPos);
+
+	uint2 TileIndex = InPos >> 3;
+	uint2 TileOffset = (InPos >> 2) & 1;
+
+	uint Shift = (TileOffset.y * 2 + TileOffset.x) * NumEncodedTextures;
+	uint Mask = ~((~0) << NumEncodedTextures);
+
+	return (RTWriteMaskTexture.Load(uint3(TileIndex, 0)) >> Shift) & Mask;
+}
+#endif
+
+/** Calculates the ScreenUV given the screen position and an offset fraction. */
+float2 CalcScreenUVFromOffsetFraction(float4 ScreenPosition, float2 OffsetFraction)
+{
+	float2 NDC = ScreenPosition.xy / ScreenPosition.w;
+	// Apply the offset in NDC space so that it is consistent regardless of scene color buffer size
+	// Clamp to valid area of the screen to avoid reading garbage
+	//@todo - soft clamp
+	float2 OffsetNDC = clamp(NDC + OffsetFraction * float2(2, -2), -.999f, .999f);
+	return float2(OffsetNDC * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz);
+}
+
+float4 GetPerPixelLightAttenuation(float2 UV)
+{
+	return Square(Texture2DSampleLevel(LightAttenuationTexture, LightAttenuationTextureSampler, UV, 0));
+}
+
+// also see ConvertToDeviceZ()
+// @param DeviceZ value that is stored in the depth buffer (Z/W)
+// @return SceneDepth (linear in world units, W)
+float ConvertFromDeviceZ(float DeviceZ)
+{
+	// Supports ortho and perspective, see CreateInvDeviceZToWorldZTransform()
+	return DeviceZ * View.InvDeviceZToWorldZTransform[0] + View.InvDeviceZToWorldZTransform[1] + 1.0f / (DeviceZ * View.InvDeviceZToWorldZTransform[2] - View.InvDeviceZToWorldZTransform[3]);
+}
+
+// inverse operation of ConvertFromDeviceZ()
+// @param SceneDepth (linear in world units, W)
+// @return DeviceZ (Z/W)
+float ConvertToDeviceZ(float SceneDepth)
+{
+	FLATTEN
+	if (View.ViewToClip[3][3] < 1.0f)
+	{
+		// Perspective
+		return 1.0f / ((SceneDepth + View.InvDeviceZToWorldZTransform[3]) * View.InvDeviceZToWorldZTransform[2]);
+	}
+	else
+	{
+		// Ortho
+		return SceneDepth * View.ViewToClip[2][2] + View.ViewToClip[3][2];
+	}
+}
+
+float2 ScreenPositionToBufferUV(float4 ScreenPosition)
+{
+	return float2(ScreenPosition.xy / ScreenPosition.w * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz);
+}
+
+float2 SvPositionToBufferUV(float4 SvPosition)
+{
+	return SvPosition.xy * View.BufferSizeAndInvSize.zw;
+}
+
+// Used for post process shaders which don't need to resolve the view	
+float3 SvPositionToTranslatedWorld(float4 SvPosition)
+{
+	float4 HomWorldPos = mul(float4(SvPosition.xyz, 1), View.SVPositionToTranslatedWorld);
+
+	return HomWorldPos.xyz / HomWorldPos.w;
+}
+
+// Used for vertex factory shaders which need to use the resolved view
+float3 SvPositionToResolvedTranslatedWorld(float4 SvPosition)
+{
+	float4 HomWorldPos = mul(float4(SvPosition.xyz, 1), ResolvedView.SVPositionToTranslatedWorld);
+
+	return HomWorldPos.xyz / HomWorldPos.w;
+}
+
+// prefer to use SvPositionToTranslatedWorld() for better quality
+float3 SvPositionToWorld(float4 SvPosition)
+{
+	return SvPositionToTranslatedWorld(SvPosition) - View.PreViewTranslation;
+}
+
+// investigate: doesn't work for usage with View.ScreenToWorld, see SvPositionToScreenPosition2()
+float4 SvPositionToScreenPosition(float4 SvPosition)
+{
+	// todo: is already in .w or needs to be reconstructed like this:
+//	SvPosition.w = ConvertFromDeviceZ(SvPosition.z);
+
+	float2 PixelPos = SvPosition.xy - View.ViewRectMin.xy;	
+
+	// NDC (NormalizedDeviceCoordinates, after the perspective divide)
+	float3 NDCPos = float3( (PixelPos * View.ViewSizeAndInvSize.zw - 0.5f) * float2(2, -2), SvPosition.z);
+
+	// SvPosition.w: so .w has the SceneDepth, some mobile code and the DepthFade material expression wants that
+	return float4(NDCPos.xyz, 1) * SvPosition.w;
+}
+
+// Used for vertex factory shaders which need to use the resolved view
+float4 SvPositionToResolvedScreenPosition(float4 SvPosition)
+{
+	float2 PixelPos = SvPosition.xy - ResolvedView.ViewRectMin.xy;	
+
+	// NDC (NormalizedDeviceCoordinates, after the perspective divide)
+	float3 NDCPos = float3( (PixelPos * ResolvedView.ViewSizeAndInvSize.zw - 0.5f) * float2(2, -2), SvPosition.z);
+
+	// SvPosition.w: so .w has the SceneDepth, some mobile code and the DepthFade material expression wants that
+	return float4(NDCPos.xyz, 1) * SvPosition.w;
+}
+
+float2 SvPositionToViewportUV(float4 SvPosition)
+{
+	// can be optimized from 2SUB+2MUL to 2MAD
+	float2 PixelPos = SvPosition.xy - View.ViewRectMin.xy;	
+
+	return PixelPos.xy * View.ViewSizeAndInvSize.zw;
+}
+
+float2 BufferUVToViewportUV(float2 BufferUV)
+{
+	float2 PixelPos = BufferUV.xy * View.BufferSizeAndInvSize.xy - View.ViewRectMin.xy;
+	return PixelPos.xy * View.ViewSizeAndInvSize.zw;
+}
+
+float2 ViewportUVToBufferUV(float2 ViewportUV)
+{
+	float2 PixelPos = ViewportUV * View.ViewSizeAndInvSize.xy;
+	return (PixelPos + View.ViewRectMin.xy) * View.BufferSizeAndInvSize.zw;
+}
+
+// Maps standard viewport UV to screen position.
+float2 ViewportUVToScreenPos(float2 ViewportUV)
+{
+	return float2(2 * ViewportUV.x - 1, 1 - 2 * ViewportUV.y);
+}
+
+float2 ScreenPosToViewportUV(float2 ScreenPos)
+{
+	return float2(0.5 + 0.5 * ScreenPos.x, 0.5 - 0.5 * ScreenPos.y);
+}
+
+// Maps standard viewport UV to an unprojected viewpos.
+// Viewpos can then be achieved via out.xy / out.z
+float3 ScreenToViewPos(float2 ViewportUV, float SceneDepth)
+{
+	float2 ProjViewPos;
+
+	ProjViewPos.x =  ViewportUV.x * View.ScreenToViewSpace.x  + View.ScreenToViewSpace.z;
+	ProjViewPos.y =  ViewportUV.y * View.ScreenToViewSpace.y  + View.ScreenToViewSpace.w;
+	return float3(ProjViewPos * SceneDepth, SceneDepth);
+}
+
+// ----------------------------
+
+/** 
+ * aligns the clip space position so that it can be used as a texture coordinate
+ * to properly align in screen space
+ */
+MaterialFloat2 ScreenAlignedPosition( float4 ScreenPosition )
+{
+	return MaterialFloat2(ScreenPositionToBufferUV(ScreenPosition));
+}
+
+/** 
+ * Aligns the [0,1] UV to match the view within the backbuffer
+ */
+MaterialFloat2 ScreenAlignedUV( MaterialFloat2 UV )
+{
+	return (UV*MaterialFloat2(2,-2) + MaterialFloat2(-1,1))*View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+}
+
+/**
+ * Compute viewport coordinates from the given fragment coordinates.
+ */
+MaterialFloat2 GetViewportCoordinates(MaterialFloat2 InFragmentCoordinates)
+{
+	return InFragmentCoordinates;
+}
+
+/**
+ * Unpack a normal stored in a normal map. The X and Y components are rescaled from [0,1] to [-1,1] and Z is reconstructed.
+ */
+MaterialFloat4 UnpackNormalMap( MaterialFloat4 TextureSample )
+{
+	#if DXT5_NORMALMAPS
+		MaterialFloat2 NormalXY = TextureSample.ag;
+	#else
+		MaterialFloat2 NormalXY = TextureSample.rg;
+	#endif
+
+	NormalXY = NormalXY * MaterialFloat2(2.0f,2.0f) - MaterialFloat2(1.0f,1.0f);
+	MaterialFloat NormalZ = sqrt( saturate( 1.0f - dot( NormalXY, NormalXY ) ) );
+	return MaterialFloat4( NormalXY.xy, NormalZ, 1.0f );
+}
+
+// Antialiased version of a binary comparison between ThresholdConst and a texture channel.
+float AntialiasedTextureMask( Texture2D Tex, SamplerState Sampler, float2 UV, float ThresholdConst, int Channel )
+{
+	// By setting MaskConst to 0001, 0010, 0100 or 1000 individual channels can be chosen (the compiler should be able to optimize that).
+	MaterialFloat4 MaskConst = MaterialFloat4(Channel == 0, Channel == 1, Channel == 2, Channel == 3);
+
+	// border width in pixels, for antialiasing 1 .. 1.5 is good but 1.0 is good for optimizations 
+	const float WidthConst = 1.0f;			
+	float InvWidthConst = 1 / WidthConst;
+
+	// Problem:
+
+	// A simple texture lookup with a comparison against some thresold value allows to get a mask useful
+	// for many purposes (e.g. text rendering, signs, oil/water/paint). Antialiased masks look much better
+	// and mip mapping provides that but only for minification. So when the texture resolution is lower than
+	// the rendering size results get blurry.
+
+	// Idea:
+
+	// We compute the distance to the threshold line in pixels (with subpixel precision). We can visualize
+	// the problem as a heightmap that intersects a axis aligned plane at the threshold height. Only surface
+	// above the threshold plane contributes to the mask. Looking at one pixel the heightmap can be approximated
+	// by a plane. We can easily get the plane center value form a texture lookup and get the plane equation from
+	// ddx and ddy of that value (only one value per 2x2 block) or some other more precise method. We can reduce the
+	// 3d problem to 2d (looking at the steepest angle only) and the resulting value tells us how much the texture value
+	// changes for one pixel. This allows us to scale and bias (threshold) the texture value the so it maps to the
+	// distance function. We rescaling the distance to 0.5 coverage at the line, >1 MaterialFloat a pixel inside and <0 MaterialFloat
+	// a pixel outside. Clamping this value in the range from 0..1 gives us a good approximation of the pixel coverage.
+
+	// We tried multiple possible implementations - this is the cheapest and looks ok is most cases.
+	// If quality improvements are needed we can add an option to the node later on.
+	float Result;
+	{
+		// optimized, ddx/ddy only for every 2x2 block (bad for distant stuff)
+		float Sample1 = dot(MaskConst, Texture2DSample(Tex, Sampler, UV));
+
+		// compute the derivatives of the texture content
+		float2 TexDD = float2(DDX(Sample1), DDY(Sample1));
+
+		float TexDDLength = max(abs(TexDD.x), abs(TexDD.y)); 
+		float Top = InvWidthConst * (Sample1 - ThresholdConst);
+		Result = Top / TexDDLength + ThresholdConst;
+	}
+
+	Result = saturate(Result);	// no always needed (e.g. DX9 framebuffer blending)
+
+	return Result;
+}
+
+// While RepeatSize is a float here, the expectation is that it would be largely integer values coming in from the UI. The downstream logic assumes
+// floats for all called functions (NoiseTileWrap) and this prevents any float-to-int conversion errors from automatic type conversion.
+float Noise3D_Multiplexer(int Function, float3 Position, int Quality, bool bTiling, float RepeatSize)
+{
+	// verified, HLSL compiled out the switch if Function is a constant
+	switch(Function)
+	{
+		case 0:
+			return SimplexNoise3D_TEX(Position);
+		case 1:
+			return GradientNoise3D_TEX(Position, bTiling, RepeatSize);
+		case 2:
+			return FastGradientPerlinNoise3D_TEX(Position);
+		case 3:
+			return GradientNoise3D_ALU(Position, bTiling, RepeatSize);
+		case 4:
+			return ValueNoise3D_ALU(Position, bTiling, RepeatSize);
+		default:
+			return VoronoiNoise3D_ALU(Position, Quality, bTiling, RepeatSize, true).w * 2. - 1.;
+	}
+	return 0;
+}
+
+// @param LevelScale usually 2 but higher values allow efficient use of few levels
+// @return in user defined range (OutputMin..OutputMax)
+MaterialFloat MaterialExpressionNoise(float3 Position, float Scale, int Quality, int Function, bool bTurbulence, uint Levels, float OutputMin, float OutputMax, float LevelScale, float FilterWidth, bool bTiling, float RepeatSize)
+{
+	Position *= Scale;
+	FilterWidth *= Scale;
+
+	float Out = 0.0f;
+	float OutScale = 1.0f;
+	float InvLevelScale = 1.0f / LevelScale;
+	
+	LOOP for(uint i = 0; i < Levels; ++i)
+	{
+		// fade out noise level that are too high frequent (not done through dynamic branching as it usually requires gradient instructions)
+		OutScale *= saturate(1.0 - FilterWidth);
+
+		if(bTurbulence)
+		{
+			Out += abs(Noise3D_Multiplexer(Function, Position, Quality, bTiling, RepeatSize)) * OutScale;
+		}
+		else
+		{
+			Out += Noise3D_Multiplexer(Function, Position, Quality, bTiling, RepeatSize) * OutScale;
+		}
+
+		Position *= LevelScale;
+		RepeatSize *= LevelScale;
+		OutScale *= InvLevelScale;
+		FilterWidth *= LevelScale;
+	}
+
+	if(!bTurbulence)
+	{
+		// bring -1..1 to 0..1 range
+		Out = Out * 0.5f + 0.5f;
+	}
+
+	// Out is in 0..1 range
+	return lerp(OutputMin, OutputMax, Out);
+}
+
+
+// Material node for noise functions returning a vector value
+// @param LevelScale usually 2 but higher values allow efficient use of few levels
+// @return in user defined range (OutputMin..OutputMax)
+MaterialFloat4 MaterialExpressionVectorNoise(MaterialFloat3 Position, int Quality, int Function, bool bTiling, float TileSize)
+{
+	float4 result = float4(0,0,0,1);
+	float3x4 Jacobian = JacobianSimplex_ALU(Position, bTiling, TileSize);	// compiled out if not used
+
+	// verified, HLSL compiled out the switch if Function is a constant
+	switch (Function)
+	{
+	case 0:	// Cellnoise
+		result.xyz = float3(Rand3DPCG16(int3(floor(NoiseTileWrap(Position, bTiling, TileSize))))) / 0xffff;
+		break;
+	case 1: // Color noise
+		result.xyz = float3(Jacobian[0].w, Jacobian[1].w, Jacobian[2].w);
+		break;
+	case 2: // Gradient
+		result = Jacobian[0];
+		break;
+	case 3: // Curl
+		result.xyz = float3(Jacobian[2][1] - Jacobian[1][2], Jacobian[0][2] - Jacobian[2][0], Jacobian[1][0] - Jacobian[0][1]);
+		break;
+	default: // Voronoi
+		result = VoronoiNoise3D_ALU(Position, Quality, bTiling, TileSize, false);
+		break;
+	}
+	return result;
+}
+
+
+/*
+* Clips a ray to an AABB.  Does not handle rays parallel to any of the planes.
+*
+* @param RayOrigin - The origin of the ray in world space.
+* @param RayEnd - The end of the ray in world space.  
+* @param BoxMin - The minimum extrema of the box.
+* @param BoxMax - The maximum extrema of the box.
+* @return - Returns the closest intersection along the ray in x, and furthest in y.  
+*			If the ray did not intersect the box, then the furthest intersection <= the closest intersection.
+*			The intersections will always be in the range [0,1], which corresponds to [RayOrigin, RayEnd] in worldspace.
+*			To find the world space position of either intersection, simply plug it back into the ray equation:
+*			WorldPos = RayOrigin + (RayEnd - RayOrigin) * Intersection;
+*/
+float2 LineBoxIntersect(float3 RayOrigin, float3 RayEnd, float3 BoxMin, float3 BoxMax)
+{
+	float3 InvRayDir = 1.0f / (RayEnd - RayOrigin);
+	
+	//find the ray intersection with each of the 3 planes defined by the minimum extrema.
+	float3 FirstPlaneIntersections = (BoxMin - RayOrigin) * InvRayDir;
+	//find the ray intersection with each of the 3 planes defined by the maximum extrema.
+	float3 SecondPlaneIntersections = (BoxMax - RayOrigin) * InvRayDir;
+	//get the closest of these intersections along the ray
+	float3 ClosestPlaneIntersections = min(FirstPlaneIntersections, SecondPlaneIntersections);
+	//get the furthest of these intersections along the ray
+	float3 FurthestPlaneIntersections = max(FirstPlaneIntersections, SecondPlaneIntersections);
+
+	float2 BoxIntersections;
+	//find the furthest near intersection
+	BoxIntersections.x = max(ClosestPlaneIntersections.x, max(ClosestPlaneIntersections.y, ClosestPlaneIntersections.z));
+	//find the closest far intersection
+	BoxIntersections.y = min(FurthestPlaneIntersections.x, min(FurthestPlaneIntersections.y, FurthestPlaneIntersections.z));
+	//clamp the intersections to be between RayOrigin and RayEnd on the ray
+	return saturate(BoxIntersections);
+}
+
+/** Computes distance from an AABB to a point in space. */
+MaterialFloat ComputeDistanceFromBoxToPoint(MaterialFloat3 Mins, MaterialFloat3 Maxs, MaterialFloat3 InPoint)
+{
+	MaterialFloat3 DistancesToMin = InPoint < Mins ? abs(InPoint - Mins) : 0;
+	MaterialFloat3 DistancesToMax = InPoint > Maxs ? abs(InPoint - Maxs) : 0;
+
+	//@todo - this is actually incorrect, it gives manhattan distance
+	MaterialFloat Distance = dot(DistancesToMin, 1);
+	Distance += dot(DistancesToMax, 1);
+	return Distance;
+}
+
+/** Computes squared distance from a point in space to an AABB. */
+MaterialFloat ComputeSquaredDistanceFromBoxToPoint(MaterialFloat3 BoxCenter, MaterialFloat3 BoxExtent, MaterialFloat3 InPoint)
+{
+	MaterialFloat3 AxisDistances = max(abs(InPoint - BoxCenter) - BoxExtent, 0);
+	return dot(AxisDistances, AxisDistances);
+}
+
+/** Computes distance from point inside an AABB to the AABB's surface. */
+float ComputeDistanceFromBoxToPointInside(float3 BoxCenter, float3 BoxExtent, float3 InPoint)
+{
+	float3 DistancesToMin = max(InPoint - BoxCenter + BoxExtent, 0);
+	float3 DistancesToMax = max(BoxCenter + BoxExtent - InPoint, 0);
+	float3 ClosestDistances = min(DistancesToMin, DistancesToMax);
+	return min(ClosestDistances.x, min(ClosestDistances.y, ClosestDistances.z));
+}
+
+bool RayHitSphere(float3 RayOrigin, float3 UnitRayDirection, float3 SphereCenter, float SphereRadius)
+{
+	float3 ClosestPointOnRay = max(0, dot(SphereCenter - RayOrigin, UnitRayDirection)) * UnitRayDirection;
+	float3 CenterToRay = RayOrigin + ClosestPointOnRay - SphereCenter;
+	return dot(CenterToRay, CenterToRay) <= Square(SphereRadius);
+}
+
+bool RaySegmentHitSphere(float3 RayOrigin, float3 UnitRayDirection, float RayLength, float3 SphereCenter, float SphereRadius)
+{
+	float DistanceAlongRay = dot(SphereCenter - RayOrigin, UnitRayDirection);
+	float3 ClosestPointOnRay = DistanceAlongRay * UnitRayDirection;
+	float3 CenterToRay = RayOrigin + ClosestPointOnRay - SphereCenter;
+	return dot(CenterToRay, CenterToRay) <= Square(SphereRadius) && DistanceAlongRay > -SphereRadius && DistanceAlongRay - SphereRadius < RayLength;
+}
+
+/**
+ * Returns near intersection in x, far intersection in y, or both -1 if no intersection.
+ * RayDirection does not need to be unit length.
+ */
+float2 RayIntersectSphere(float3 RayOrigin, float3 RayDirection, float4 Sphere)
+{
+	float3 LocalPosition = RayOrigin - Sphere.xyz;
+	float LocalPositionSqr = dot(LocalPosition, LocalPosition);
+
+	float3 QuadraticCoef;
+	QuadraticCoef.x = dot(RayDirection, RayDirection);
+	QuadraticCoef.y = 2 * dot(RayDirection, LocalPosition);
+	QuadraticCoef.z = LocalPositionSqr - Sphere.w * Sphere.w;
+
+	float Discriminant = QuadraticCoef.y * QuadraticCoef.y - 4 * QuadraticCoef.x * QuadraticCoef.z;
+
+	float2 Intersections = -1;
+
+	// Only continue if the ray intersects the sphere
+	FLATTEN
+	if (Discriminant >= 0)
+	{
+		float SqrtDiscriminant = sqrt(Discriminant);
+		Intersections = (-QuadraticCoef.y + float2(-1, 1) * SqrtDiscriminant) / (2 * QuadraticCoef.x);
+	}
+
+	return Intersections;
+}
+
+/** Transforms a vector from tangent space to world space */
+MaterialFloat3 TransformTangentVectorToWorld(MaterialFloat3x3 TangentToWorld, MaterialFloat3 InTangentVector)
+{
+	// Transform directly to world space
+	// The vector transform is optimized for this case, only one vector-matrix multiply is needed
+	return mul(InTangentVector, TangentToWorld);
+}
+
+/** Transforms a vector from world space to tangent space */
+MaterialFloat3 TransformWorldVectorToTangent(MaterialFloat3x3 TangentToWorld, MaterialFloat3 InWorldVector)
+{
+	// Transform from world to tangent space with the transpose of TangentToWorld (achieved by swapping vector / matrix multiply order)
+	// Note that the transpose is only equal to the inverse for orthonormal matrices - aka only uniform scaling
+	return mul(TangentToWorld, InWorldVector);
+}
+
+float3 TransformWorldVectorToView(float3 InTangentVector)
+{
+	// Transform from world to view space
+	return mul(InTangentVector, (float3x3)ResolvedView.TranslatedWorldToView);
+}
+
+/** Computes the distance from the center to the edge of an AABB with the given extents in the given direction. */
+MaterialFloat GetBoxPushout(MaterialFloat3 Normal,MaterialFloat3 Extent)
+{
+	return dot(abs(Normal * Extent), MaterialFloat3(1.0f, 1.0f, 1.0f));
+}
+
+/** Generates arbitrary but valid perpendicular unit vectors to ZAxis.  ZAxis should be unit length. */
+void GenerateCoordinateSystem(float3 ZAxis, out float3 XAxis, out float3 YAxis)
+{
+	if (abs(ZAxis.x) > abs(ZAxis.y))
+	{
+		float InverseLength = 1.0f / sqrt(dot(ZAxis.xz, ZAxis.xz));
+		XAxis = float3(-ZAxis.z * InverseLength, 0.0f, ZAxis.x * InverseLength);
+	}
+	else
+	{
+		float InverseLength = 1.0f / sqrt(dot(ZAxis.yz, ZAxis.yz));
+		XAxis = float3(0.0f, ZAxis.z * InverseLength, -ZAxis.y * InverseLength);
+	}
+
+	YAxis = cross(ZAxis, XAxis);
+}
+
+// Define passthrough implementations of EvaluateAttributeAtSample for non-D3D11 platforms.
+#if !SM5_PROFILE
+	float EvaluateAttributeAtSample(float Attribute,uint SampleIndex) { return Attribute; }
+	float2 EvaluateAttributeAtSample(float2 Attribute,uint SampleIndex) { return Attribute; }
+	float3 EvaluateAttributeAtSample(float3 Attribute,uint SampleIndex) { return Attribute; }
+	float4 EvaluateAttributeAtSample(float4 Attribute,uint SampleIndex) { return Attribute; }
+#endif
+
+/** Output of the screen vertex shader. */
+struct FScreenVertexOutput
+{
+#if METAL_PROFILE || COMPILER_GLSL_ES3_1
+	//@todo-rco: FIXME!
+	noperspective float2 UV : TEXCOORD0;
+#else
+	noperspective MaterialFloat2 UV : TEXCOORD0;
+#endif
+	float4 Position : SV_POSITION;
+};
+
+
+// for velocity rendering, motionblur and temporal AA
+// velocity needs to support -2..2 screen space range for x and y
+// texture is 16bit 0..1 range per channel
+float4 EncodeVelocityToTexture(float3 V)
+{
+	// 0.499f is a value smaller than 0.5f to avoid using the full range to use the clear color (0,0) as special value
+	// 0.5f to allow for a range of -2..2 instead of -1..1 for really fast motions for temporal AA
+	float4 EncodedV;
+	EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f;
+
+	uint Vz = asuint(V.z);
+
+	EncodedV.z = saturate(float((Vz >> 16) & 0xFFFF) * rcp(65535.0f) + (0.1 / 65535.0f));
+	EncodedV.w = saturate(float((Vz >>  0) & 0xFFFF) * rcp(65535.0f) + (0.1 / 65535.0f));
+
+	return EncodedV;
+}
+// see EncodeVelocityToTexture()
+float3 DecodeVelocityFromTexture(float4 EncodedV)
+{
+	const float InvDiv = 1.0f / (0.499f * 0.5f);
+
+	float3 V;
+	V.xy = EncodedV.xy * InvDiv - 32767.0f / 65535.0f * InvDiv;
+	V.z = asfloat((uint(round(EncodedV.z * 65535.0f)) << 16) | uint(round(EncodedV.w * 65535.0f)));
+
+	return V;
+}
+
+// Used for the Global Illumination in the GIReplace material expression
+bool GetGIReplaceState()
+{
+#if REFLECTIVE_SHADOW_MAP
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool GetRayTracingQualitySwitch()
+{
+#if RAYHITGROUPSHADER
+	return true;
+#else
+	return false;
+#endif
+}
+
+// Used for the RuntimeVirtualTextureReplace material expression
+// Returns true if rendering to a runtime virtual texture page
+bool GetRuntimeVirtualTextureOutputSwitch()
+{
+#if VIRTUAL_TEXTURE_PAGE_RENDER
+	return true;
+#else
+	return false;
+#endif
+}
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM4
+struct FWriteToSliceGeometryOutput
+{
+	FScreenVertexOutput Vertex;
+	uint LayerIndex : SV_RenderTargetArrayIndex;
+};
+#endif
+
+// Helper macro to globally ignore requests for non-offset world positions in materials when lower than shader model 4. We do this
+// because we are using an extra interpolator for this second world position, and in < ES31 there may not be enough
+#define USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS	(NEEDS_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS && FEATURE_LEVEL >= FEATURE_LEVEL_ES3_1)
+
+/** Used for calculating vertex positions and UVs when drawing with DrawRectangle */
+void DrawRectangle(
+	in float4 InPosition,
+	in float2 InTexCoord,
+	out float4 OutPosition,
+	out float2 OutTexCoord)
+{
+	OutPosition = InPosition;
+	OutPosition.xy = -1.0f + 2.0f * (DrawRectangleParameters.PosScaleBias.zw + (InPosition.xy * DrawRectangleParameters.PosScaleBias.xy)) * DrawRectangleParameters.InvTargetSizeAndTextureSize.xy;
+	OutPosition.xy *= float2( 1, -1 );
+	OutTexCoord.xy = (DrawRectangleParameters.UVScaleBias.zw + (InTexCoord.xy * DrawRectangleParameters.UVScaleBias.xy)) * DrawRectangleParameters.InvTargetSizeAndTextureSize.zw;
+}
+
+/** Helper variant for vertex shaders which need a separate output for SV_POSITION and packed UV / Screen position */
+void DrawRectangle(
+	in float4 InPosition,
+	in float2 InTexCoord,
+	out float4 OutPosition,
+	out float4 OutUVAndScreenPos)
+{
+	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUVAndScreenPos.xy);
+	OutUVAndScreenPos.zw = OutPosition.xy;
+}
+
+/** Used for calculating vertex positions when drawing with DrawRectangle */
+void DrawRectangle(in float4 InPosition, out float4 OutPosition)
+{
+	OutPosition = InPosition;
+	OutPosition.xy = -1.0f + 2.0f * (DrawRectangleParameters.PosScaleBias.zw + (InPosition.xy * DrawRectangleParameters.PosScaleBias.xy)) * DrawRectangleParameters.InvTargetSizeAndTextureSize.xy;
+	OutPosition.xy *= float2( 1, -1 );
+}
+
+//Since some platforms don't remove Nans in saturate calls, 
+//SafeSaturate function will remove nan/inf.    
+//Can be expensive, only call when there's a good reason to expect Nans.
+//D3D saturate actually turns NaNs -> 0  since it does the max(0.0f, value) first, and D3D NaN rules specify the non-NaN operand wins in such a case.  
+//See: https://docs.microsoft.com/en-us/windows/desktop/direct3dhlsl/saturate
+#define SafeSaturate_Def(type)\
+type SafeSaturate(type In) \
+{\
+	return saturate(In);\
+}
+
+SafeSaturate_Def(float)
+SafeSaturate_Def(float2)
+SafeSaturate_Def(float3)
+SafeSaturate_Def(float4)
+
+// By default HLSL compilers make assumptions about the non-NaN nature of most inputs. Otherwise, most of its optimizations would be invalid, e.g. assuming multiply by 0 equals 0.
+// Unfortunately, as a consequence of this, the native infinite()/isnan()/isinf() intrinsics frequently get silently optimized away. To avoid this hazard we manually implement the same logic.
+// These are expected to generate identical code as native intrinsics would (when working properly). The PositiveFinite versions are faster than the native.
+// Also note that FXC has a quirk in which the pattern b? a : 0 is implemented with an AND instead of the more natural MOVC, i.e. optimizing for D3D bytecode instead of real-world HW instructions.
+// So drivers detect this pattern and convert back to a conditional move. HLSLcc instead converts to mix(), so NaNs end up propagating through despite our efforts to kill them (see UE-66179).
+// So we break this pattern using !b? 0 : a instead, which generates a MOVC.
+#define IsAndMakeFinite_Def(type, booltype)\
+booltype IsFinite(type In) \
+{\
+	return (asuint(In) & 0x7F800000) != 0x7F800000; \
+}\
+booltype IsPositiveFinite(type In) \
+{\
+	return asuint(In) < 0x7F800000; \
+}\
+type MakeFinite(type In) \
+{\
+    return !IsFinite(In)? 0 : In; \
+}\
+type MakePositiveFinite(type In) \
+{\
+    return !IsPositiveFinite(In)? 0 : In; \
+}
+
+IsAndMakeFinite_Def(float,  bool)
+IsAndMakeFinite_Def(float2, bool2)
+IsAndMakeFinite_Def(float3, bool3)
+IsAndMakeFinite_Def(float4, bool4)
+
+// Experimental way to allow adjusting the OpacityMask for shadow map rendering of masked materials.
+// Can be accessed with a Custom material node. If this turns out to be very useful we can expose as MaterialFunction
+// and potentially expose other queries as well (e.g. SkeletalMesh, HitProxy, ).
+// @return 0:no, 1:yes
+bool GetShadowReplaceState()
+{
+#ifdef SHADOW_DEPTH_SHADER
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool GetReflectionCapturePassSwitchState()
+{
+	return View.RenderingReflectionCaptureMask > 0.0f;
+}
+
+float IsShadowDepthShader()
+{
+	return GetShadowReplaceState() ? 1.0f : 0.0f;
+}
+
+#define TERRAIN_ZSCALE (1.0f/128.0f)
+
+// Decodes a value which was packed into two 8 bit channels
+float DecodePackedTwoChannelValue(float2 PackedHeight)
+{
+	return PackedHeight.x * 255.0 * 256.0 + PackedHeight.y * 255.0;
+}
+
+float DecodeHeightValue(float InValue)
+{
+	return (InValue - 32768.0) * TERRAIN_ZSCALE;
+}
+
+float DecodePackedHeight(float2 PackedHeight)
+{
+	return DecodeHeightValue(DecodePackedTwoChannelValue(PackedHeight));
+}
+
+/** Reverses all the 32 bits. */
+uint ReverseBits32( uint bits )
+{
+#if SM5_PROFILE || COMPILER_METAL
+	return reversebits( bits );
+#else
+	bits = ( bits << 16) | ( bits >> 16);
+	bits = ( (bits & 0x00ff00ff) << 8 ) | ( (bits & 0xff00ff00) >> 8 );
+	bits = ( (bits & 0x0f0f0f0f) << 4 ) | ( (bits & 0xf0f0f0f0) >> 4 );
+	bits = ( (bits & 0x33333333) << 2 ) | ( (bits & 0xcccccccc) >> 2 );
+	bits = ( (bits & 0x55555555) << 1 ) | ( (bits & 0xaaaaaaaa) >> 1 );
+	return bits;
+#endif
+}
+
+/** Reverses all the <BitCount> lowest significant bits. */
+uint ReverseBitsN(uint Bitfield, const uint BitCount)
+{
+	return ReverseBits32(Bitfield) >> (32 - BitCount);
+}
+
+// see PixelShaderOutputCommon
+struct FPixelShaderIn
+{
+	// read only
+	float4 SvPosition;
+
+	// Pixel Shader InCoverage, only usable if PIXELSHADEROUTPUT_COVERAGE is 1
+	uint Coverage;
+
+	//
+	bool bIsFrontFace;
+};
+// see PixelShaderOutputCommon
+struct FPixelShaderOut
+{
+	// [0..7], only usable if PIXELSHADEROUTPUT_MRT0, PIXELSHADEROUTPUT_MRT1, ... is 1
+	float4 MRT[8];
+
+	// Pixel Shader OutCoverage, only usable if PIXELSHADEROUTPUT_COVERAGE is 1
+	uint Coverage;
+
+	// Pixel Shader OutDepth
+	float Depth;
+};
+
+
+// ---------------------------------------------------- Global samplers.
+
+// If GetGlobalSampler() was not implemented in Platform.ush, provide a default one from View uniform buffer.
+#if !defined(GetGlobalSampler) && SUPPORTS_INDEPENDENT_SAMPLERS
+
+// Implements UE4's Get global sampler.
+// Filter={Point,Bilinear,Trilinear}
+// WrapMode={Wrapped,Clamped}
+
+#define GetGlobalSampler(Filter,WrapMode) \
+	View.Shared##Filter##WrapMode##Sampler
+
+#endif // GetGlobalSampler
+
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+
+// Shortcuts for global samplers.
+#define GlobalPointClampedSampler GetGlobalSampler(Point, Clamped)
+#define GlobalPointWrappedSampler GetGlobalSampler(Point, Wrapped)
+#define GlobalBilinearClampedSampler GetGlobalSampler(Bilinear, Clamped)
+#define GlobalBilinearWrappedSampler GetGlobalSampler(Bilinear, Wrapped)
+#define GlobalTrilinearClampedSampler GetGlobalSampler(Trilinear, Clamped)
+#define GlobalTrilinearWrappedSampler GetGlobalSampler(Trilinear, Wrapped)
+
+#endif // SUPPORTS_INDEPENDENT_SAMPLERS
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5
+
+float4 GatherDepth(Texture2D Texture, float2 UV)
+{
+	// using Gather: xyzw in counter clockwise order starting with the sample to the lower left of the queried location
+	float4 DeviceZ = Texture.GatherRed(GlobalBilinearClampedSampler, UV);
+
+	return float4(
+		ConvertFromDeviceZ(DeviceZ.x),
+		ConvertFromDeviceZ(DeviceZ.y),
+		ConvertFromDeviceZ(DeviceZ.z),
+		ConvertFromDeviceZ(DeviceZ.w));
+}
+
+#endif

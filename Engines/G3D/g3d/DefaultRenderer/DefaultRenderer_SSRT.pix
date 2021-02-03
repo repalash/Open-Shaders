@@ -1,0 +1,105 @@
+#version 410 // -*- c++ -*-
+/** \file GIRenderer_gatherGlossy.pix */
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <Camera/Camera.glsl>
+#include <reconstructFromDepth.glsl>
+
+#include <screenSpaceRayTrace.glsl>
+
+// Include DDGI volume for miss rays
+#include <DDGIVolume/DDGIVolume.glsl>
+
+#expect NUM_DDGIVOLUMES, "Length of ddgiVolume array"
+uniform DDGIVolume ddgiVolumeArray[NUM_DDGIVOLUMES];
+
+uniform Camera     camera;
+
+uniform_GBuffer(gbuffer_);
+
+uniform sampler2D  rayOrigins;
+uniform sampler2D  rayDirections;
+
+uniform float      nearPlaneZ;
+
+uniform mat4x3     worldToCamera;
+
+uniform vec2       screenRes;
+
+// Must be after GBuffer declaration
+#include <deferredHelpers.glsl>
+
+void main() {
+
+    Point2 hitPixel;
+    int hitLayer;
+    Point3 csHitPoint;
+
+    Point3  wsRayOrigin = texelFetch(rayOrigins, ivec2(gl_FragCoord.xy), 0).xyz;
+    Vector3 wsRayDirection = texelFetch(rayDirections, ivec2(gl_FragCoord.xy), 0).xyz;
+
+    if (! traceScreenSpaceRay1(
+        camera.invFrame * vec4(wsRayOrigin, 1),
+        camera.invFrame * vec4(wsRayDirection, 0),
+        camera.projectToPixelMatrix,
+        gbuffer_DEPTH_buffer,
+        screenRes,
+        0.5f, //  csZThickness, expected thickness of objects in scene (e.g. pillars)
+        true,
+        camera.clipInfo,
+        camera.nearPlaneZ,
+        2.0f, //stride,
+        1 + float((int(gl_FragCoord.x) + int(gl_FragCoord.y)) & 1) * 0.5,
+        225.0f, //maxSteps,
+        80.0f, //maxRayTraceDistance,
+        hitPixel,
+        hitLayer,
+        csHitPoint
+    )) {
+
+#       ifdef gbuffer_WS_POSITION_notNull
+            WS_POSITION = vec4(camera.frame * vec4(csHitPoint, 1), 1);
+#       endif
+
+#       ifdef gbuffer_WS_NORMAL_notNull
+            // Must set w channel to 1 because it encodes a front face when shading rays.
+            WS_NORMAL = vec4(camera.frame[2].xyz * WS_NORMAL_writeMultiplyFirst.xyz + WS_NORMAL_writeAddSecond.xyz, 1);
+#       endif
+
+        LAMBERTIAN = vec4(0);
+        GLOSSY = vec4(0);
+
+        EMISSIVE.rgb =
+            sampleIrradiance(ddgiVolumeArray,
+                // On a miss, csHitPoint is the last valid point along the ray checked for a hit
+                camera.frame * vec4(csHitPoint, 1),
+                // We missed, so clearly we're shading in space (or at least at some point the 
+                // camera can't see), so no bias necessary.
+                vec3(0),
+                wsRayDirection,
+				camera.frame * vec4(0,0,0,1),
+                ! bool(SMOOTH_BACKFACE_TEST),
+                ! bool(CHEBYCHEV_TEST),
+                -1) * EMISSIVE_writeMultiplyFirst.xyz;
+        return;
+    }
+    
+    // Screen-space point being shaded
+    ivec2 C = ivec2(hitPixel);
+
+    // Need these checks because these buffers are not bound to the screen
+    // gbuffer on the first frame.
+#ifdef gbuffer_WS_POSITION_notNull
+    WS_POSITION = texelFetch(gbuffer_WS_POSITION_buffer, C, 0);
+#endif
+#ifdef gbuffer_WS_NORMAL_notNull
+    WS_NORMAL.xyz   = normalize(texelFetch(gbuffer_WS_NORMAL_buffer, C, 0).xyz * gbuffer_WS_NORMAL_readMultiplyFirst.xyz + gbuffer_WS_NORMAL_readAddSecond.xyz) * WS_NORMAL_writeMultiplyFirst.xyz + WS_NORMAL_writeAddSecond.xyz;
+    WS_NORMAL.w = 1; // hit
+#endif
+    LAMBERTIAN.rgb  = texelFetch(gbuffer_LAMBERTIAN_buffer, C, 0).rgb;
+    GLOSSY.rgba  = texelFetch(gbuffer_GLOSSY_buffer, C, 0);
+    EMISSIVE.rgb = texelFetch(gbuffer_EMISSIVE_buffer, C, 0).rgb * gbuffer_EMISSIVE_readMultiplyFirst.xyz * EMISSIVE_writeMultiplyFirst.xyz;
+}

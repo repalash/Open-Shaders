@@ -1,0 +1,118 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+//#define SCENE_TEXTURES_DISABLED 1
+
+#include "../Common.ush"
+#include "HairStrandsMeshProjectionCommon.ush"
+#include "HairStrandsDebugCommon.ush"
+
+float4x4 LocalToWorld;
+uint VertexOffset;
+uint IndexOffset;
+uint MaxIndexCount;
+uint MaxVertexCount;
+uint MeshUVsChannelOffset;
+uint MeshUVsChannelCount;
+uint bOutputInUVsSpace;
+uint MeshType;
+uint SectionIndex;
+float2 OutputResolution;
+
+Buffer<float> InputVertexPositionBuffer;
+Buffer<float2> InputVertexUVsBuffer;
+#if PERMUTATION_INPUT_TYPE == 1
+Buffer<uint> InputIndexBuffer;
+#endif
+
+#define REST_MESH 0
+#define DEFORMED_MESH 1
+#define SOURCE_MESH 2
+#define TARGET_MESH 3
+
+void MainVS(
+	uint VertexId : SV_VertexID,
+	out float2 OutVertexUV : TRI_UVs,
+	out float3 OutFaceNormal : FACE_NORMAL,
+	out float4 OutPosition : SV_POSITION)
+{
+	ResolvedView = ResolveView();
+
+#if PERMUTATION_INPUT_TYPE == 0
+	const uint VertexIndex = min(VertexOffset + VertexId, MaxVertexCount-1);
+	float3 P = InputVertexPositionBuffer[VertexIndex];
+	OutFaceNormal = float3(0,0,1);
+	OutVertexUV = InputVertexUVsBuffer[VertexIndex];
+#endif
+
+#if PERMUTATION_INPUT_TYPE == 1
+	const uint TriangleVertexIndex = (VertexId%3);
+	const uint TriangleIndex = VertexId / 3;
+	const FHairMeshTriangleWithUVs Tri = GetTriangleData(TriangleIndex, InputVertexPositionBuffer, InputVertexUVsBuffer, InputIndexBuffer, IndexOffset, MaxIndexCount, MaxVertexCount, MeshUVsChannelOffset, MeshUVsChannelCount);
+	OutFaceNormal = Tri.N;
+
+	float3 P = 0;
+	float2 UV = 0;
+	if (TriangleVertexIndex == 0)
+	{
+		P = Tri.P0;
+		UV = Tri.UV0;
+	}
+	if (TriangleVertexIndex == 1)
+	{
+		P = Tri.P1;
+		UV = Tri.UV1;
+	}
+	if (TriangleVertexIndex == 2)
+	{
+		P = Tri.P2;
+		UV = Tri.UV2;
+	}
+
+	OutVertexUV = UV;
+#endif
+	if (bOutputInUVsSpace)
+	{
+		float2 PixelOffset = 0;
+		//float2 PixelOffset = 1.f / float2(OutputResolution);
+		if (MeshType == REST_MESH)		PixelOffset *= 0;
+		if (MeshType == DEFORMED_MESH)	PixelOffset *= 1;
+		if (MeshType == SOURCE_MESH)	PixelOffset *= 2;
+		if (MeshType == TARGET_MESH)	PixelOffset *= 3;
+
+		OutPosition = float4((PixelOffset + OutVertexUV) * 2 - 1, 0.5, 1);
+	}
+	else
+	{
+		P = mul(float4(P, 1), LocalToWorld).xyz;
+		OutPosition = mul(float4(P, 1), View.WorldToClip);
+	}
+
+	// Quick filter
+#if 0
+	//if (MeshType != REST_MESH)
+	//if (MeshType != DEFORMED_MESH)
+	//if (MeshType != SOURCE_MESH)
+	//if (MeshType != TARGET_MESH)
+	if (MeshType != SOURCE_MESH && MeshType != TARGET_MESH || SectionIndex != 0)
+	{
+		OutPosition = float4(1.#INF, 1.#INF, 1.#INF, 1.#INF);
+		OutVertexUV = 0;
+	}
+#endif
+}
+
+void MainPS(
+	in float2 VertexUV : TRI_UVs,
+	in float3 FaceNormal : FACE_NORMAL,
+	out float4 OutColor : SV_Target0)
+{
+	float3 Color = 0;
+	if (MeshType == REST_MESH)		Color = float3(1, 0, 0);
+	if (MeshType == DEFORMED_MESH)	Color = float3(0, 1, 0);
+	if (MeshType == SOURCE_MESH)	Color = float3(0, 0, 1);
+	if (MeshType == TARGET_MESH)	Color = float3(1, 1, 0);
+
+	OutColor = float4((FaceNormal + 1) * 0.5f,1);
+	OutColor = float4(VertexUV, 0, 1);
+	OutColor = float4(Color, 1);
+}

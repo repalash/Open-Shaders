@@ -1,0 +1,40 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+
+
+#define TILE_RES_DIVISOR_LOG2 3
+#define TILE_RES_DIVISOR 8
+#define DIRECTIONALITY_DIVISION 8
+
+
+uint2 TileBufferExtent;
+uint ViewTileCount;
+uint MaxTileCount;
+
+StructuredBuffer<float> TileClassificationBuffer;
+
+
+/** Information about tiles in SGPRs. */
+struct FSSRTTileInfos
+{
+	float Directionality[DIRECTIONALITY_DIVISION];
+};
+
+
+/** Load tile informations using scalar load. */
+FSSRTTileInfos LoadTileInfos(uint2 TileCoord)
+{
+	uint TileIndex = TileCoord.x + TileCoord.y * TileBufferExtent.x;
+
+	FSSRTTileInfos TileInfos;
+
+	UNROLL_N(DIRECTIONALITY_DIVISION)
+	for (uint i = 0; i < DIRECTIONALITY_DIVISION; i++)
+	{
+		TileInfos.Directionality[i] = TileClassificationBuffer[TileIndex * DIRECTIONALITY_DIVISION + i];
+	}
+	return TileInfos;
+}

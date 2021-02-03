@@ -1,0 +1,529 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairCardsTextureCommon.ush"
+
+#define DEBUG_ENABLE 0
+#if DEBUG_ENABLE
+#include "../ShaderDrawDebug.ush"
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_VERTEX
+
+int2 OutputResolution;
+uint VertexCount;
+uint PrimitiveCount;
+
+uint UVsChannelIndex;
+uint UVsChannelCount;
+
+Buffer<float> VertexBuffer;
+Buffer<float4> NormalsBuffer;
+Buffer<float2> UVsBuffer;
+
+void MainVS(
+	uint VertexId			: SV_VertexID,
+	out float4 UVPosition	: SV_POSITION,
+	out float2 OutUV		: MESH_UV, 
+	out float3 OutPosition	: MESH_POSITION,
+	out float3 OutTangent	: MESH_TANGENT,
+	out float3 OutBitangent	: MESH_BITANGENT,
+	out float3 OutNormal	: MESH_NORMAL)
+{
+	const float3 Position = float3(
+		VertexBuffer.Load(VertexId*3 + 0),
+		VertexBuffer.Load(VertexId*3 + 1),
+		VertexBuffer.Load(VertexId*3 + 2));
+
+	float2 UVs = UVsBuffer.Load(VertexId * UVsChannelCount + UVsChannelIndex);
+	UVs.y = 1 - UVs.y;
+
+	UVPosition	= float4(UVs *2-1, 0.5f, 1);
+	OutUV		= UVs;
+	OutPosition = Position;
+
+	const float4 VY = NormalsBuffer.Load(VertexId * 2);
+	const float4 VZ = NormalsBuffer.Load(VertexId * 2 + 1);
+
+	OutTangent  = cross(VY.xyz, VZ.xyz) * VZ.w;
+	OutBitangent= VY.xyz;
+	OutNormal	= VZ.xyz;
+}
+
+#endif // VERTEXSHADER
+
+#if SHADER_PIXEL
+
+#include "HairStrandsVertexFactoryCommon.ush"
+
+float3 ComputeTangent(
+	const FHairControlPoint CP0,
+	const FHairControlPoint CP1,
+	const FHairControlPoint CP2)
+{
+	const float3 T0 = normalize(CP1.Position - CP0.Position);
+	const float3 T1 = normalize(CP2.Position - CP1.Position);
+	return normalize(T0 + T1);
+}
+
+float3 ComputeTangent(
+	const FHairControlPoint CP0,
+	const FHairControlPoint CP1)
+{
+	return normalize(CP1.Position - CP0.Position);
+}
+
+int2 OutputResolution;
+uint VertexCount;
+uint PrimitiveCount;
+
+Buffer<uint4> InVF_PositionBuffer;
+Buffer<uint4> InVF_AttributeBuffer;
+float3 InVF_PositionOffset;
+float InVF_Radius;
+float InVF_Length;
+uint InVF_ControlPointCount;
+
+Buffer<float> VertexBuffer;
+Buffer<float4> NormalsBuffer;
+Buffer<float2> UVsBuffer;
+
+float MaxDistance;
+int TracingDirection;
+
+float3 Voxel_MinBound;
+float3 Voxel_MaxBound;
+int3 Voxel_Resolution;
+float Voxel_Size;
+StructuredBuffer<uint2> Voxel_OffsetAndCount;
+StructuredBuffer<uint2> Voxel_Data;
+
+uint3 PositionToCoord(float3 P, float3 InMinAABB, float3 InMaxAABB, uint3 InResolution)
+{
+	return clamp(
+		saturate((P - InMinAABB) / (InMaxAABB - InMinAABB)) * InResolution,
+		uint3(0, 0, 0),
+		InResolution - 1);
+}
+
+uint CoordToIndex(uint3 InCoord, uint3 InResolution, uint LinearOffset)
+{
+	return
+		InCoord.x +
+		InCoord.y * InResolution.x +
+		InCoord.z * InResolution.x * InResolution.y +
+		LinearOffset;
+}
+
+bool Trace(
+	float3 InRayO,
+	float3 InRayD,
+	float InMaxDistance,
+	bool bDebugEnable,
+	inout float  OutDepth,
+	inout float  OutCoverage,
+	inout float3 OutTangent,
+	inout float2 OutRootUV, 
+	inout float  OutU, 
+	inout float  OutSeed)
+{
+	bool bIsValid = false;
+
+	const float3 WP0 = InRayO;
+	const float3 WP1 = InRayO + InRayD * InMaxDistance;
+
+	#if DEBUG_ENABLE
+	if (bDebugEnable)
+	{
+		const float4 Color0 = float4(0, 1, 0, 1);
+		const float4 Color1 = float4(1, 0, 0, 1);
+		AddLine(WP0, WP1, Color0, Color1);
+	}
+	#endif	
+
+
+	const float2 HitT = LineBoxIntersect(WP0, WP1, Voxel_MinBound, Voxel_MaxBound);
+	if (HitT.x < HitT.y)
+	{
+		#if DEBUG_ENABLE
+		if (bDebugEnable)
+		{
+			//AddLine(true, O, E);
+			AddAABB(Voxel_MinBound, Voxel_MaxBound, float4(1, 1, 1, 1));
+		}
+		#endif	
+
+		// Count the number of fibers which are within a cylinder defined by the voxel size, 
+		// and the distance between the origin and the extent of the volume
+		// This assumes that the voxel volume is cubic (i.e. equal dimensions on all sides)
+		const float3 O = WP0; // lerp(WorldPosition, IntersectEndPoint, HitT.xxx);
+		const float3 E = WP1; // lerp(WorldPosition, IntersectEndPoint, HitT.yyy);
+		const float OELength = min(length(E - O), InMaxDistance);
+
+		const int3 StartCoord = PositionToCoord(WP0, Voxel_MinBound, Voxel_MaxBound, Voxel_Resolution);
+		const int3 EndCoord   = PositionToCoord(WP1, Voxel_MinBound, Voxel_MaxBound, Voxel_Resolution);
+
+
+		// Init to 1 or -1 depending of the orientation of stepping
+		const float3 UNormD = WP1 - WP0;
+		const int3 Step = sign(UNormD);
+
+		// Step according to voxel size
+		const float3 D = normalize(UNormD) * Voxel_Size;
+
+		float t = HitT.x;
+
+		// this is slop coeff for each axis: how far we need to move in units of t for each axis
+		const float3 tDelta = Step * Voxel_Size / UNormD;
+
+		// Init to the starting voxel
+		int3 PageIndexCoord = -1;
+		float3 tMax = 0;
+		{
+			const float3 HitP = O + HitT.x * UNormD;
+
+			const float Epsilon = 0.000001f;
+			const float3 Coords = clamp(
+				saturate((HitP - Voxel_MinBound) / (Voxel_MaxBound - Voxel_MinBound)) * Voxel_Resolution,
+				0,
+				Voxel_Resolution - Epsilon);
+
+			const float3 FractCoords = max(Step, 0) - Step * frac(Coords);
+			tMax = FractCoords * tDelta;
+
+			PageIndexCoord = clamp(uint3(Coords), uint3(0, 0, 0), Voxel_Resolution - 1);
+		}
+
+		// Page stepping is the walking quantity (i.e. number of voxel) for fine ray-marching within a valid page
+		float PageStepping = 1;
+
+		bool bLastStep = false;
+		const uint LoopCount = 256u;
+		for (uint LoopIt = 0; LoopIt < LoopCount; ++LoopIt)
+		{
+			const bool bIsInside =
+				PageIndexCoord.x >= 0 &&
+				PageIndexCoord.y >= 0 &&
+				PageIndexCoord.z >= 0 &&
+				PageIndexCoord.x < int(Voxel_Resolution.x) &&
+				PageIndexCoord.y < int(Voxel_Resolution.y) &&
+				PageIndexCoord.z < int(Voxel_Resolution.z);
+			if (!bIsInside)
+			{
+				return bIsValid;
+			}
+
+			if (bLastStep)
+			{
+				return bIsValid;
+			}
+
+			if (all(PageIndexCoord == EndCoord))
+			{
+				bLastStep = true;
+			}
+
+			const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, Voxel_Resolution, 0);
+
+			#if DEBUG_ENABLE
+			if (bDebugEnable)
+			{
+				const float3 MinVoxelAABB = Voxel_MinBound + PageIndexCoord * Voxel_Size;
+				const float3 MaxVoxelAABB = Voxel_MinBound + (PageIndexCoord + 1) * Voxel_Size;
+				AddAABB(MinVoxelAABB, MaxVoxelAABB, float4(0, 1, 1, 1));
+			}
+			#endif	
+
+			// Trace against voxel content
+			{
+				const int3 VolumeCoord = PageIndexCoord;
+
+				// Update page index only when needed
+				uint2 OffsetAndCount = 0;
+				{
+					const uint LinearIndexCoord = CoordToIndex(VolumeCoord, Voxel_Resolution, 0);
+					OffsetAndCount = Voxel_OffsetAndCount[LinearIndexCoord];
+				}
+
+				if (OffsetAndCount.y > 0)
+				{
+					for (uint PointIt = 0; PointIt < OffsetAndCount.y; ++PointIt)
+					{
+						const uint2 P0_P1 = Voxel_Data[OffsetAndCount.x + PointIt];
+						const uint P0 = P0_P1.x;
+						const uint P1 = P0_P1.y;
+
+						const uint4 PackedCP_P0 = InVF_PositionBuffer[P0];
+						const uint4 PackedCP_P1 = InVF_PositionBuffer[P1];
+
+						const FHairControlPoint CP_Curr = UnpackHairControlPoint(PackedCP_P0, InVF_PositionOffset, InVF_Radius, InVF_Length);
+						const FHairControlPoint CP_Next = UnpackHairControlPoint(PackedCP_P1, InVF_PositionOffset, InVF_Radius, InVF_Length);
+
+						const float3 Tangent = ComputeTangent(CP_Curr, CP_Next);
+
+						const float3 RayP0 = InRayO;
+						const float3 RayP1 = InRayO + InRayD * InMaxDistance;
+
+						float VertexU = 0;
+						const float WorldRadius = 2 * max(CP_Curr.WorldRadius, CP_Next.WorldRadius); //  0.05f;
+						const float Distance = Intersection(CP_Curr.Position, CP_Next.Position, RayP0, RayP1, WorldRadius, VertexU) * InMaxDistance;
+						if (Distance > 0 && Distance < OutDepth)
+						{
+							OutCoverage = 1;
+							OutTangent = Tangent;
+							OutDepth = Distance;
+
+
+							const FHairAttributes Attributes0 = DecodeHairAttribute(InVF_AttributeBuffer[P0]);
+							const FHairAttributes Attributes1 = DecodeHairAttribute(InVF_AttributeBuffer[P1]);
+
+							OutSeed		= Attributes0.Seed;
+							OutRootUV	= Attributes0.RootUV;
+							OutU		= lerp(Attributes0.UCoord, Attributes1.UCoord, VertexU);
+
+							bIsValid = true;
+
+							#if DEBUG_ENABLE
+							if (bDebugEnable)
+							{
+								const float4 Color = float4(1, 0, 0, 1);
+								AddLine(CP_Curr.Position, CP_Next.Position, Color, Color);
+								AddCross(CP_Curr.Position, 0.05f, Color);
+								AddCross(CP_Next.Position, 0.05f, Color);
+							}
+							#endif							
+						}
+					}
+				}
+			}
+
+			// t is used for defining the intersection point at the entry of a valid page
+			t = min(tMax.x, min(tMax.y, tMax.z));
+
+			// Find the next page indx to visit and update the tmax, accordingly
+			const float3 Mask = tMax.x < tMax.y ?
+				(tMax.x < tMax.z ? float3(1, 0, 0) : float3(0, 0, 1)) :
+				(tMax.y < tMax.z ? float3(0, 1, 0) : float3(0, 0, 1));
+			PageIndexCoord += Step * Mask;
+			tMax += tDelta * Mask;
+		}
+	}
+
+	return bIsValid;
+}
+
+void MainPS(
+	in float4  SvPosition	: SV_Position,
+	in float2  InUV			: MESH_UV,
+	in float3  InPosition	: MESH_POSITION,
+	in float3  InTangent	: MESH_TANGENT,
+	in float3  InBitangent	: MESH_BITANGENT,
+	in float3  InNormal		: MESH_NORMAL,
+	out float  OutDepthTest	: SV_Depth,
+	out float  OutDepth		: SV_Target0,
+	out float  OutCoverage	: SV_Target1,
+	out float4 OutTangent	: SV_Target2,
+	out float4 OutAttribute : SV_Target3,
+	out uint   OutTriangleMask : SV_Target4)
+{
+	const float3 T = normalize(InTangent);
+	const float3 B = normalize(InBitangent);
+	const float3 N = normalize(InNormal);
+
+	const float3 PixelAxisX = ddx(InPosition);
+	const float3 PixelAxisY = ddy(InPosition);
+
+	OutDepth = max(0, MaxDistance);
+	OutCoverage = 0;
+	OutTangent = 0;
+	OutAttribute = 0;
+	OutDepthTest = 1;
+
+	float3 Tangent_ObjectSpace = 0;
+	const int2 PixelCoord = int2(SvPosition.xy);
+
+	const bool bDebugEnable =
+	#if DEBUG_ENABLE
+		uint(GetCursorPos().x) == uint(InUV.x * OutputResolution.x) &&
+		uint(GetCursorPos().y) == uint(InUV.y * OutputResolution.y);
+	#else
+		false;
+	#endif
+
+	const uint SampleCount = 8;
+	uint bValidCount = 0;
+	for (uint SampleIt = 0; SampleIt < SampleCount; ++SampleIt)
+	{
+		const float2 Jitter = Hammersley(SampleIt, SampleCount, 0) * 2 - 1;
+
+		float3 RayO = InPosition + Jitter.x * PixelAxisX + Jitter.y * PixelAxisY;
+		float3 RayD = N;
+
+		// If the tracing distance is:
+		// * Positive: Tracing is done outside towards the surface
+		// * Negative: Tracing is done inside, starting from the surface
+		// * Zero    : Tracing is from outside towards the surface, but continus within the surface
+		if (TracingDirection > 0)
+		{
+			RayO = RayO + RayD * MaxDistance;
+			RayD =-RayD;
+		}
+		else if (TracingDirection < 0)
+		{
+			RayD = -RayD;
+		}
+		else // (TracingDirection == 0)
+		{
+			RayO = RayO + RayD * MaxDistance * 0.5f;
+			RayD = -RayD;
+		}
+	
+		float  SampleDepth = MaxDistance;
+		float  SampleCoverage = 0;
+		float3 SampleTangent  = 0;
+		float2 SampleRootUV = 0;
+		float  SampleU = 0;
+		float  SampleSeed = 0;
+		if (Trace(RayO, RayD, MaxDistance, bDebugEnable, SampleDepth, SampleCoverage, SampleTangent, SampleRootUV, SampleU, SampleSeed))
+		{
+			if (SampleDepth < OutDepth)
+			{
+				OutAttribute.xy = SampleRootUV;
+				OutAttribute.z = SampleU;
+				OutAttribute.w = SampleSeed;
+			}
+
+			OutDepth = min(OutDepth, SampleDepth);
+			OutCoverage += SampleCoverage;
+			Tangent_ObjectSpace += SampleTangent;
+			++bValidCount;
+		}
+	}
+
+	if (bValidCount > 0 && OutCoverage > 0)
+	{
+		Tangent_ObjectSpace = normalize(Tangent_ObjectSpace);
+		const float3 Tangent_FrameSpace  = float3(
+			dot(Tangent_ObjectSpace, T), 
+			dot(Tangent_ObjectSpace, B), 
+			dot(Tangent_ObjectSpace, N));
+
+		OutCoverage /= bValidCount;
+		OutTangent.xyz = (Tangent_FrameSpace + 1) * 0.5f;
+	}
+	else
+	{
+		OutDepth = MaxDistance;
+		OutCoverage = 0;
+		OutTangent = 0;
+		OutAttribute = 0;
+	}
+
+	OutDepth = saturate(OutDepth / MaxDistance);
+	OutDepthTest = OutDepth;
+	OutTriangleMask = 1;
+}
+
+#endif // SHADER_PIXEL
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_TEXTURE_DILATION
+
+uint PackDistance(float x)							{ return x * 1000.f; }
+float UnpackDistance(float x, inout bool bIsValid)	{ bIsValid = x != 0; return float(x) / 1000.f; }
+
+int2 Resolution;
+int ClearDistance;
+RWTexture2D<uint> TriangleMaskTexture;
+
+Texture2D<float>  Source_DepthTexture;
+Texture2D<float>  Source_CoverageTexture;
+Texture2D<float4> Source_TangentTexture;
+Texture2D<float4> Source_AttributeTexture;
+
+RWTexture2D<float>  Target_DepthTexture;
+RWTexture2D<float>  Target_CoverageTexture;
+RWTexture2D<float4> Target_TangentTexture;
+RWTexture2D<float4> Target_AttributeTexture;
+
+// Dilate the source texture (Depth/Coverage/Tanget/Attribute), using a distance to triangle edge metric. 
+// Original valid pixel are marked into the triangleMasktexture during the texture generation. Then 
+// successive dilation pass are run. At each pass the triangleMaskTexure stored the distance to triangle
+// edge in order to propagate correctly the pixel edge information.
+[numthreads(8, 4, 1)]
+void MainCS(int2 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= Resolution.x || DispatchThreadId.y >= Resolution.y)
+		return;
+
+	const float MaxDistance = 1000000.f;
+
+	const uint2 PixelCoord = DispatchThreadId.xy;
+	const uint  PackedDistance = TriangleMaskTexture.Load(PixelCoord);
+
+	bool bIsValid = false;
+	const float Distance = UnpackDistance(PackedDistance, bIsValid);
+
+	if (bIsValid)
+	{
+		// Fast path: the pixel is valid, we copy value
+		Target_DepthTexture[PixelCoord]		= Source_DepthTexture.Load(uint3(PixelCoord,0));
+		Target_CoverageTexture[PixelCoord]	= Source_CoverageTexture.Load(uint3(PixelCoord, 0));
+		Target_TangentTexture[PixelCoord]	= Source_TangentTexture.Load(uint3(PixelCoord, 0));
+		Target_AttributeTexture[PixelCoord] = Source_AttributeTexture.Load(uint3(PixelCoord, 0));
+		return;
+	}
+	else
+	{
+		float Target_Depth = 0;
+		float Target_Coverage = 0;
+		float4 Target_Tangent = 0;
+		float4 Target_Attribute = 0;
+
+		// Find the closest neighbor from triangle, amoung valid neighbord
+		bool bIsDilatedPixelValid = false;
+		float MinDistance = 9999999;
+		for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x)
+		{
+			if (x == 0 && y == 0)
+				continue;
+
+			const int2 NPixelOffset = int2(x, y);
+			const int2 NPixelCoord = clamp(PixelCoord + NPixelOffset, 0, Resolution);
+
+			bool bNIsValid = false;
+			const uint NPackedDistance = TriangleMaskTexture.Load(uint2(NPixelCoord));
+			const float NDistance = UnpackDistance(NPackedDistance, bNIsValid);
+			if (bNIsValid && NDistance <= MinDistance)
+			{
+				Target_Depth		= Source_DepthTexture.Load(uint3(NPixelCoord,0));
+				Target_Coverage		= Source_CoverageTexture.Load(uint3(NPixelCoord, 0));
+				Target_Tangent		= Source_TangentTexture.Load(uint3(NPixelCoord, 0));
+				Target_Attribute	= Source_AttributeTexture.Load(uint3(NPixelCoord, 0));
+				MinDistance			= NDistance;
+				bIsDilatedPixelValid= true;
+			}
+		}
+
+		// If a valid neighbord has been bound, update pixel value
+		if (bIsDilatedPixelValid)
+		{
+			Target_DepthTexture[PixelCoord]		= Target_Depth;
+			Target_CoverageTexture[PixelCoord]	= Target_Coverage;
+			Target_TangentTexture[PixelCoord]	= Target_Tangent;
+			Target_AttributeTexture[PixelCoord] = Target_Attribute;
+
+			TriangleMaskTexture[PixelCoord] = PackDistance(MinDistance);
+		}
+	}
+
+
+}
+#endif // SHADER_TEXTURE_DILATION

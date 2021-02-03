@@ -1,0 +1,38 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTexturesCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+Texture2D<float> SceneDepthTexture;
+Texture2D<uint4> CategorizationTexture;
+
+float DistanceThreshold;
+void MainPS(
+	in FScreenVertexOutput Input, 
+#if PERMUTATION_OUTPUT_FORMAT == 0
+	out float OutColor : SV_Target0
+#elif PERMUTATION_OUTPUT_FORMAT == 1
+	out float2 OutColor : SV_Target0
+#endif
+)
+{
+	const uint3 PixelCoord = uint3(Input.Position.xy, 0);
+	const float FarDepth = 10e-06;
+
+	const float SceneDepth = ConvertFromDeviceZ(SceneDepthTexture.Load(PixelCoord));
+	const FCategorizationData CatData = DecodeCategorizationData(CategorizationTexture.Load(PixelCoord));
+	const float SampleDepth = ConvertFromDeviceZ(CatData.ClosestDepth);
+
+	if (abs(SampleDepth-SceneDepth) > DistanceThreshold)
+	{
+		discard;
+	}
+
+	const uint LargeHairCount = 100000;
+#if PERMUTATION_OUTPUT_FORMAT == 0
+	OutColor = LargeHairCount;
+#elif PERMUTATION_OUTPUT_FORMAT == 1
+	OutColor = float2(LargeHairCount, 1);
+#endif
+}

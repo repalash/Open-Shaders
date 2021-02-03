@@ -1,0 +1,76 @@
+#version 330
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_depthOnly.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+#include <UniversalSurface/UniversalSurface_vertex.glsl>
+
+#expect HAS_ALPHA
+#expect HAS_BONES
+#expect PARALLAXSTEPS
+#expect HAS_TRANSMISSIVE
+
+#if HAS_VERTEX_COLOR
+    in vec4 g3d_VertexColor;
+#else
+    const vec4 g3d_VertexColor = vec4(1.0);
+#endif
+
+#if (HAS_BONES > 0)
+    in vec4             g3d_BoneWeights;
+    in ivec4            g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+#endif
+    
+void main() {
+    vec4 osVertex = g3d_Vertex;
+    vec3 osNormal = g3d_Normal.xyz;
+    vec4 packedTangent = vec4(0);
+
+#   if (PARALLAXSTEPS > 0)
+        packedTangent = g3d_PackedTangent;
+#   endif
+
+    vec2 tex0, tex1;
+#   if (HAS_ALPHA != 0) || (HAS_TRANSMISSIVE != 0)
+        tex0      = g3d_TexCoord0;
+#   endif
+
+#   if (HAS_BONES > 0)
+#       if PARALLAXSTEPS > 0
+            UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, osVertex, osNormal, packedTangent);
+#       else
+            mat4 boneMatrix = UniversalSurface_getFullBoneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture);
+            osVertex = boneMatrix * osVertex;	   
+#       endif
+#   endif
+
+    UniversalSurface_customOSVertexTransformation(osVertex, osNormal, packedTangent, tex0, tex1);
+
+    wsPosition = (g3d_ObjectToWorldMatrix * osVertex).xyz;
+    tan_Z      = g3d_ObjectToWorldNormalMatrix * osNormal;
+
+#   if ((HAS_ALPHA != 0) || (HAS_TRANSMISSIVE != 0)) && (PARALLAXSTEPS > 0)
+        tan_X = (g3d_ObjectToWorldMatrix * vec4(packedTangent.xyz, 0)).xyz;
+
+        // T and N are guaranteed perpendicular, so B is normalized.  Its facing 
+        // direction is stored in the texcoord w component.
+        tan_Y = cross(tan_Z, tan_X) * packedTangent.w;
+        
+        // Compute the tangent space eye vector (ATI does not support the transpose operator)
+        mat3 worldToTangent = mat3(tan_X.x, tan_Y.x, tan_Z.x,
+                                   tan_X.y, tan_Y.y, tan_Z.y,
+                                   tan_X.z, tan_Y.z, tan_Z.z);
+        
+        vec3 wsEyePos = g3d_CameraToWorldMatrix[3].xyz;
+        _tsE          = worldToTangent * (wsEyePos - wsPosition);
+#   endif
+
+    texCoord      = tex0;
+    gl_Position   = osVertex * g3d_ObjectToScreenMatrixTranspose;
+}

@@ -1,0 +1,48 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ODSCapture.usf: Shader for reconstructing a lat-long from a previously rendered
+	stereo cube capture with omni-directional stereo displacement.
+	See: https://developers.google.com/vr/jump/rendering-ods-content.pdf
+	Note: The left eye is packed on top of the right eye.
+=============================================================================*/
+
+#include "Common.ush"
+
+TextureCube LeftEyeTexture;
+TextureCube RightEyeTexture;
+SamplerState LeftEyeTextureSampler;
+SamplerState RightEyeTextureSampler;
+
+void MainPS(  
+	FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+#if ODS_CAPTURE
+	bool bIsTop = (Input.UV.y < 0.5);
+	float OffsetY = bIsTop ? 0.0 : -1.0;
+	
+	float2 UVs;
+	UVs.x = Input.UV.x;
+	UVs.y = Input.UV.y * 2.0 + OffsetY;
+
+	float4 ScaleOffset = float4(2.0 * PI, -PI, -PI, PI * 0.5);
+				
+	float2 Angles = UVs * ScaleOffset.xy + ScaleOffset.zw;
+	float2 AngleCos = cos(Angles);
+	float2 AngleSin = sin(Angles);
+	float3 EyeUVs = float3(AngleSin.x * AngleCos.y, -AngleCos.x * AngleCos.y, AngleSin.y);
+
+	if (bIsTop)
+	{
+		OutColor = float4(TextureCubeSample(LeftEyeTexture, LeftEyeTextureSampler, EyeUVs).rgb, 1.0);
+	}
+	else
+	{
+		OutColor = float4(TextureCubeSample(RightEyeTexture, RightEyeTextureSampler, EyeUVs).rgb, 1.0);
+	}
+#else
+	OutColor = float4(0.0, 0.0, 0.0, 1.0);
+#endif
+}

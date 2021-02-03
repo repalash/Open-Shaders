@@ -1,0 +1,120 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "HairStrandsMeshProjectionCommon.ush"
+#include "HairStrandsMeshRBF.ush"
+
+float3 SimRestOffset;
+float3 SimDeformedOffset;
+uint VertexCount;
+uint IterationCount;
+uint DispatchCountX; 
+
+Buffer<uint4> SimRestPosePositionBuffer;
+RWBuffer<uint4> OutSimDeformedPositionBuffer;
+
+
+#if PERMUTATION_GROUP_SIZE == 0
+#define GROUP_SIZE 64
+#elif PERMUTATION_GROUP_SIZE == 1
+#define GROUP_SIZE 32
+#else
+#error Unknown group size	
+#endif
+
+
+#define DEFORMATION_BYPASS 0
+#define DEFORMATION_WAVE 1
+#define DEFORMATION_NORMAL_DIRECTION 2
+#define DEFORMATION_OFFSET_GUIDE 3
+#define DEFORMATION_OFFSET_GUIDE_DYNAMIC 4
+#define DEFORMATION_OFFSET_GUIDE_GLOBAL 5
+
+#if PERMUTATION_DEFORMATION == DEFORMATION_OFFSET_GUIDE_DYNAMIC
+
+Buffer<float4>  SimRestPosition0Buffer;
+Buffer<float4>  SimRestPosition1Buffer;
+Buffer<float4>  SimRestPosition2Buffer;
+
+Buffer<float4>  SimDeformedPosition0Buffer;
+Buffer<float4>  SimDeformedPosition1Buffer;
+Buffer<float4>  SimDeformedPosition2Buffer;
+
+Buffer<uint>	SimRootBarycentricBuffer;
+Buffer<uint>    SimVertexToRootIndexBuffer;
+
+// Return world position of a guide vertex deformed by a skinned triangle
+float3 DeformGuideByTriangle(
+	uint GuideIndex,
+	FHairMeshTriangle RestTriangle,
+	FHairMeshTriangle DeformedTriangle,
+	float3 RootBarycentric)
+{
+	const float3 WorldRestGuidePoint = f16tof32(SimRestPosePositionBuffer[GuideIndex].xyz) + SimRestOffset;
+	const float3 LocalRestGuidePoint = ToTriangle(WorldRestGuidePoint, RootBarycentric, RestTriangle);
+	const float3 WorldDeformedGuidePoint = ToWorld(LocalRestGuidePoint, RootBarycentric, DeformedTriangle);
+
+	return WorldDeformedGuidePoint;
+}
+
+#endif
+
+#if PERMUTATION_DEFORMATION == DEFORMATION_OFFSET_GUIDE_GLOBAL
+uint SampleCount;
+Buffer<float4>  RestSamplePositionsBuffer;
+Buffer<float4>  MeshSampleWeightsBuffer;
+#endif
+
+float3 DisplacePosition(uint VertexIndex, float3 Pos, float Seed)
+{
+// By pass
+#if PERMUTATION_DEFORMATION == DEFORMATION_BYPASS
+	return Pos;
+#endif
+
+// Wave
+#if PERMUTATION_DEFORMATION == DEFORMATION_WAVE
+	const float Scale = 100.f;
+	Pos *= Scale;
+	//	return float3(0, cos(Pos.y + Seed / 16.f), cos(Pos.z + Seed / 32.f)) / Scale;
+	return Pos + float3(0, cos(Pos.y + Seed / 16.f), cos(Pos.z + Seed / 32.f));
+#endif
+
+// Align with some normal
+#if PERMUTATION_DEFORMATION == DEFORMATION_NORMAL_DIRECTION
+	return Pos;
+#endif
+
+#if PERMUTATION_DEFORMATION == DEFORMATION_OFFSET_GUIDE
+	return Pos + (SimRestOffset - SimDeformedOffset);
+#endif
+
+#if PERMUTATION_DEFORMATION == DEFORMATION_OFFSET_GUIDE_DYNAMIC
+	const uint RootIndex = SimVertexToRootIndexBuffer[VertexIndex];
+	const float3 RootBarycentric = DecodeBarycentrics(SimRootBarycentricBuffer[RootIndex]);
+
+	const FHairMeshTriangle RestTriangle = GetTriangleTransformation(RootIndex, SimRestPosition0Buffer, SimRestPosition1Buffer, SimRestPosition2Buffer);
+	const FHairMeshTriangle DeformedTriangle = GetTriangleTransformation(RootIndex, SimDeformedPosition0Buffer, SimDeformedPosition1Buffer, SimDeformedPosition2Buffer);
+
+	return DeformGuideByTriangle(VertexIndex, RestTriangle, DeformedTriangle, RootBarycentric) - SimDeformedOffset;
+#endif
+
+#if PERMUTATION_DEFORMATION == DEFORMATION_OFFSET_GUIDE_GLOBAL
+	const float3 RestControlPoint = Pos + SimRestOffset;
+	const float3 ControlPoint = ApplyRBF(RestControlPoint, SampleCount, RestSamplePositionsBuffer, MeshSampleWeightsBuffer);
+	return ControlPoint - SimDeformedOffset;
+#endif
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint VertexIndex = DispatchThreadId.x + DispatchThreadId.y * DispatchCountX * GROUP_SIZE;
+	if (VertexIndex < VertexCount)
+	{
+		const uint4  Data 				= SimRestPosePositionBuffer[VertexIndex];
+		const float3 ControlPoint		= f16tof32(Data.xyz);
+		const float3 DisplacedPosition	= DisplacePosition(VertexIndex, ControlPoint, IterationCount);
+		OutSimDeformedPositionBuffer[VertexIndex] = uint4(f32tof16(DisplacedPosition), Data.w);
+	}
+}

@@ -1,0 +1,178 @@
+#version 410
+/**
+  \file data-files/shader/FogVolumeSurface/FogVolumeSurface_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <reconstructFromDepth.glsl>
+
+#define HAS_LAMBERTIAN_TERM 1
+#define HAS_GLOSSY_TERM 1
+
+#include <LightingEnvironment/LightingEnvironment_uniforms.glsl>
+#include <Light/Light.glsl>
+
+const float maxBackgroundDistance = 60.0; // meters
+const float rayMarchStep = 0.12; // meters
+const float minRayMarchDistance = 7.0;
+
+const Color3 fogColor = Color3(0.1,0.6,0.95) * 0.2;
+//const Color3 fogColor = Color3(0.95);
+//const float coveragePerStep = 0.002;
+const float coveragePerStep = 0.012;
+
+// For constructing eye rays
+uniform mat4x3         cameraToWorldMatrix;
+uniform float          tanHalfFieldOfViewY;
+uniform float          projectionMatrix22, projectionMatrix23;
+const float nearPlaneZ = -1.0;
+
+// For reading back depth
+uniform sampler2D      depthBuffer;
+uniform vec3           clipInfo;
+
+// From https://www.shadertoy.com/view/4sf3D2
+float hash(vec2 p) {return fract(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3) * 1e3); }
+
+// This shader was written for research use only. 
+// It must be explicitly kept in sync with the writePixel implementation used
+// by the renderer, and only works in OIT mode, because it computes the
+// weights and output values itself.
+
+/** (Ar, Ag, Ab, Aa) */
+layout(location = 0) out float4 _accum;
+
+/** (Br, Bg, Bb, D^2) */
+layout(location = 1) out float4 _modulate;
+
+/** (deltax, deltay) */
+layout(location = 2) out float2 _refraction;
+
+Point3 project(Vector4 v) {
+    return v.xyz * (1.0 / v.w);
+}
+
+Radiance3 shade(Point3 wsPosition, Vector3 w_o) {
+    Radiance3 L_o = Radiance3(0);
+	
+#   for (int I = 0; I < NUM_LIGHTS; ++I)
+    {
+        Vector3 w_i = light$(I)_position.xyz - wsPosition;
+        float  lightDistance = length(w_i);
+        w_i /= lightDistance;
+
+        // Spot light falloff
+        float brightness = light$(I)_position.w * spotLightFalloff(w_i, light$(I)_direction, light$(I)_right, light$(I)_up, light$(I)_rectangular, light$(I)_attenuation.w, light$(I)_softnessConstant);
+
+        // Directional light has no falloff
+        brightness += 1.0 - light$(I)_position.w;
+
+        if (brightness > 0.0) {
+            brightness /= (4.0 * pi * dot(float3(1.0, lightDistance, lightDistance * lightDistance), light$(I)_attenuation.xyz));
+
+#           if defined(light$(I)_shadowMap_notNull)
+                // Compute projected shadow coord.
+                vec3 projShadowCoord = project(light$(I)_shadowMap_MVP * vec4(wsPosition, 1.0));
+                float visibility = texture(light$(I)_shadowMap_buffer, projShadowCoord);                
+                brightness *= visibility;
+#           endif
+
+            Biradiance3 B_i = brightness * light$(I)_color;
+
+            // Ad-hoc phase function:
+            // We use a cosine-power scattering function about w_i
+            // Wild guess about normalization factor.
+            const float k = 0.5;
+            Color3 brdf = mix(1.0 / pi, pow(max(-dot(w_i, w_o), 0.0), k * 50.0) * (k * 20.0 + 1.0) / (8.0 * pi), k) * fogColor; 
+
+            L_o += B_i * brdf;
+        } // in spotlight
+
+    } // for
+#   endfor
+
+    return L_o; 
+}
+
+void main() {
+    Radiance3 premultipliedReflectionAndEmission = Radiance3(1,0,0);
+    float coverage = 0.5;
+
+    Ray eyeRay = Ray(Point3(0, 0, 0),
+                     normalize(Vector3((gl_FragCoord.xy - g3d_FragCoordExtent.xy / 2.0) * Vector2(1, -1), 
+                                       g3d_FragCoordExtent.y / ( -2.0 * tanHalfFieldOfViewY))));
+    float csEyeRayDirectionZ = eyeRay.direction.z;
+
+    // Transform the ray to world space
+    eyeRay.direction = Matrix3(cameraToWorldMatrix) * eyeRay.direction;
+    eyeRay.origin    = cameraToWorldMatrix * vec4(eyeRay.origin, 1.0);
+
+    float backgroundDepth    = texelFetch(depthBuffer, ivec2(gl_FragCoord.xy), 0).r;
+    float backgroundZ        = reconstructCSZ(backgroundDepth, clipInfo);
+
+    // Along the ray
+    float backgroundDistance = min(backgroundZ / csEyeRayDirectionZ, maxBackgroundDistance);
+
+    // March from the camera (technically, we should march from the near plane) to the background
+    float backgroundVisibility = 1.0;
+
+    // premultipliedColor * weight
+    _accum.rgb = Color3(0);
+
+    // coverage * weight
+    _accum.a = 0;
+
+    Vector3 w_o = -eyeRay.direction;
+
+	Radiance3 environmentScatteredLight = Radiance3(0);
+    // Environment
+#   for (int i = 0; i < NUM_ENVIRONMENT_MAPS; ++i)
+    {
+        // Uniform evt component
+        // Sample the highest MIP-level to approximate Lambertian integration over the hemisphere
+        float3 ambientEvt = (textureLod(environmentMap$(i)_buffer, float3(1,1,1), 20).rgb + 
+                             textureLod(environmentMap$(i)_buffer, float3(-1,-1,-1), 20).rgb) * 0.5;
+
+        // Directional evt component from front
+        float3 directionalEvt = textureLod(environmentMap$(i)_buffer, w_o, 10).rgb;
+        environmentScatteredLight += (ambientEvt + directionalEvt) * 0.5 * environmentMap$(i)_readMultiplyFirst.rgb * fogColor;
+			//+= boostSaturation((ambientEvt + directionalEvt) * 0.5, environmentSaturationBoost) * environmentMap$(i)_readMultiplyFirst.rgb;
+    }
+#   endfor
+
+
+    for (float t = hash(gl_FragCoord.xy) * rayMarchStep + (nearPlaneZ - minRayMarchDistance) / csEyeRayDirectionZ; t < backgroundDistance; t += rayMarchStep) {
+        Point3 wsPoint = eyeRay.origin + eyeRay.direction * t;
+        float  csZ     = csEyeRayDirectionZ * t;
+
+        float weight;
+        {
+            // Compute what gl_FragCoord.z would be
+            float projectedZ = (projectionMatrix22 * csZ + projectionMatrix23) / -csZ;
+
+            // This is the DefaultRender's OIT weighting function
+            float tmp = 1.0 - projectedZ * 0.99;
+            weight = clamp(coverage * tmp * tmp * tmp * 1e3, 1e-2, 3e2 * 0.2);
+        }
+
+        _accum.rgb += (shade(wsPoint, w_o) + environmentScatteredLight) * coveragePerStep * weight;
+        _accum.a   += coveragePerStep * weight;
+        backgroundVisibility *= 1.0 - coveragePerStep;
+    }
+    
+    // net coverage of the fog volume
+    _modulate.rgb = Vector3(1.0 - backgroundVisibility);
+
+    // No diffusion
+    _modulate.a = 0.0;
+
+    // No refraction
+    _refraction = Vector2(0.0);
+}

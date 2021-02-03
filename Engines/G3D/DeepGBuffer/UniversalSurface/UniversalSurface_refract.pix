@@ -1,0 +1,68 @@
+#version 120 or 150 compatibility or 420 compatibility
+#include <compatibility.glsl>
+
+/** Image of the background plane */
+uniform sampler2D   background;
+uniform bool        backgroundInvertY;
+uniform float2      backgroundMinCoord, backgroundMaxCoord;
+
+/** Camera space z position of the background plane; Negative number */
+uniform float       backZ;
+
+uniform float       etaRatio;
+
+/** Camera space surface position */
+varying float3      csPos;
+
+/** Camera space normal (non-unit) */
+varying float3      csN_raw;
+
+uniform vec2        backSizeMeters;
+
+uniform sampler2D   lambertianMap;
+uniform vec4        lambertianConstant;
+
+/** Texture coordinate */
+varying float2      texCoord;
+
+bool totalInternalRefraction(in vec3 v) {
+    return dot(v, v) <= 0.01;
+}
+
+void main(void) {
+    // Surface normal, pointing away from csPos
+    float3 csN   = normalize(csN_raw);
+
+    // Incoming ray direction from eye, pointing away from csPos
+    float3 csw_i = normalize(-csPos);
+
+    // Refracted ray direction, pointing away from wsPos
+    float3 csw_o = refract(-csw_i, csN, etaRatio);
+
+    if (totalInternalRefraction(csw_o)) {
+        // No transmitted light
+        gl_FragColor.rgb = float3(0.0);
+    } else {
+        // Take to the reference frame of the background (i.e., offset 
+        float3 d = csw_o;
+
+        // Take to the reference frame of the background
+        float3 x = csPos;
+        x.z -= backZ; 
+
+        // Find the xy intersection with the plane z = 0
+        float2 hit = (x.xy - d.xy * x.z / d.z);
+
+        // Hit is now scaled in meters from the center of the screen; adjust scale and offset based 
+        // on the actual size of the background
+        float2 backCoord = (hit / backSizeMeters) + vec2(0.5);
+
+        if (backgroundInvertY) {
+            backCoord.y = 1.0 - backCoord.y;
+        }
+        
+        gl_FragColor.rgb = texture2D(background, clamp(backCoord, backgroundMinCoord, backgroundMaxCoord)).rgb;
+    }
+
+    gl_FragColor.a = texture2D(lambertianMap, texCoord).a * lambertianConstant.a;
+}

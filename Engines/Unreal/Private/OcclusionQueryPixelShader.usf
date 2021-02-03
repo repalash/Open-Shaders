@@ -1,0 +1,12 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	OcclusionQueryPixelShader.usf: Pixel shader for visualizing occlusion queries.
+=============================================================================*/
+
+#include "Common.ush"
+
+void Main(out float4 OutColor : SV_Target0)
+{
+	OutColor = float4(1, 0, 0, 1);
+}

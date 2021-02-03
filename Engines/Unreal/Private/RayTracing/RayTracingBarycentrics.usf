@@ -1,0 +1,47 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "RayTracingCommon.ush"
+
+RWTexture2D<float4> Output;
+RaytracingAccelerationStructure TLAS;
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingBarycentricsMainRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin;
+
+	float2 RenderTargetUV = (float2(PixelCoord) + .5f) * View.BufferSizeAndInvSize.zw;
+
+	RayDesc Ray = CreatePrimaryRay(RenderTargetUV);
+	uint RayFlags = 0
+	              | RAY_FLAG_CULL_BACK_FACING_TRIANGLES      // use back face culling
+	              | RAY_FLAG_FORCE_OPAQUE;                   // don't run anyhit shader
+
+	FDefaultPayload Payload = (FDefaultPayload)0;
+
+	TraceRay(
+		TLAS,   // AccelerationStructure
+		RayFlags,
+		RAY_TRACING_MASK_ALL,             // InstanceInclusionMask
+		RAY_TRACING_SHADER_SLOT_MATERIAL, // RayContributionToHitGroupIndex
+		RAY_TRACING_NUM_SHADER_SLOTS,     // MultiplierForGeometryContributionToShaderIndex
+		0,      // MissShaderIndex
+		Ray,    // RayDesc
+		Payload // Payload
+	);
+
+	float4 Result = float4(0, 0, 0, 1);
+	if (Payload.IsHit())
+	{
+		Result = float4(Payload.Barycentrics, 1.0f - Payload.Barycentrics.x - Payload.Barycentrics.y, 1.0f);
+	}
+	Output[PixelCoord] = Result;
+}
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(RayTracingBarycentricsMainCHS,
+	FDefaultPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+	Payload.Barycentrics = Attributes.Barycentrics;
+	Payload.HitT = RayTCurrent();
+}

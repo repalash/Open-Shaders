@@ -1,0 +1,23 @@
+#version 410
+/**
+  \file data-files/shader/PointSurface/PointSurface_depthOnly.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+in Point3       position;
+
+// in meters
+uniform float   pointRadius;
+
+void main() {
+    vec4 vertex = vec4(position, 1.0);
+
+    gl_Position = vertex * g3d_ObjectToScreenMatrixTranspose;
+
+    // Magic constant in here should be based on resolution
+    gl_PointSize = sqrt(1 << LOD) * pointRadius * 1100.0 / max((-(g3d_ObjectToCameraMatrix * vertex).z), 0.01);    
+}

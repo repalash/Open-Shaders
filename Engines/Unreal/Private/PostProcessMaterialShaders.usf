@@ -1,0 +1,408 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessMaterialShaders.usf: Shaders for rendering post process materials
+=============================================================================*/
+
+#include "Common.ush"
+#include "ScreenPass.ush"
+
+#ifndef POST_PROCESS_MATERIAL
+#define POST_PROCESS_MATERIAL 0
+#endif
+
+#ifndef POST_PROCESS_MATERIAL_MOBILE
+#define POST_PROCESS_MATERIAL_MOBILE 0
+#endif
+
+#if (POST_PROCESS_MATERIAL == 0)
+#error POST_PROCESS_MATERIAL must be defined to non-zero in the shader compilation environment.
+#endif
+
+#if (FEATURE_LEVEL <= FEATURE_LEVEL_ES3_1) != POST_PROCESS_MATERIAL_MOBILE
+#error POST_PROCESS_MATERIAL_MOBILE define does not match feature level.
+#endif
+
+// Must match ESceneTextureId
+#define PPI_PostProcessInput0 14
+#define PPI_PostProcessInput1 15
+#define PPI_PostProcessInput2 16
+#define PPI_PostProcessInput3 17
+#define PPI_PostProcessInput4 18
+
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessInput_0) 
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessInput_1)
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessInput_2)
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessInput_3)
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessInput_4)
+SCREEN_PASS_TEXTURE_VIEWPORT(PostProcessOutput)
+
+Texture2D PostProcessInput_0_Texture;
+Texture2D PostProcessInput_1_Texture;
+Texture2D PostProcessInput_2_Texture;
+Texture2D PostProcessInput_3_Texture;
+Texture2D PostProcessInput_4_Texture;
+
+SamplerState PostProcessInput_0_Sampler;
+SamplerState PostProcessInput_1_Sampler;
+SamplerState PostProcessInput_2_Sampler;
+SamplerState PostProcessInput_3_Sampler;
+SamplerState PostProcessInput_4_Sampler;
+SamplerState PostProcessInput_BilinearSampler;
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+	#define PostProcessInput_0_SharedSampler PostProcessInput_0_Sampler
+	#define PostProcessInput_1_SharedSampler PostProcessInput_0_Sampler
+	#define PostProcessInput_2_SharedSampler PostProcessInput_0_Sampler
+	#define PostProcessInput_3_SharedSampler PostProcessInput_0_Sampler
+	#define PostProcessInput_4_SharedSampler PostProcessInput_0_Sampler
+#else
+	#define PostProcessInput_0_SharedSampler PostProcessInput_0_Sampler
+	#define PostProcessInput_1_SharedSampler PostProcessInput_1_Sampler
+	#define PostProcessInput_2_SharedSampler PostProcessInput_2_Sampler
+	#define PostProcessInput_3_SharedSampler PostProcessInput_3_Sampler
+	#define PostProcessInput_4_SharedSampler PostProcessInput_4_Sampler
+#endif
+
+#define EYE_ADAPTATION_LOOSE_PARAMETERS 1
+
+#include "/Engine/Generated/Material.ush"
+
+struct FPostProcessMaterialVSToPS
+{
+	float4 Position : SV_POSITION;
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	float4 TexCoords[(NUM_TEX_COORD_INTERPOLATORS+1)/2] : TEXCOORD0;
+#endif
+};
+
+#if NUM_TEX_COORD_INTERPOLATORS
+float2 GetUV(FPostProcessMaterialVSToPS Interpolants, int UVIndex)
+{
+	float4 UVVector = Interpolants.TexCoords[UVIndex / 2];
+	return Mod(UVIndex, 2) == 1 ? UVVector.zw : UVVector.xy;
+}
+
+void SetUV(inout FPostProcessMaterialVSToPS Interpolants, int UVIndex, float2 InValue)
+{
+	FLATTEN
+	if (Mod(UVIndex, 2) == 1)
+	{
+		Interpolants.TexCoords[UVIndex / 2].zw = InValue;
+	}
+	else
+	{
+		Interpolants.TexCoords[UVIndex / 2].xy = InValue;
+	}
+}
+#endif
+
+FMaterialVertexParameters GetPostProcessMaterialVSParameters(float2 UV)
+{
+	// Most params irrelevant so not a lot to fill out here
+	FMaterialVertexParameters Result = (FMaterialVertexParameters)0;
+	Result.VertexColor = 1.f.xxxx;
+	Result.WorldPosition = float3(UV, 0.f); 
+	
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; CoordinateIndex++)
+	{
+		Result.TexCoords[CoordinateIndex] = UV;
+	}
+#endif
+
+	return Result;
+}
+
+#if (FEATURE_LEVEL > FEATURE_LEVEL_ES3_1)
+
+#if VERTEXSHADER
+
+void MainVS(
+	in float4 InPosition : ATTRIBUTE0,
+	out FPostProcessMaterialVSToPS Output
+	)
+{
+	Output = (FPostProcessMaterialVSToPS)0;
+	DrawRectangle(InPosition, Output.Position);
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	FMaterialVertexParameters VertexParameters = GetPostProcessMaterialVSParameters(InPosition.xy);
+	 
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
+	GetCustomInterpolators(VertexParameters, CustomizedUVs);
+	
+	{
+		UNROLL
+		for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS; CoordinateIndex++)
+		{
+			SetUV(Output, CoordinateIndex, InPosition.xy);
+		}
+	}
+	{
+		UNROLL
+		for (int CoordinateIndex = NUM_MATERIAL_TEXCOORDS; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+		{
+			SetUV(Output, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
+		}
+	}
+#endif
+}
+
+void MainVS_VideoOverlay(
+	in float4 InPosition : ATTRIBUTE0,
+	in float2 InTexCoord : ATTRIBUTE1,
+	out float2 OutUV : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION
+	)
+{
+	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUV);
+}
+
+#elif PIXELSHADER
+
+void MainPS(
+	in FPostProcessMaterialVSToPS Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+	ResolvedView = ResolveView();
+	FMaterialPixelParameters Parameters = MakeInitializedMaterialPixelParameters();
+	FPixelMaterialInputs PixelMaterialInputs;
+
+	// can be optimized
+	float4 SvPosition = Input.Position;
+	float2 ViewportUV = (SvPosition.xy - PostProcessOutput_ViewportMin.xy) * PostProcessOutput_ViewportSizeInverse.xy;
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	{
+		UNROLL
+		for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS; CoordinateIndex++)
+		{
+			Parameters.TexCoords[CoordinateIndex] = ViewportUV;
+		}
+	}
+	{
+		UNROLL
+		for (int CoordinateIndex = NUM_MATERIAL_TEXCOORDS; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+		{
+			Parameters.TexCoords[CoordinateIndex] = GetUV(Input, CoordinateIndex);
+		}
+	}
+#endif
+
+	Parameters.VertexColor = 1;
+	
+	SvPosition.z = LookupDeviceZ(ViewportUVToBufferUV(ViewportUV));
+	SvPosition.z = max(SvPosition.z, 1e-18);
+
+	// fill out other related material parameters
+	CalcMaterialParametersPost(Parameters, PixelMaterialInputs, SvPosition, true);
+
+	// Grab emissive colour as output
+#if MATERIAL_OUTPUT_OPACITY_AS_ALPHA
+	const float Alpha = GetMaterialOpacity(PixelMaterialInputs);
+#else
+	const float Alpha = 1.0f;
+#endif
+	OutColor = float4(GetMaterialEmissive(PixelMaterialInputs), Alpha );
+
+#if !MATERIALBLENDING_MODULATE && USE_PREEXPOSURE && POST_PROCESS_MATERIAL_BEFORE_TONEMAP
+	OutColor.xyz *= View.PreExposure;
+#endif
+} 
+
+void MainPS_VideoOverlay(
+	in float2 InUV : TEXCOORD0,
+	in float4 SvPosition : SV_Position,		// after all interpolators
+	out float4 OutColor : SV_Target0
+	)
+{
+	ResolvedView = ResolveView();
+	FMaterialPixelParameters Parameters = MakeInitializedMaterialPixelParameters();
+	FPixelMaterialInputs PixelMaterialInputs;
+
+	float2 ViewportUV = InUV;
+
+#if NUM_MATERIAL_TEXCOORDS
+	for(int CoordinateIndex = 0;CoordinateIndex < NUM_MATERIAL_TEXCOORDS;CoordinateIndex++)
+	{
+		Parameters.TexCoords[CoordinateIndex] = ViewportUV;
+	}
+#endif
+
+	Parameters.VertexColor = 1;
+
+	SvPosition.z = LookupDeviceZ(ViewportUVToBufferUV(ViewportUV));
+	SvPosition.z = max(SvPosition.z, 1e-18);
+
+	// fill out other related material parameters
+	CalcMaterialParametersPost(Parameters, PixelMaterialInputs, SvPosition, true);
+
+	// Grab emissive colour as output
+#if MATERIAL_OUTPUT_OPACITY_AS_ALPHA
+	const float Alpha = GetMaterialOpacity(PixelMaterialInputs);
+#else
+	const float Alpha = 1.0f;
+#endif
+	OutColor = float4(GetMaterialEmissive(PixelMaterialInputs), Alpha );
+}
+
+#else // !VERTEXSHADER && !PIXELSHADER
+#error Wrong shader domain.
+
+#endif
+
+#else // FEATURE_LEVEL_ES3_1
+
+Texture2D MobileCustomStencilTexture;
+SamplerState MobileCustomStencilTextureSampler;
+
+int MobileStencilValueRef; // Use integer cause it has to be negative to make the less function to pass the test as always
+
+uint bFlipYAxis;
+
+//
+// Mobile version
+//
+void MainVS(
+	in float4 InPosition : ATTRIBUTE0,
+	in float2 InTexCoord : ATTRIBUTE1,
+	out FPostProcessMaterialVSToPS Output
+	)
+{
+	Output = (FPostProcessMaterialVSToPS)0;
+	float2 OutUV;
+	DrawRectangle(InPosition, InTexCoord, Output.Position, OutUV);
+			
+#if NUM_TEX_COORD_INTERPOLATORS
+	FMaterialVertexParameters VertexParameters = GetPostProcessMaterialVSParameters(InPosition.xy);
+
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
+	GetCustomInterpolators(VertexParameters, CustomizedUVs);
+
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS; CoordinateIndex++)
+	{
+	#if POST_PROCESS_AR_PASSTHROUGH
+		SetUV(Output, CoordinateIndex, OutUV);
+	#else
+		SetUV(Output, CoordinateIndex, InPosition.xy);
+	#endif
+	}
+	UNROLL
+	for (int CoordinateIndex = NUM_MATERIAL_TEXCOORDS; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+	{
+		SetUV(Output, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
+	}
+#endif
+}
+
+#define MOBILE_STENCIL_COMPARE_LESS				0
+#define MOBILE_STENCIL_COMPARE_LESSEQUAL		1
+#define MOBILE_STENCIL_COMPARE_GREATE			2
+#define MOBILE_STENCIL_COMPARE_GREATEEQUAL		3
+#define MOBILE_STENCIL_COMPARE_EQUAL			4
+#define MOBILE_STENCIL_COMPARE_NOTEQUAL			5
+#define MOBILE_STENCIL_COMPARE_NEVER			6
+#define MOBILE_STENCIL_COMPARE_ALWAYS			7
+
+#ifndef MOBILE_STENCIL_COMPARE_FUNCTION
+#define MOBILE_STENCIL_COMPARE_FUNCTION MOBILE_STENCIL_COMPARE_NEVER
+#endif
+
+void MainPS(
+	in FPostProcessMaterialVSToPS Input,
+	out half4 OutColor : SV_Target0
+	)
+{
+	ResolvedView = ResolveView();
+	FMaterialPixelParameters Parameters = MakeInitializedMaterialPixelParameters();
+	FPixelMaterialInputs PixelMaterialInputs;
+
+	// can be optimized
+	float4 SvPosition = Input.Position;
+	if (bFlipYAxis)
+	{
+		SvPosition.y = PostProcessOutput_ViewportSize.y - SvPosition.y;
+	}
+	float2 ViewportUV = (SvPosition - PostProcessOutput_ViewportMin) * PostProcessOutput_ViewportSizeInverse;
+	float2 BufferUV = ViewportUVToBufferUV(ViewportUV);
+	
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS; CoordinateIndex++)
+	{
+	#if POST_PROCESS_AR_PASSTHROUGH
+		Parameters.TexCoords[CoordinateIndex] = GetUV(Input, CoordinateIndex);
+	#else
+		Parameters.TexCoords[CoordinateIndex] = ViewportUV;
+	#endif
+	}
+	UNROLL
+	for (int CoordinateIndex = NUM_MATERIAL_TEXCOORDS; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++)
+	{
+		Parameters.TexCoords[CoordinateIndex] = GetUV(Input, CoordinateIndex);
+	}
+#endif
+	Parameters.VertexColor = 1;
+		
+	float ClipValue = 1.0f;
+
+#if MOBILE_STENCIL_COMPARE_FUNCTION != MOBILE_STENCIL_COMPARE_NEVER && MOBILE_STENCIL_COMPARE_FUNCTION != MOBILE_STENCIL_COMPARE_ALWAYS
+	int MobileStencilValue = floor(Texture2DSample(MobileCustomStencilTexture, MobileCustomStencilTextureSampler, BufferUV).r*255.0f + 0.5f);
+#endif
+
+#if MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_LESS
+	ClipValue = MobileStencilValueRef < MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_LESSEQUAL
+	ClipValue = MobileStencilValueRef <= MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_GREATE
+	ClipValue = MobileStencilValueRef > MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_GREATEEQUAL
+	ClipValue = MobileStencilValueRef >= MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_EQUAL
+	ClipValue = MobileStencilValueRef == MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_NOTEQUAL
+	ClipValue = MobileStencilValueRef != MobileStencilValue ? 1.0f : -1.0f;
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_NEVER
+#elif MOBILE_STENCIL_COMPARE_FUNCTION == MOBILE_STENCIL_COMPARE_ALWAYS
+	ClipValue = MobileStencilValueRef == 256 ? 1.0f : -1.0f;
+#endif
+
+#if MOBILE_STENCIL_COMPARE_FUNCTION != MOBILE_STENCIL_COMPARE_NEVER
+	clip(ClipValue);
+#endif
+
+	float DeviceZ = LookupDeviceZ(BufferUV);
+	SvPosition.z = DeviceZ;
+	SvPosition.z = max(SvPosition.z, 1e-18);
+	// fill out other related material parameters
+	CalcMaterialParametersPost(Parameters, PixelMaterialInputs, SvPosition, true);
+
+	// Grab emissive colour as output
+	half3 EmissiveColor = GetMaterialEmissive(PixelMaterialInputs);
+	
+#if MATERIAL_OUTPUT_OPACITY_AS_ALPHA
+	half Alpha = GetMaterialOpacity(PixelMaterialInputs);
+#else
+	half Alpha = Parameters.BackupSceneColorAlpha;
+#endif
+	half4 FullSceneColor = half4(EmissiveColor, Alpha);
+	   
+#if POST_PROCESS_MATERIAL_BEFORE_TONEMAP
+#if OUTPUT_GAMMA_SPACE
+	FullSceneColor.rgb = sqrt(FullSceneColor.rgb);
+#endif
+
+#if !MATERIALBLENDING_MODULATE && USE_PREEXPOSURE
+	FullSceneColor.xyz *= View.PreExposure;
+#endif
+#endif
+	OutColor = FullSceneColor;
+}
+#endif //(FEATURE_LEVEL > FEATURE_LEVEL_ES3_1)

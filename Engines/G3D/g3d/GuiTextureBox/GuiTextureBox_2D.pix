@@ -1,0 +1,127 @@
+#version 410
+/**
+  \file data-files/shader/GuiTextureBox/GuiTextureBox_2D.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <Texture/Texture.glsl>
+#include <GuiTextureBox/GuiTextureBox_Arrows.glsl>
+
+#expect SAMPLER_TYPE "gsamplerXX"
+
+uniform_Texture(SAMPLER_TYPE, tex_);
+
+#if IS_GL_TEXTURE_RECTANGLE == 1
+#   extension GL_ARB_texture_rectangle : enable
+#else
+#   if IS_ARRAY || IS_3D
+#       expect LAYER
+#   endif
+#endif
+uniform float     adjustGamma;
+uniform mat4      colorShift;
+uniform float     bias;
+uniform float     scale;
+uniform bool      invertIntensity;
+uniform float     mipLevel;
+uniform bool      mod1;
+uniform bool      showMotionFlow;
+uniform float     motionVectorSpacing;
+uniform float     motionVectorScale;
+
+in vec2 g3d_TexCoord;
+
+out vec4 result;
+
+/** Does a matrix multiplication, letting zero * inf = zero so that we 
+    can swizzle with a matrix */
+vec4 matMulNoNan(mat4 M, vec4 v) {
+    vec4 x;
+    for (int i = 0; i < 4; ++i) {
+        float sum = 0.0;
+        for (int j = 0; j < 4; ++j) {
+            float c = M[j][i];
+            if (c != 0) {
+                sum += c * v[j];
+            }
+        }
+        x[i] = sum;
+    }
+    return x;
+}
+
+
+void main(void) {
+#if DRAW_INVERTED == 1
+    vec2 coords = vec2(g3d_TexCoord.x, 1 - g3d_TexCoord.y);
+#else
+    vec2 coords = g3d_TexCoord.xy;
+#endif
+
+#if IS_GL_TEXTURE_RECTANGLE == 1
+    vec4 c = texture2DRect(tex_buffer, vec2(coords.xy * tex_size.xy - vec2(0.5)));
+#else
+#   if IS_ARRAY || IS_3D  
+#       if IS_ARRAY
+            float zCoord = LAYER;
+#       else
+            float zCoord = (LAYER + 0.5)*tex_invSize.z; 
+#       endif
+        vec4 c = textureLod(tex_buffer, vec3(coords.xy, zCoord), mipLevel);
+#   else
+        vec4 c = textureLod(tex_buffer, coords.xy, mipLevel);
+#   endif
+    
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////
+	// Visualization recoloring
+    c = (c + bias) * scale;
+    c = invertIntensity ? vec4(1.0 - c) : c;
+    c = matMulNoNan(colorShift, c);
+    c = max(c, vec4(0.0));
+
+    if (mod1) {
+        // Handle positive and negative numbers.
+        // The GLSL specification indicates that
+        // mod(c, 1) should be sufficient, but not
+        // all drivers comply
+        c = mod(mod(c, 1.0) + 1.0, 1.0);
+    }
+	////////////////////////////////////////////////////////////////////////////////////
+
+	if (showMotionFlow) {
+		// Scale the coordinates with the output size, so that they are uniform density regardless of zoom
+		// level
+        vec2 fragCoord = coords * g3d_FragCoordExtent;
+		vec2 arrowCenter = arrowTileCenterCoord(fragCoord, motionVectorSpacing);
+
+#if IS_GL_TEXTURE_RECTANGLE == 1
+        vec2 vector = texture2DRect(tex_buffer, vec2((arrowCenter / g3d_FragCoordExtent) * tex_size.xy - vec2(0.5))).xy * tex_readMultiplyFirst.xy + tex_readAddSecond.xy;
+#else
+#   if IS_ARRAY || IS_3D  
+#       if IS_ARRAY
+        float zCoord = LAYER;
+#       else
+        float zCoord = (LAYER + 0.5) * tex_invSize.z;
+#       endif
+        vec2 vector = textureLod(tex_buffer, vec3(arrowCenter / g3d_FragCoordExtent, zCoord), mipLevel).xy * tex_readMultiplyFirst.xy + tex_readAddSecond.xy;
+#   else
+        vec2 vector = textureLod(tex_buffer, arrowCenter / g3d_FragCoordExtent, mipLevel).xy * tex_readMultiplyFirst.xy + tex_readAddSecond.xy;
+#   endif
+#endif
+		// Read the direction at the center (ignoring the value under *this* pixel
+        vector *= motionVectorScale * motionVectorSpacing;
+
+		float alpha = arrowAlpha(fragCoord - arrowCenter, vector, motionVectorSpacing);
+		// Make everything relative to the center, which may be fractional
+		c = lerp(c, vec4(ARROW_COLOR, 1), alpha);
+   }
+
+    result.rgb = pow(c.rgb, vec3(adjustGamma));
+    result.a = 1.0;
+}

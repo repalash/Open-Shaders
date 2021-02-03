@@ -1,0 +1,133 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_buildInit.glc
+
+  Computes (countBuffer[endIndex] - countBuffer[startIndex]) and then uses that
+  to produce the indirect buffer for dispatch/draw indirect calls.  If startIndex < 0,
+  considers countBuffer[startIndex] to be zero.
+
+  Requires BUFFER_WIDTH to be set to choose grid dimensions.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#extension GL_NV_gpu_shader5 : require
+#extension GL_NV_shader_thread_group : require
+
+
+#include <SVO/SVO_util.glsl>
+
+#include <SVO/SVO.glsl>
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+uniform bool	resetPoolAllocation;
+uniform int		curSvoId;
+uniform uint	topDenseTreeNumNodes;
+
+
+//coherent volatile uniform uint			*d_rootIndexBuffer;	//New
+//coherent volatile uniform uint			*d_childIndexBuffer;
+//coherent volatile uniform uint			*d_parentIndexBuffer;
+
+
+/** Number of nodes allocated; indices are number * 8 */
+coherent volatile uniform uint			*d_numberOfAllocatedNodes;
+
+coherent volatile uniform uint			*d_levelStartIndexBuffer;
+coherent volatile uniform uint			*d_levelIndexBuffer;
+
+
+coherent volatile uniform uint			*d_dispatchIndirectLevelBuffer;
+
+void main() {
+	if(gl_LocalInvocationIndex == 0){
+
+		if(resetPoolAllocation)
+		{
+			(*d_numberOfAllocatedNodes) = 0;
+		}
+		memoryBarrier();
+
+		////////////////////////////
+
+		//Allocate root block
+		uint curBlockIdx = atomicAdd(d_numberOfAllocatedNodes, 1);
+
+
+		uint startIndex = curBlockIdx*8;			//Tree start index
+
+		d_levelStartIndexBuffer[0] = curBlockIdx*8;
+
+
+		//Allocate l1 block
+		curBlockIdx = atomicAdd(d_numberOfAllocatedNodes, 1);
+
+		//d_rootIndexBuffer[curSvoId] = curBlockIdx*8;			//Root block location (2x2x2,level 1)
+		svoSetRootLocation(curSvoId, curBlockIdx*8, 0);
+		svoSetRootLocation(curSvoId, curBlockIdx*8, 1);			//Set both level 0 and 1 for backward compatibility
+
+		d_levelIndexBuffer[0] = curBlockIdx*8;					//End offset level 0 : 8
+		d_levelStartIndexBuffer[1] = curBlockIdx*8;				//Start of level 1 : 8
+
+		
+		//curBlockIdx = atomicAdd(d_numberOfAllocatedNodes, 1);	//Alloc level 2	
+		curBlockIdx++;
+		d_levelIndexBuffer[1] = curBlockIdx*8;					//End offset level 1 : 16
+		d_levelStartIndexBuffer[2] = curBlockIdx*8;				//Start of level 2 : 16
+
+		d_levelIndexBuffer[2] = curBlockIdx*8;					//End offset level 2 : 16 (zero elements level)
+
+		//Clear octree pointers
+		for (int i = 0; i <16 ; ++i) {
+			d_childIndexBuffer[startIndex+ i] = 0;
+			d_parentIndexBuffer[startIndex+ i] = 0;
+		}
+
+#if SVO_USE_TOP_DENSE ==0
+		const int unallocatedNodesStart = 3;
+
+		//Clear the rest
+		for (int i = unallocatedNodesStart; i <SVO_MAX_NUM_LEVELS ; ++i) {
+			d_levelStartIndexBuffer[i]	= 0;
+			d_levelIndexBuffer[i]		= 0;
+		}
+#else
+
+		memoryBarrier();
+
+		//d_rootIndexBuffer[curSvoId + 1*SVO_MAX_NUM_VOLUMES] = curBlockIdx*8;		//Todo invert svoID and levels to make level access cache coherent per-svo
+		
+		const int unallocatedNodesStart = 2;
+
+		for (int l = unallocatedNodesStart; l <SVO_TOP_MIPMAP_NUM_LEVELS ; ++l) {
+
+			uint levelNumBlocks = uint( svoTopDenseTreeGetLevelNumBlocks(l) );
+			curBlockIdx = atomicAdd(d_numberOfAllocatedNodes, levelNumBlocks);		//Allocate this level
+
+
+			d_levelStartIndexBuffer[l] = curBlockIdx*8;								//Start of level 2 : 16
+
+			d_levelIndexBuffer[l] = (curBlockIdx + levelNumBlocks)*8;				//End offset level 2 : 80
+
+			svoSetRootLocation(curSvoId, curBlockIdx*8, l);
+
+		}
+#endif
+
+		// Set the initial grid to 8x1x1 to process the root's 8 pointers
+		//GLPixelTransferBuffer::copy(m_eightOneOneTwo->buffer(), m_dispatchIndirectLevelBuffer->buffer(), 3);
+		//GLPixelTransferBuffer::copy(m_eightOneOneTwo->buffer(), m_dispatchIndirectLevelBuffer->buffer(), 1, 0, 3);	//Set 4th element to 8
+
+		d_dispatchIndirectLevelBuffer[0] = 8;
+		d_dispatchIndirectLevelBuffer[1] = 1;
+		d_dispatchIndirectLevelBuffer[2] = 1;
+		d_dispatchIndirectLevelBuffer[3] = 8;
+
+
+	}
+	
+}

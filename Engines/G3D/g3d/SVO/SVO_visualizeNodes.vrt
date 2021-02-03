@@ -1,0 +1,87 @@
+#version 420
+/**
+  \file data-files/shader/SVO/SVO_visualizeNodes.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#extension GL_NV_gpu_shader5 : enable
+#extension GL_EXT_shader_image_load_store : enable
+#extension GL_EXT_bindable_uniform : enable
+#extension GL_NV_shader_buffer_load : enable
+
+/** Level to render */
+uniform int             level;
+
+/** Width of the oct tree */
+uniform float           scale;
+
+/** True if this node or one of its parents does not exist */
+out int                 discardThisNode;
+
+out float               radius;
+out vec3				voxColor;
+
+#include <SVO/SVO.glsl>
+
+void main() {
+
+
+#if 0
+	// Current node (initially the root)
+    int nodeIndex = svoGetRootLocation(SVO_CUR_SVO_ID);
+
+	// We begin at the center of a unit cube
+    vec3  pos = vec3(0.5, 0.5, 0.5) * scale;
+    radius = scale * 0.5;
+
+    // Traverse the tree
+    for (int curLevel = 0; (nodeIndex != NULL) && (nodeIndex != 0xFFFFFFFFU) && (curLevel < level); ++curLevel) {
+        // Every three bits describe one level, where the LSB are level 0 in the form (zyx)
+        int offset = (gl_VertexID >> (curLevel * 3)) & 7;
+ 
+        // Move the center following the bits
+        vec3 step = vec3(float(offset & 1), float((offset >> 1) & 1), float((offset >> 2) & 1)) - 0.5;
+        pos += step * radius;
+        radius *= 0.5;
+
+        // Advance into the child
+        nodeIndex = int(imageLoad(childIndexBuffer, offset + nodeIndex).r);
+    }
+
+	// nodeIndex is now either NULL or the index of  the block of the children of the
+    // node that we wanted is stored.
+    discardThisNode = int(nodeIndex == NULL /*|| nodeIndex==0xFFFFFFFFU*/);
+#else
+	//Bottom-up coordinates calculation
+
+	vec3  pos = vec3(0.0);
+	pos = svoGetPositionFromLevelIndex( level, gl_VertexID );
+
+	radius = 0.5f/float(1<<level);
+
+	if( imageLoad(childIndexBuffer, gl_VertexID ).r != 0 ){
+		discardThisNode=0;
+	} else {
+		discardThisNode=1;
+	}
+
+	ivec3 gbufferCoords=svoGBufferCoordsFromNodeIdx(gl_VertexID, ivec3(0));
+	
+# if defined (GBUFFER_CHANNEL_svo_WS_NORMAL)
+	vec4  voxCol=texelFetch( GBUFFER_TEX(svo, WS_NORMAL), GBUFFER_COORDS(svo, gbufferCoords), 0).rgba;
+	voxColor = voxCol.aaa;
+	//voxColor = vec3(gbufferCoords)/4096.0f;
+# else
+	voxColor = pos;
+# endif
+
+#endif
+
+    
+
+    gl_Position = vec4(pos, 1);
+}

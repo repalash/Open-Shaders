@@ -1,0 +1,224 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+float3 DecodeVelocityFromTexture(float4 In);
+#include "HairStrandsVisibilityCommon.ush" 
+
+// Note: Culled cluster is disabled as the input to the vertex factory from HairStrandsMaterialPS or HairStrandsMaterialGBufferPS 
+// are alredy culled vertex (coming from the visibility buffer). By disabling the cluster within this material pass, we insure that 
+// the provided primitive ID will be used for feteching attrinbute, rather than the one for conmputing the indirect ID 
+// 
+// This is required as the hair strands vertex factory enabled culled cluster by default (to support shadow & hit proxy shader for 
+// which we can't provide custom defines)
+#define USE_CULLED_CLUSTER 0
+
+#define USE_FORCE_TEXTURE_MIP 1
+#define FORCED_TEXTURE_MIP 0.0f
+#include "../Common.ush"
+
+#include "../SceneTexturesCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../VelocityCommon.ush"
+
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush" 
+
+#define SUPPORT_MATERIAL_PROPERTY 1
+uint MaterialPass_MacroGroupId;
+uint MaterialPass_MaterialId;  
+uint MaterialPass_PrimitiveId;
+uint MaterialPass_LightChannelMask;
+
+#ifndef HAIR_MATERIAL_DEBUG_OUTPUT
+#define HAIR_MATERIAL_DEBUG_OUTPUT 0
+#endif
+
+#if VF_STRAND_HAIR
+struct FEvaluateOutput
+{
+	FHairSample NodeData;
+	float2 NodeVelocity;
+};
+
+struct FHairVertexData
+{
+	float3 World_P;
+	float3 World_P_Prev;
+	float  Radius;
+	bool   bIsValid;
+};
+
+FVertexFactoryInterpolantsVSToPS GetInterpolants(uint PrimitiveId, uint HairPrimitiveId, inout FHairVertexData OutHairVertex)
+{
+	FMaterialVertexParameters Empty = (FMaterialVertexParameters)0;
+
+	FVertexFactoryInput Input;
+	Input.PrimitiveId = PrimitiveId;
+	Input.VertexId = HairPrimitiveId * 6; // 6: the vertex factory expect triangles list index. A quad is made of two triangles with indices: 0,1,2,3,4,5.
+
+	FVertexFactoryIntermediates	Intermediates = GetVertexFactoryIntermediates(Input);
+	FVertexFactoryInterpolantsVSToPS Interpolants = VertexFactoryGetInterpolantsVSToPS(Input, Intermediates, Empty);
+
+	OutHairVertex.World_P = VertexFactoryGetWorldPositionRaw(Input, Intermediates, false).xyz;
+	OutHairVertex.World_P_Prev = VertexFactoryGetPreviousWorldPosition(Input, Intermediates, false).xyz;
+
+	const FHairControlPoint ControlPoint = GetVertexPosition(Input, false);
+	OutHairVertex.Radius = ControlPoint.WorldRadius;
+	OutHairVertex.bIsValid = ControlPoint.Type != HAIR_CONTROLPOINT_END;
+
+	return Interpolants;
+}
+
+FEvaluateOutput Evaluate(
+	in float2 SamplePixelCoord,
+	in float SampleDepth,
+	in uint SamplePrimitiveId,
+	in uint SampleCoverage8bit,
+	in uint PrimitiveId,
+	in bool bUpdateSampleCoverage)
+{
+	// World_P / World_P0 / World_P1 are in translated world space
+	const float SceneDepth = ConvertFromDeviceZ(SampleDepth);
+	const float2 UV = SamplePixelCoord / float2(View.BufferSizeAndInvSize.xy);
+	const float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	const float3 World_P = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+
+	float3 Velocity_World_P;
+	float3 Velocity_World_P_Prev;
+	float U = 0;
+	float WorldStrandRadius = 0;
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+	{
+		const uint HairPrimitiveId0 = SamplePrimitiveId;
+		const uint HairPrimitiveId1 = HairPrimitiveId0 + 1; //TODO: min(HairPrimitiveId0 + 1, MaxVertexCount-1);
+
+		FHairVertexData Vertex0;
+		FHairVertexData Vertex1;
+
+		FVertexFactoryInterpolantsVSToPS Interpolants0 = GetInterpolants(PrimitiveId, HairPrimitiveId0, Vertex0);
+		FVertexFactoryInterpolantsVSToPS Interpolants1 = GetInterpolants(PrimitiveId, HairPrimitiveId1, Vertex1);
+
+		Interpolants = Interpolants0;
+
+		// Compute U
+		// Use the projection of the current sample point onto the hair segment (which is in the middle of the hair strands)
+		const float3 A = (World_P  - Vertex0.World_P);
+		const float3 B = (Vertex1.World_P - Vertex0.World_P);
+		const float CosA = dot(A, B);
+		const float LengthB2 = dot(B, B);
+		const float SegmentU = LengthB2 > 0 ? saturate(CosA / LengthB2) : 0;
+
+		// Compute V
+		float SegmentV = 0.5f;
+		{
+			const float3 W = cross(A, B);
+			const bool bIsRight = dot(W, View.ViewForward) < 0;
+			const float WorldV	= length(A - B * SegmentU);
+			WorldStrandRadius	= lerp(Vertex0.Radius, Vertex1.Radius, SegmentU);
+			SegmentV = WorldV / WorldStrandRadius;
+			SegmentV = bIsRight ? SegmentV * 0.5f + 0.5f : (1 - SegmentV) * 0.5f;
+		}
+
+		Velocity_World_P	  = lerp(Vertex0.World_P, Vertex1.World_P, SegmentU);
+		Velocity_World_P_Prev = lerp(Vertex0.World_P_Prev, Vertex1.World_P_Prev, SegmentU);
+
+		Interpolants.TangentToWorld0 = lerp(Interpolants0.TangentToWorld0, Interpolants1.TangentToWorld0, SegmentU);
+		Interpolants.TangentToWorld2 = lerp(Interpolants0.TangentToWorld2, Interpolants1.TangentToWorld2, SegmentU);
+
+		Interpolants.TangentToWorld0 = normalize(Interpolants.TangentToWorld0);
+		Interpolants.TangentToWorld2 = normalize(Interpolants.TangentToWorld2);
+
+		Interpolants.PrimitiveId	 = PrimitiveId;
+		Interpolants.HairPrimitiveId = HairPrimitiveId0;
+		Interpolants.HairPrimitiveUV = float2(SegmentU, SegmentV);
+	}
+	
+
+	#if 1
+	float2 EncodedVelocity = 0;
+	{
+		const float4 ScreenPos		= mul(float4(Velocity_World_P.xyz, 1), ResolvedView.TranslatedWorldToClip);
+		const float4 PrevScreenPos	= mul(float4(Velocity_World_P_Prev.xyz, 1), ResolvedView.PrevTranslatedWorldToClip);
+
+		const float2 Velocity	= Calculate3DVelocity(ScreenPos, PrevScreenPos).xy;
+		EncodedVelocity			= EncodeVelocityToTexture(float3(Velocity, 0.0)).xy;
+	}
+	#endif
+
+	// Sample Position < consider to be the center??
+	// VS
+	const float4 SvPosition = float4(SamplePixelCoord, SampleDepth, 1);
+
+	// Coverage computation
+	// We don't use the coverage information
+	float Coverage = 1;
+	if (bUpdateSampleCoverage)
+	{
+		const bool bUseStableRasterization = UseStableRasterization();
+
+		FHairRenderInfo HairRenderInfo = GetHairRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits, bUseStableRasterization);
+		const float LocalSceneDepth = ConvertFromDeviceZ(SvPosition.z); // Linear depth in world unit
+		const float PixelRadius = HairRenderInfo.bIsOrthoView ? HairRenderInfo.RadiusAtDepth1Primary : LocalSceneDepth * HairRenderInfo.RadiusAtDepth1Primary; // Not correct but the coverage is not used (we count instead the number of sub-sample covered)
+		const float StrandRealRadius = WorldStrandRadius;
+		Coverage = StrandRealRadius / max(StrandRealRadius, PixelRadius);
+
+		SampleCoverage8bit = min(uint(Coverage * 0xFF), 0xFFu);
+	}
+
+	// expressed the coverage relatively to the current pixel coverage?
+
+	// PS
+	FHairSample OutSample		= (FHairSample)0;
+	OutSample.Depth				= SampleDepth;
+	OutSample.Coverage8bit		= SampleCoverage8bit;
+	OutSample.PrimitiveId		= SamplePrimitiveId;
+	OutSample.MacroGroupId		= MaterialPass_MacroGroupId;
+	OutSample.LightChannelMask	= MaterialPass_LightChannelMask;
+	OutSample.bScatterSceneLighting = UseScatterSceneLighting();
+
+	// Material computation
+	{
+		const bool bIsFrontFace = true;
+		FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+		FPixelMaterialInputs PixelMaterialInputs;
+
+		float4 LocalScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, LocalScreenPosition, bIsFrontFace, TranslatedWorldPosition, TranslatedWorldPosition);
+
+		OutSample.BaseColor = GetMaterialBaseColor(PixelMaterialInputs);
+		OutSample.Roughness = GetMaterialRoughness(PixelMaterialInputs);
+		OutSample.Specular = GetMaterialSpecular(PixelMaterialInputs);
+		OutSample.Backlit = saturate(GetMaterialCustomData0(MaterialParameters));
+		OutSample.Emissive = GetMaterialEmissive(PixelMaterialInputs);
+
+	#if HAIRSTRANDS_HAS_NORMAL_CONNECTED
+	  #if MATERIAL_TANGENTSPACENORMAL 
+		// Convert the tangent space input tangent 
+		// * from a frame with Z/(0,0,1) being up and Y/(0,1,0) being the main tangent direction (called green)
+		// * to   a frame with Y/(0,1,0) being up and Z/(0,0,1) being the main tangent direction (called blue)
+		const float3 TangentSpaceGreen = normalize(GetMaterialNormalRaw(PixelMaterialInputs));
+		const float3 TangentSpaceBlue = float3(-TangentSpaceGreen.x, TangentSpaceGreen.z, TangentSpaceGreen.y);
+		OutSample.Tangent = mul(TangentSpaceBlue, MaterialParameters.TangentToWorld);
+		OutSample.Tangent = normalize(OutSample.Tangent);
+	  #else // Tangent in World space (likely provided by the HairAttributes node)
+		OutSample.Tangent = normalize(GetMaterialNormalRaw(PixelMaterialInputs));
+	  #endif
+	#else
+		OutSample.Tangent = normalize(Interpolants.TangentToWorld2.xyz);
+	#endif
+
+		// this feature is only needed for development/editor - we can compile it out for a shipping build (see r.CompileShadersForDevelopment cvar help)
+	#if USE_DEVELOPMENT_SHADERS
+		{
+			OutSample.BaseColor = OutSample.BaseColor * View.DiffuseOverrideParameter.w + View.DiffuseOverrideParameter.xyz;
+		}
+	#endif
+	}
+
+	FEvaluateOutput Out;
+	Out.NodeData	 = OutSample;
+	Out.NodeVelocity = EncodedVelocity;
+	return Out;
+}
+#endif

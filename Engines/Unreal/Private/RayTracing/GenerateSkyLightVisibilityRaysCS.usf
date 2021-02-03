@@ -1,0 +1,66 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	GenerateSkyLightVisibilityRaysCS.usf: Build variance map
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "../MonteCarlo.ush"
+#include "../QuasiRandom.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingSkyLightCommon.ush"
+#include "SkyLightVisibilityRaysData.ush"
+
+uint3 SkyLightVisibilityRaysDimensions;
+RWStructuredBuffer<FSkyLightVisibilityRays> OutSkyLightVisibilityRays;
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint2 PixelCoord = uint2(DispatchThreadId.x, DispatchThreadId.y);
+
+	FQuasiRandom QuasiRandom;
+	QuasiRandom_Initialize(QuasiRandom, PixelCoord, 0, SkyLight.SamplesPerPixel);
+	float3 BlueNoiseShift = EvalBlueNoise(QuasiRandom.BlueNoiseCoord, 0);
+
+	// Cache Cubeface CDF
+	uint MipCount = log2(SkyLight.MipDimensions.x);
+	float FaceCdf[7];
+	BuildFaceCdf(MipCount, FaceCdf);
+
+	for (uint SampleIndex = 0; SampleIndex < SkyLight.SamplesPerPixel; ++SampleIndex)
+	{
+		QuasiRandom_Update(QuasiRandom, SampleIndex, SkyLight.SamplesPerPixel);
+
+		// Determine sky light or lambert ray
+		float3 RandSample = QuasiRandom_Sample3(QuasiRandom);
+		RandSample = HaltonSequence3(QuasiRandom.HaltonSequence, QuasiRandom.HaltonIteration, 0);
+		RandSample += BlueNoiseShift;
+		RandSample = fmod(RandSample, 1.0);
+
+		float3 RayDirection;
+		float SkyLightSamplingStrategyPdf = 0.5;
+		float MisWeight = 1.0;
+		float RayPdf = 0.0;
+		BRANCH
+			if (RandSample.x < SkyLightSamplingStrategyPdf)
+			{
+				RandSample.x /= SkyLightSamplingStrategyPdf;
+				GenerateSkyLightOcclusionRay(FaceCdf, RandSample, RayDirection, RayPdf);
+				MisWeight = RayPdf / (SkyLightSamplingStrategyPdf * RayPdf + (1.0 - SkyLightSamplingStrategyPdf) * PdfSphericalOcclusionRay(RayDirection));
+			}
+			else
+			{
+				GenerateSphericalOcclusionRay(RandSample.yz, RayDirection, RayPdf);
+				MisWeight = RayPdf / ((1.0 - SkyLightSamplingStrategyPdf) * RayPdf + SkyLightSamplingStrategyPdf * PdfSkyLightOcclusionRay(FaceCdf, RayDirection));
+			}
+
+		// Write out a new Sky Light Visibility Ray for this sample
+
+		const uint SkyLightVisibilityRayIndex = GetSkyLightVisibilityRayIndex(PixelCoord, SampleIndex, SkyLightVisibilityRaysDimensions.xy);
+
+		OutSkyLightVisibilityRays[SkyLightVisibilityRayIndex].DirectionAndPdf = float4(RayDirection.xyz, MisWeight / RayPdf);
+	}
+}

@@ -1,0 +1,31 @@
+#version 120 // -*- c++ -*-
+
+/** 
+\file Texture_minMaxMean.pix 
+*/
+#include <compatibility.glsl>
+#expect FOUR_COMPONENTS
+uniform sampler2D   source;
+uniform int         width;
+
+void main() {
+    int y = int(gl_FragCoord.x);
+    vec4 mn = vec4(1.0);
+#if FOUR_COMPONENTS
+    vec4 mx = vec4(0.0); 
+#else
+    vec4 mx = vec4(0.0, 0.0, 0.0, 1.0); 
+#endif
+    vec4 mean = vec4(0.0);
+    for(int x = 0; x < width; ++x) {
+        vec4 t = texelFetch2D(source, ivec2(x, y), 0);
+        mean += t;
+        mx = max(mx, t);
+        mn = min(mn, t);
+    }
+    mean /= float(width);
+    gl_FragData[0] = mn;
+    gl_FragData[1] = mx;
+    gl_FragData[2] = mean;
+}
+

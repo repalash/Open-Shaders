@@ -1,0 +1,51 @@
+#version 330
+/**
+  \file data-files/shader/GaussianBlur/GaussianBlur_apply.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+
+#expect KERNEL_RADIUS      "Half the width, plus 0.5"
+#expect LOG_DOWNSAMPLE_X   "Bits to shift coordinates right in X, e.g., for downsampling output"
+#expect LOG_DOWNSAMPLE_Y   "Bits to shift coordinates right in X, e.g., for downsampling output"
+const int2 shift = int2(LOG_DOWNSAMPLE_X, LOG_DOWNSAMPLE_Y);
+
+uniform sampler2D source;
+uniform int2      direction;
+
+out vec4 result;
+
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render. used for VR. <= 0 to disable"
+float square(float x) { return x * x; }
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            discard;
+        }
+#   endif
+
+#   ifdef NVIDIA_361_WORKAROUND
+        NVIDIA_361_WORKAROUND();
+#   endif
+    int2   P = int2(gl_FragCoord.xy * (int2(1) << shift)) + min(direction, int2(0));
+    float4 sum = texelFetch(source, P, 0) * gaussCoef[KERNEL_RADIUS - 1];
+    
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        float4 v = texelFetch(source, (KERNEL_RADIUS - 1 - tap) * direction + P, 0);
+        sum += v * gaussCoef[tap];
+    }
+
+    for (int tap = 0; tap < KERNEL_RADIUS - 1; ++tap) {
+        float4 v = texelFetch(source, -(KERNEL_RADIUS - 1 - tap) * direction + P, 0);
+        sum += v * gaussCoef[tap];
+    }
+
+    result = sum;
+}
+

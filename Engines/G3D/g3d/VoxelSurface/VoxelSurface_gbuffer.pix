@@ -1,0 +1,161 @@
+#version 410
+/**
+  \file data-files/shader/VoxelSurface/VoxelSurface_gbuffer.pix
+
+  This shader expects a prefix (GBuffer::macros() or SVO::macros()) to be attached
+  at runtime using Shader::setPremable.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#extension GL_ARB_conservative_depth : enable
+
+#define VISUALIZE_EFFICIENCY 0
+
+#define UNBLENDED_PASS 1
+
+#include "VoxelSurface_pixel.glsl"
+
+flat in Color3               voxelLambertian;
+flat in float                voxelCoverage;
+
+layout (depth_greater) out float gl_FragDepth;
+
+/** Do not read color attributes (except LAMBERTIAN, if an alpha test is required)
+    outside of this rectangle.  Used to implement the trim band outside of which
+    only depth is recorded. */
+uniform vec2            lowerCoord, upperCoord;
+
+#if defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+// We reproject per-pixel so that csPrevPosition can be interpolated
+// linearly in the current frame's 3D; projecting the previous position
+// in the vertex shader would result in a previous homogeneous value
+// being linearly in the current time frame.
+    uniform mat4 ProjectToScreenMatrix;
+    uniform mat4 PreviousProjectToScreenMatrix;
+#else
+    mat4 ProjectToScreenMatrix;
+    mat4 PreviousProjectToScreenMatrix;
+#endif
+
+float backside = (gl_FrontFacing == g3d_InvertY) ?  1.0 : -1.0;
+
+#if (USE_DEPTH_PEEL != 0)
+#   include <depthPeel.glsl>
+
+    /** Need not be at the same resolution as the current depth buffer. 
+        For samples to be written, they must be at greater gl_FragCoord.z values
+        than those in this buffer.*/
+    uniform sampler2D previousDepthBuffer;
+
+    /**
+     textureSize(previousDepthBuffer) / textureSize(currentDepthBuffer)
+     */
+    uniform float2    currentToPreviousScale;
+
+    /** Minimum depth buffer value distance (on [0,1]) that new faces 
+        must be beyond previousDepthBuffer to be written. */
+    uniform float     minZSeparation;
+
+    uniform float3    clipInfo;
+#endif
+
+/** Texture coordinate */
+layout(location=0) in vec2 texCoord;
+//
+//#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+//    layout(location=7) in Point3 csPrevPosition;
+//#else
+//    Point3 csPrevPosition;
+//#endif
+
+Point3 csPrevPosition;
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    uniform mat4x3  PreviousObjectToCameraMatrix;
+#endif
+    
+layout(location=10) in vec4         vertexColor;
+
+
+#ifdef SVO_POSITION
+#   error VoxelSurface does not support SVO_POSITION
+#endif
+
+void main() {
+#   if (USE_DEPTH_PEEL != 0)
+        if (isDepthPeeled(previousDepthBuffer, currentToPreviousScale, minZSeparation, gl_FragCoord.xyz, clipInfo)) {
+            // We have to discard here to avoid writing to z, even though it causes us to lose early z tests on 2013-era hardware
+            discard;
+        }
+#   endif
+        
+    Point3 worldPosition;
+    vec3 normal;
+
+    float fragDepth;
+
+
+
+
+    if (! computeHitAndDepth(gl_FragCoord, worldPosition, normal, fragDepth)) {
+#       if VISUALIZE_EFFICIENCY
+
+        UniversalMaterialSample materialSample;
+
+        materialSample.lambertianReflectivity = vec3(0);
+        materialSample.coverage = 1.0f;
+        materialSample.fresnelReflectionAtNormalIncidence = Color3(0);
+        materialSample.smoothness = 0.0f;
+        materialSample.transmissionCoefficient = Color3(0);
+        materialSample.offsetTexCoord = Point2(0);
+        materialSample.emissive = vec3(1,0., 0.0);
+        materialSample.lightMapRadiance = Radiance3(0);
+        materialSample.geometricNormal = Vector3(1,0,0);
+        materialSample.shadingNormal = normal;
+        materialSample.glossyShadingNormal = Vector3(0,1,0);
+        materialSample.tsNormal = Vector3(1,0,0);
+        materialSample.position = worldPosition;
+
+        if ((int(gl_FragCoord.x) + int(gl_FragCoord.y)) % 3 != 0) discard;
+    
+        writeToGBuffer(materialSample, ProjectToScreenMatrix, csPrevPosition, PreviousProjectToScreenMatrix);
+        return;
+#       else
+            discard;
+#       endif
+    }
+
+#   if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+        csPrevPosition = (PreviousObjectToCameraMatrix * vec4(g3d_WorldToObjectMatrix * vec4(worldPosition, 1.0), 1.0)).xyz;
+#   endif
+
+    //////////////////////// MATERIAL //////////////////////////////
+
+    UniversalMaterialSample materialSample;
+
+    materialSample.lambertianReflectivity = voxelLambertian;
+    materialSample.coverage = 1.0;
+    materialSample.fresnelReflectionAtNormalIncidence = Color3(0.05);
+    materialSample.smoothness = 0.5f;
+
+    if (voxelLambertian.b > 0.8 && voxelLambertian.r < 0.5 && voxelLambertian.g > 0.3) {
+        // Hack for water!
+        materialSample.fresnelReflectionAtNormalIncidence = vec3(0,0,0.1);//voxelLambertian * 0.2;
+        materialSample.smoothness = 0.95f;
+    }
+    materialSample.transmissionCoefficient = Color3(0);
+    materialSample.offsetTexCoord = Point2(0);
+
+    materialSample.emissive = voxelLambertian * voxelCoverage;
+    materialSample.lightMapRadiance = Radiance3(0);
+    materialSample.geometricNormal = Vector3(1,0,0);
+    materialSample.shadingNormal = normal;
+    materialSample.glossyShadingNormal = Vector3(0, 1, 0);
+    materialSample.tsNormal = Vector3(1,0,0);
+    materialSample.position = worldPosition;
+    
+    writeToGBuffer(materialSample, ProjectToScreenMatrix, csPrevPosition, PreviousProjectToScreenMatrix);
+    gl_FragDepth = fragDepth;
+}

@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MetalCommon.usf: Common Metal shader code
+=============================================================================*/
+
+// Update this GUID to improve shader recompilation for Metal only shaders
+// GUID = 58B83ABA-46B7-4D8A-B64B-766CE8FC28AD
+
+#pragma once
+
+#if VERTEXSHADER && HULLSHADER
+#ifndef TESSELLATIONSHADER
+#define TESSELLATIONSHADER 1
+#endif
+#endif
+
+#define STRONG_TYPE
+#define StrongTypedBuffer Buffer
+
+/* Too many bugs to enable wave-intrinsics just yet, but we are getting there.
+#if ((MAX_SHADER_LANGUAGE_VERSION >= 3 && COMPUTESHADER) || (MAX_SHADER_LANGUAGE_VERSION >= 4 && PIXELSHADER))
+#define COMPILER_SUPPORTS_WAVE_ONCE 1
+#define COMPILER_SUPPORTS_WAVE_VOTE 1
+#define COMPILER_SUPPORTS_WAVE_MINMAX 1
+#define COMPILER_SUPPORTS_WAVE_BIT_ORAND 1
+#endif
+*/
+
+#define COMPILER_SUPPORTS_MINMAX3 0
+
+#if IOS && PIXELSHADER 
+	// The load operation here will be patched by the MetalShaderCompiler,
+	// do NOT change any character in the "SubpassFetch*" macro definition, including white spaces!
+	
+	// 4 components: RGBA_0
+	Texture2D<float4> gl_LastFragDataRGBA_0;
+	#define SubpassFetchRGBA_0() gl_LastFragDataRGBA_0.Load(uint3(0, 0, 0), 0)
+	// 1 component: R_4
+	Texture2D<float> gl_LastFragDataR_4;
+	#define SubpassFetchR_4() gl_LastFragDataR_4.Load(uint3(0, 0, 0), 0)
+	//
+	// Rest of SubpassFetch can be found in MetalSubpassSupport.ush
+	//
+	#if MOBILE_DEFERRED_SHADING
+		#define DepthbufferFetchES2() SubpassFetchR_4()
+	#else
+		#define DepthbufferFetchES2() SubpassFetchRGBA_0().w
+	#endif
+#else
+	#define SubpassFetchRGBA_0() ((float4)0.0)
+	#define SubpassFetchR_0() (0.0)
+	#define SubpassFetchR_4() (0.0)
+#endif //IOS && PIXELSHADER 

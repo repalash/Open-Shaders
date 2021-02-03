@@ -1,0 +1,464 @@
+/*=============================================================================
+	ShaderPrintCommon.ush:
+	Include this to be able to call ShaderPrint() from arbitrary shaders
+=============================================================================*/
+
+#pragma once
+
+// Include the MiniFont symbol definitions
+#include "MiniFontCommon.ush"
+
+// --------------------------------------------------------------------------
+// Uniforms and structures
+
+// Needs to match C++ code in ShaderPrintUniform.cpp
+struct ShaderPrintItem
+{
+	float2 ScreenPos; // Position in normalized coordinates
+	int Value;        // Cast to value or symbol
+	int Type;         // SHADER_PRINT_TYPE_* defines how to read Value
+};
+
+RWStructuredBuffer<ShaderPrintItem> RWValuesBuffer;
+
+// Content of ShaderPrintItem.Type defines what to cast ShaderPrintItem.Value as
+#define SHADER_PRINT_TYPE_SYMBOL 0
+#define SHADER_PRINT_TYPE_FLOAT  1
+#define SHADER_PRINT_TYPE_INT    2
+#define SHADER_PRINT_TYPE_UINT   3
+#define SHADER_PRINT_TYPE_HEX    4
+
+#include "/Engine/Generated/UniformBuffers/ShaderPrintUniform.ush"
+//float4 FontSize;      // .xy character size, .zw character spacing (in normalized coordinates)
+//int MaxValueCount;    // maximum number of values that we can print in one frame
+//int MaxSymbolCount;   // maximum number of symbols (after conversion from characters) that we can print in one frame
+
+static const float2 ShaderPrintCursorStart = float2(0.05f, 0.05f);
+static const float ShaderPrintTabCount = 12.f;
+
+// 'Global' values for tracking printing state (per thread)
+static float2 ShaderPrintCursorPos = ShaderPrintCursorStart;
+static bool ShaderPrintFilterEnable = true;
+
+// --------------------------------------------------------------------------
+// Internal helpers
+
+void ShaderPrint_Internal(in ShaderPrintItem Item)
+{
+	// If MaxValueCount is 0 then we don't reset the buffer counter so early out here
+	if (ShaderPrintUniform.MaxValueCount == 0)
+	{
+		return;
+	}
+
+	// Buffer counter is stored in first element .Value
+	int IndexToStore = 0;
+	InterlockedAdd(RWValuesBuffer[0].Value, 1, IndexToStore);
+
+	// Prevent writing off the buffer
+	// Note that counter still increases so need clamp when reading it in later passes
+	if (IndexToStore >= ShaderPrintUniform.MaxValueCount)
+	{
+		return;
+	}
+
+	// Because counter is in first element, read/writes need to be offset by 1
+	RWValuesBuffer[IndexToStore + 1] = Item;
+}
+
+void ShaderPrint_Internal(in float2 ScreenPos, in int Value, in int Type)
+{
+	ShaderPrintItem Item;
+	Item.ScreenPos = ScreenPos;
+	Item.Value = Value;
+	Item.Type = Type;
+	ShaderPrint_Internal(Item);
+}
+
+// --------------------------------------------------------------------------
+// Symbol printing
+
+float2 ShaderPrintSymbol(in float2 ScreenPos, in int Symbol)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint_Internal(ScreenPos, Symbol, SHADER_PRINT_TYPE_SYMBOL);
+		ScreenPos.x += ShaderPrintUniform.FontSize.z;
+	}
+	return ScreenPos;
+}
+
+void ShaderPrintSymbol(in int symbol)
+{
+	ShaderPrintCursorPos = ShaderPrintSymbol(ShaderPrintCursorPos, symbol);
+}
+
+float2 ShaderPrintHelloWorld(in float2 ScreenPos)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _H_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _E_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _L_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _L_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _O_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _SPC_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _W_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _O_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _R_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _L_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _D_);
+		ScreenPos = ShaderPrintSymbol(ScreenPos, _SPC_);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrintHelloWorld()
+{
+	ShaderPrintCursorPos = ShaderPrintHelloWorld(ShaderPrintCursorPos);
+}
+
+// --------------------------------------------------------------------------
+// Value printing
+
+float2 ShaderPrint(in float2 ScreenPos, in float Value, in int Type = SHADER_PRINT_TYPE_FLOAT)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint_Internal(ScreenPos, asint(Value), Type);
+		ScreenPos.x += ShaderPrintUniform.FontSize.z * ShaderPrintTabCount;
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float Value, in int Type = SHADER_PRINT_TYPE_FLOAT)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in int Value, in int Type = SHADER_PRINT_TYPE_INT)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint_Internal(ScreenPos, Value, Type);
+		ScreenPos.x += ShaderPrintUniform.FontSize.z * ShaderPrintTabCount;
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in int Value, in int Type = SHADER_PRINT_TYPE_INT)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in uint Value, in int Type = SHADER_PRINT_TYPE_UINT)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint_Internal(ScreenPos, asint(Value), Type);
+		ScreenPos.x += ShaderPrintUniform.FontSize.z * ShaderPrintTabCount;
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in uint Value, in int Type = SHADER_PRINT_TYPE_UINT)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value, Type);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in bool Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value ? 1u : 0u, SHADER_PRINT_TYPE_UINT);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in bool Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value ? 1u : 0u, SHADER_PRINT_TYPE_UINT);
+	}
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float2 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float2 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in int2 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in int2 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in uint2 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.y);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in uint2 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float3 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, Value.z);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float3 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in int3 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, Value.z);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in int3 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in uint3 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.z);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in uint3 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float4 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, Value.z);
+		ScreenPos = ShaderPrint(ScreenPos, Value.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float4 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in int4 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, Value.z);
+		ScreenPos = ShaderPrint(ScreenPos, Value.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in int4 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in uint4 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.x);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.y);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.z);
+		ScreenPos = ShaderPrint(ScreenPos, (int)Value.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in uint4 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float3x3 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint(ScreenPos, Value[0]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, Value[1]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, Value[2]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float3x3 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float4x3 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint(ScreenPos, float4(Value[0], 0.f));
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, float4(Value[1], 0.f));
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, float4(Value[2], 0.f));
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, float4(Value[3], 1.f));
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float4x3 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+float2 ShaderPrint(in float2 ScreenPos, in float4x4 Value)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ShaderPrint(ScreenPos, Value[0]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, Value[1]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, Value[2]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+		ShaderPrint(ScreenPos, Value[3]);
+		ScreenPos += float2(0.f, ShaderPrintUniform.FontSize.w);
+	}
+	return ScreenPos;
+}
+
+void ShaderPrint(in float4x4 Value)
+{
+	ShaderPrintCursorPos = ShaderPrint(ShaderPrintCursorPos, Value);
+}
+
+// --------------------------------------------------------------------------
+// Formating helpers
+
+float2 ShaderPrintSpace(in float2 ScreenPos, in float Count = 1)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos.x += ShaderPrintUniform.FontSize.z * Count;
+	}
+	return ScreenPos;
+
+}
+
+void ShaderPrintSpace(in float Count = 1)
+{
+	ShaderPrintCursorPos = ShaderPrintSpace(ShaderPrintCursorPos, Count);
+}
+
+float2 ShaderPrintNewline(in float2 ScreenPos)
+{
+	if (ShaderPrintFilterEnable)
+	{
+		ScreenPos.x = ShaderPrintCursorStart.x;
+		ScreenPos.y += ShaderPrintUniform.FontSize.w;
+	}
+	return ScreenPos;
+}
+
+void ShaderPrintNewline()
+{
+	ShaderPrintCursorPos = ShaderPrintNewline(ShaderPrintCursorPos);
+}
+
+float2 ShaderPrintGetCursorPos()
+{
+	return ShaderPrintCursorPos;
+}
+
+float2 ShaderPrintSetCursorPos(in float2 ScreenPos)
+{
+	float2 PrevScreenPos = ShaderPrintCursorPos;
+	ShaderPrintCursorPos = ScreenPos;
+	return PrevScreenPos;
+}
+
+// --------------------------------------------------------------------------
+// Filter helpers
+// Use these to restrict ShaderPrint to a subset of active threads
+// The filter functions can be called once at the start of the shader to filter all later printing
+//
+// Example use cases would be:
+//
+// ShaderPrintFilter(all(SvPosition.xy == float2(100, 100)));
+// to debug a single pixel
+//
+// ShaderPrintFilter(all(DispatchThreadId == uint3(0, 0, 0)));
+// to debug a single compute shader thread
+//
+// ShaderPrintFilterOneThread()
+// to debug a single random active thread
+// Note that ShaderPrintFilterOneThread() only works for one shader invocation in a view since it relies on a global memory location
+
+void ShaderPrintFilter(bool bFilter)
+{
+	ShaderPrintFilterEnable = bFilter;
+}
+
+void ShaderPrintFilterOneThread()
+{
+	// Atomic flag is stored in first element .Type Value
+	uint PrevValue;
+	InterlockedCompareExchange(RWValuesBuffer[0].Type, 0, 1, PrevValue);
+	ShaderPrintFilter(PrevValue == 0);
+}

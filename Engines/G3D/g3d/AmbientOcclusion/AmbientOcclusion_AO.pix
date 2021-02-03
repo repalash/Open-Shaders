@@ -1,0 +1,315 @@
+#version 410
+/**
+  \file data-files/shader/AmbientOcclusion/AmbientOcclusion_AO.pix
+
+  Reference implementation of the Scalable Ambient Obscurance (AmbientOcclusion) screen-space ambient obscurance algorithm. 
+ 
+  The optimized algorithmic structure of AmbientOcclusion was published in McGuire, Mara, and Luebke, Scalable Ambient Obscurance,
+  <i>HPG</i> 2012, and was developed at NVIDIA with support from Louis Bavoil.
+
+  The mathematical ideas of AlchemyAO were first described in McGuire, Osman, Bukowski, and Hennessy, The 
+  Alchemy Screen-Space Ambient Obscurance Algorithm, <i>HPG</i> 2011 and were developed at 
+  Vicarious Visions.  
+ 
+  DX11 HLSL port by Leonardo Zide of Treyarch
+
+  <hr>
+
+  Open Source under the "BSD" license: http://www.opensource.org/licenses/bsd-license.php
+
+  Copyright (c) 2011-2012, NVIDIA
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+  Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+  Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#ifdef GL_ARB_gpu_shader5
+#extension GL_ARB_gpu_shader5 : enable
+#endif
+
+#include <reconstructFromDepth.glsl>
+#include "AmbientOcclusion_constants.glsl"
+
+#expect NUM_SAMPLES "Integer number of samples to take at each pixels"
+#expect NUM_SPIRAL_TURNS "Integer number of turns around the circle that the spiral pattern makes. The G3D::AmbientOcclusion class provides a discrepancy-minimizing value of NUM_SPIRAL_TURNS for eac value of NUM_SAMPLES."
+#expect DIFFERENT_DEPTH_RESOLUTIONS "1 if the peeled depth buffer is at a different resolution than the primary depth buffer"
+#expect USE_DEPTH_PEEL "1 to enable, 0 to disable"
+#expect CS_Z_PACKED_TOGETHER "1 to enable, 0 to disable"
+#expect TEMPORALLY_VARY_SAMPLES "1 to enable, 0 to disable"
+#expect COMPUTE_PERCENT "integer screen fraction percent within which to render. Used for VR. <= 0 to disable"
+
+#expect FAR_PLANE_Z "(negative) z-coordinate of the far plane"
+
+#include <AmbientOcclusion/AmbientOcclusion_constants.glsl>
+
+#define HIGH_QUALITY 1
+//////////////////////////////////////////////////
+
+/** The height in pixels of a 1m object if viewed from 1m away.  
+    You can compute it from your projection matrix.  The actual value is just
+    a scale factor on radius; you can simply hardcode this to a constant (~500)
+    and make your radius value unitless (...but resolution dependent.)  */
+uniform float           projScale;
+
+/** Negative, "linear" values in world-space units */
+uniform sampler2D       CS_Z_buffer;
+
+#if (USE_DEPTH_PEEL != 0) && (CS_Z_PACKED_TOGETHER == 0)
+    /** Negative, "linear" values in world-space units */
+    uniform sampler2D       peeled_CS_Z_buffer;
+    
+#   if (DIFFERENT_DEPTH_RESOLUTIONS != 0)
+    uniform float           peeledToUnpeeledScale;
+#   endif
+
+#endif
+
+#ifdef normal_notNull
+    /** Same size as result buffer, do not offset by guard band when reading from it */
+    uniform sampler2D       normal_buffer;
+    uniform vec4            normal_readMultiplyFirst;
+    uniform vec4            normal_readAddSecond;
+#endif
+
+/** World-space AO radius in scene units (r).  e.g., 1.0m */
+uniform float           radius;
+uniform float           radius2;
+uniform float           negInvRadius2;
+
+/** Bias to avoid AO in smooth corners, e.g., 0.015m */
+uniform float           bias;
+
+/** intensity / radius^6 */
+uniform float           intensityDivR6;
+uniform float           intensity;
+
+uniform ProjInfo        projInfo;
+
+out vec3                result;
+#define visibility      result.r
+#define bilateralKey    result.g
+
+/////////////////////////////////////////////////////////
+
+/** Returns a unit vector and a screen-space radius for the tap on a unit disk 
+    (the caller should scale by the actual disk radius) */
+vec2 tapLocation(int sampleNumber, float spinAngle, out float ssR){
+    // Radius relative to ssR
+    float radius = float(sampleNumber + mod(spinAngle, 1.0) + 0.5) * (1.0 / (NUM_SAMPLES - 0.5));
+    radius *= radius;
+    float angle = radius * (NUM_SPIRAL_TURNS * 6.28) + spinAngle;
+
+    ssR = radius;
+    return vec2(cos(angle), sin(angle));
+}
+
+
+/** Used for packing Z into the GB channels */
+float CSZToKey(float z) {
+    return clamp(z * (1.0 / FAR_PLANE_Z), 0.0, 1.0);
+}
+
+ 
+/** Read the camera-space position of the point at screen-space pixel ssP */
+vec3 getPosition(ivec2 ssP, sampler2D cszBuffer) {
+    vec3 P;
+    P.z = texelFetch(cszBuffer, ssP, 0).r;
+
+    // Offset to pixel center
+    P = reconstructCSPosition(vec2(ssP) + vec2(0.5), P.z, projInfo);
+    return P;
+}
+
+int getMipLevel(float ssR) {
+    // Derivation:
+    //  mipLevel = floor(log(ssR / MAX_OFFSET));
+    return clamp(int(floor(log2(ssR))) - LOG_MAX_OFFSET, 0, MAX_MIP_LEVEL);
+}
+
+
+/** Read the camera-space position of the point at screen-space pixel ssP + unitOffset * ssR.  Assumes length(unitOffset) == 1.
+    Use cszBufferScale if reading from the peeled depth buffer, which has been scaled by (1 / invCszBufferScale) from the original */
+vec3 getOffsetPosition(ivec2 ssC, vec2 unitOffset, float ssR, sampler2D cszBuffer, float invCszBufferScale) {    
+    int mipLevel = getMipLevel(ssR);
+        
+    ivec2 ssP = ivec2(ssR * unitOffset) + ssC;
+    
+    vec3 P;
+
+    // We need to divide by 2^mipLevel to read the appropriately scaled coordinate from a MIP-map.  
+    // Manually clamp to the texture size because texelFetch bypasses the texture unit
+    ivec2 mipP = clamp(ssP >> mipLevel, ivec2(0), textureSize(CS_Z_buffer, mipLevel) - ivec2(1));
+
+    P.z = texelFetch(cszBuffer, mipP, mipLevel).r;
+
+    // Offset to pixel center
+    P = reconstructCSPosition((vec2(ssP) + vec2(0.5)) * invCszBufferScale, P.z, projInfo);
+
+    return P;
+}
+
+
+/** Read the camera-space position of the points at screen-space pixel ssP + unitOffset * ssR in both channels of the packed csz buffer.  Assumes length(unitOffset) == 1. */
+void getOffsetPositions(ivec2 ssC, vec2 unitOffset, float ssR, sampler2D cszBuffer, out vec3 P0, out vec3 P1) {
+    
+    int mipLevel = getMipLevel(ssR);
+    ivec2 ssP = ivec2(ssR * unitOffset) + ssC;
+
+    // We need to divide by 2^mipLevel to read the appropriately scaled coordinate from a MIP-map.  
+    // Manually clamp to the texture size because texelFetch bypasses the texture unit
+    ivec2 mipP = clamp(ssP >> mipLevel, ivec2(0), textureSize(CS_Z_buffer, mipLevel) - ivec2(1));
+
+    vec2 Zs = texelFetch(cszBuffer, mipP, mipLevel).rg;
+
+    // Offset to pixel center
+    P0 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.x, projInfo);
+    P1 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.y, projInfo);
+}
+
+/** Smaller return value = less occlusion */
+float fallOffFunction(float vv, float vn, float epsilon) {
+    float f = saturate(vv * negInvRadius2 + 1.0);
+    return f * saturate(vn - bias) / (epsilon + vv);
+}
+
+
+/** Compute the occlusion due to sample point \a Q about camera-space point \a C with unit normal \a n_C */
+float aoValueFromPositionsAndNormal(vec3 C, vec3 n_C, vec3 Q) {
+    vec3 v = Q - C;
+    float vv = dot(v, v);
+    float vn = dot(v, n_C);
+    const float epsilon = 0.015;
+
+    float f = fallOffFunction(vv, vn, epsilon);
+    
+    // Enhance dark areas
+    return f * lerp(0.9 + 0.5 * intensity, 1.2 - intensity * 0.15, f);
+}
+
+
+/** Compute the occlusion due to sample with index \a i about the pixel at \a ssC that corresponds
+    to camera-space point \a C with unit normal \a n_C, using maximum screen-space sampling radius \a ssDiskRadius 
+
+    Note that units of H() in the HPG12 paper are meters, not
+    unitless.  The whole falloff/sampling function is therefore
+    unitless.  In this implementation, we factor out (9 / radius).
+
+    When sampling from the peeled depth buffer, make sure ssDiskRadius has been premultiplied by cszBufferScale
+*/
+float sampleAO(in ivec2 ssC, in vec3 C, in vec3 n_C, in float ssDiskRadius, in int tapIndex, 
+               in float randomPatternRotationAngle, in sampler2D cszBuffer, in float invCszBufferScale) {
+    // Offset on the unit disk, spun for this pixel
+    float ssR;
+    vec2 unitOffset = tapLocation(tapIndex, randomPatternRotationAngle, ssR);
+
+    // Ensure that the taps are at least 1 pixel away
+    ssR = max(0.75, ssR * ssDiskRadius);
+
+#   if (CS_Z_PACKED_TOGETHER != 0)
+        vec3 Q0, Q1;
+        getOffsetPositions(ssC, unitOffset, ssR, cszBuffer, Q0, Q1);
+
+        // When very close to an object, the second call will tend to return a high number
+        return max(aoValueFromPositionsAndNormal(C, n_C, Q0), min(square(0.5 * C.z), 1) * aoValueFromPositionsAndNormal(C, n_C, Q1));
+#   else
+        // The occluding point in camera space
+        vec3 Q = getOffsetPosition(ssC, unitOffset, ssR, cszBuffer, invCszBufferScale);
+
+        return aoValueFromPositionsAndNormal(C, n_C, Q);
+#   endif
+}
+
+const float MIN_RADIUS = 1.0; // pixels
+
+// By Morgan McGuire from https://www.shadertoy.com/view/lt3XDM
+// Works on low-precision GPUs
+float lowPrecisionHash(vec2 p) {    
+    vec3 p3 = fract(vec3(p.xyx) * 0.13);
+    p3 += dot(p3, p3.yzx + 3.333);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            visibility = 1;
+            bilateralKey = 0;
+            return;
+        }
+#   endif
+
+    // Pixel being shaded 
+    ivec2 ssC = ivec2(gl_FragCoord.xy);
+   
+    // World space point being shaded
+    vec3 C = getPosition(ssC, CS_Z_buffer);
+
+    bilateralKey = CSZToKey(C.z);
+
+    vec3 n_C;
+#   ifdef normal_notNull
+        n_C = texelFetch(normal_buffer, ivec2(gl_FragCoord.xy), 0).xyz;
+        n_C = normalize(n_C * normal_readMultiplyFirst.xyz + normal_readAddSecond.xyz);
+#   else       
+        // Reconstruct normals from positions.
+        n_C = reconstructNonUnitCSFaceNormal(C);
+        // Since n_C is computed from the cross product of camera-space edge vectors from points at
+        // adjacent pixels, its magnitude will be proportional to the square of distance from the camera.
+        //
+        // if the threshold # is too big you will see black dots where we used a bad normal at edges, too small -> white
+        if (dot(n_C, n_C) > (square(C.z * C.z * 0.00006))) { 
+            
+            // The normals from depth should be very small values before normalization,
+            // except at depth discontinuities, where they will be large and lead
+            // to 1-pixel false occlusions because they are not reliable
+            visibility = 1.0; 
+            return;
+        } else {
+            // Precision is pretty bad on 16-bit depth
+            n_C = normalize(n_C);
+        }
+#   endif
+
+
+    // Hash of pixel position as pseudo-random value
+    float randomPatternRotationAngle = 
+#ifdef G3D_NVIDIA
+        (
+        float(((ssC.x & 0xffff) * ((ssC.y & 0xff) + 1)) ^ (ssC.x >> 16) +
+              (((ssC.x + 127) & 0xffff) * ((ssC.y + 128) & 0xff)))
+        ) * 2.39996
+#else
+        lowPrecisionHash(ssC) * 20.1
+#endif
+#if TEMPORALLY_VARY_SAMPLES
+        + g3d_RunTime * 10
+#endif
+    ;
+    
+    // Choose the screen-space sample radius
+    // proportional to the projected area of the sphere
+    float ssDiskRadius = -projScale * radius / C.z;
+    
+    if (ssDiskRadius <= MIN_RADIUS) {
+        // There is no way to compute AO at this radius
+        visibility = 1.0;
+        return;
+    }
+
+    float sum = 0.0;
+    for (int i = 0; i < NUM_SAMPLES; ++i) {
+        sum += sampleAO(ssC, C, n_C, ssDiskRadius, i, randomPatternRotationAngle, CS_Z_buffer, 1);
+    }
+
+    visibility = pow(saturate(1.0 - sqrt(sum * (1.0 / NUM_SAMPLES))), intensity);
+}

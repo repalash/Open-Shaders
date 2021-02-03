@@ -1,0 +1,312 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../CommonViewUniformBuffer.ush"
+#include "../SceneTextureParameters.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShaderDrawDebug.ush"
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+uint3 PositionToCoord(float3 P, float3 InMinAABB, float3 InMaxAABB, uint3 InResolution)
+{
+	return clamp(
+		saturate((P - InMinAABB) / (InMaxAABB - InMinAABB)) * InResolution,
+		uint3(0, 0, 0),
+		InResolution - 1);
+}
+
+uint3 PositionToCoordUnclampled(float3 P, float3 InMinAABB, float3 InMaxAABB, uint3 InResolution)
+{
+	return saturate((P - InMinAABB) / (InMaxAABB - InMinAABB)) * InResolution;
+}
+
+uint CoordToIndex(uint3 InCoord, uint3 InResolution, uint LinearOffset)
+{
+	return
+		InCoord.x +
+		InCoord.y * InResolution.x +
+		InCoord.z * InResolution.x * InResolution.y +
+		LinearOffset;
+}
+
+uint3 IndexToCoord(uint InIndex, uint3 InResolution)
+{
+	const uint SliceSize = (InResolution.x * InResolution.y);
+	const uint SliceIndex = InIndex % SliceSize;
+
+	uint3 OutCoord = 0;
+	OutCoord.x = SliceIndex % InResolution.x;
+	OutCoord.y = SliceIndex / InResolution.x;
+	OutCoord.z = InIndex / SliceSize;
+
+	return OutCoord;
+}
+
+bool IsInVoxelBounds(float3 P, float3 MinP, float3 MaxP)
+{
+	return
+		P.x >= MinP.x && P.y >= MinP.y && P.z >= MinP.z &&
+		P.x <= MaxP.x && P.y <= MaxP.y && P.z <= MaxP.z;
+}
+
+float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
+{
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), View.ScreenToWorld);
+	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+
+	return WorldPosition;
+}
+
+float3 EncodeTangent(float3 N)
+{
+	return N * 0.5 + 0.5;
+}
+
+float3 DecodeTangent(float3 N)
+{
+	return N * 2 - 1;
+}
+
+uint PackDirection(float3 In)
+{
+	float3 T = EncodeTangent(In);
+	return
+		((0xFF & uint(T.x * 255))) |
+		((0xFF & uint(T.y * 255)) << 8) |
+		((0xFF & uint(T.z * 255)) << 16);
+}
+
+float3 UnpackDirection(uint In)
+{
+	return DecodeTangent(float3(
+		float((In)       & 0xFF) / 255.f,
+		float((In >> 8)  & 0xFF) / 255.f,
+		float((In >> 16) & 0xFF) / 255.f));
+}
+
+
+#if SHADER_PLAIN
+
+float2 OutputResolution;
+int3 Voxel_Resolution;
+float Voxel_VoxelSize;
+float3 Voxel_MinBound;
+float3 Voxel_MaxBound;
+Buffer<float4> Voxel_TangentBuffer;
+Buffer<float4> Voxel_NormalBuffer;
+Buffer<uint>   Voxel_DensityBuffer;
+Buffer<uint>   Voxel_ProcessedDensityBuffer;
+
+RWTexture2D<float4> OutputTexture;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const float2 PixelCoord = DispatchThreadId.xy + 0.5f;
+	const float2 UV = PixelCoord / float2(OutputResolution);
+
+	const bool bDebugEnabled = all(int2(PixelCoord) == GetCursorPos());
+
+	float  WorldDepth = 0;
+	float  ClipDepth = 0;
+
+
+	if (uint(PixelCoord.x) == 0 && uint(PixelCoord.y) == 0)
+	{
+		AddAABB(Voxel_MinBound, Voxel_MaxBound, float4(1, 0.5f, 0, 1));
+	}
+
+	bool bIsValid = false;
+	float3 HitColor = 0;
+	{
+		// Reverse-Z
+		const float3 O = View.WorldCameraOrigin;
+		const float3 E = ReconstructWorldPositionFromDepth(UV, ConvertFromDeviceZ(0.0001f));
+		const float3 D = (E - O);
+
+		float PixelRadius = -1;
+		const float2 HitT = LineBoxIntersect(O, E, Voxel_MinBound, Voxel_MaxBound);
+		float AccDensity = 0;
+		if (HitT.x < HitT.y)
+		{
+			// Use different offseting to see either: 
+			// * Individual voxel (for debugging mainly)
+			// * Smoothed voxel (as used for transmittance computation)
+			const float3 Offset = 0;
+			const float Dither = InterleavedGradientNoise(PixelCoord.xy, 1);
+
+			// Intersect the indirection table to see if a brick is empty or not
+			const uint MaxStep = 256;
+			const float Delta = (HitT.y - HitT.x) / float(MaxStep);
+			for (uint StepIt = 0; StepIt < MaxStep; ++StepIt)
+			{
+				const float3 HitP = Offset + O + ((Dither + StepIt) * Delta + HitT.x) * D;
+				const int3 VoxelCoord = PositionToCoord(HitP, Voxel_MinBound, Voxel_MaxBound, Voxel_Resolution);
+				const uint VoxelLinearCoord = CoordToIndex(VoxelCoord, Voxel_Resolution, 0);
+
+				const uint Density = Voxel_DensityBuffer.Load(VoxelLinearCoord);
+
+				if (Density > 0)
+				{
+					float3 UnoccludedDirection = UnpackDirection(Density);
+
+
+					// Filtering
+					if (0)
+					{
+						int KernelSize = 1;
+						uint ValidCount = 0;
+						UnoccludedDirection = 0;
+						for (int Z = -KernelSize; Z <= KernelSize; ++Z)
+						for (int Y = -KernelSize; Y <= KernelSize; ++Y)
+						for (int X = -KernelSize; X <= KernelSize; ++X)
+						{
+							const int3 Offset = int3(X, Y, Z);
+							const int3 C = VoxelCoord + Offset;
+							if (all(C >= 0) && all(C < Voxel_Resolution))
+							{
+								const float w = all(Offset == VoxelCoord) ? 2 : 1;
+								const uint LinearC = CoordToIndex(C, Voxel_Resolution, 0);
+								const uint PackedDir = Voxel_ProcessedDensityBuffer[LinearC];
+								if (PackedDir > 0)
+								{
+									const float3 Dir = UnpackDirection(PackedDir);
+									UnoccludedDirection += normalize(Dir) * w;
+									ValidCount++;
+								}
+							}
+						}
+
+						if (ValidCount>0)
+						{
+							UnoccludedDirection = normalize(UnoccludedDirection);
+
+						}						
+
+						// CPU tangent
+						//UnoccludedDirection = Voxel_TangentBuffer.Load(VoxelLinearCoord) / Density;
+						//UnoccludedDirection = normalize(UnoccludedDirection);
+					}
+
+					const float3 Tangent = Voxel_TangentBuffer.Load(VoxelLinearCoord).xyz;
+					const float3 Normal  = Voxel_NormalBuffer.Load(VoxelLinearCoord).xyz;
+					//UnoccludedDirection = Tangent;
+					UnoccludedDirection = Normal;
+
+					AccDensity = 1;
+					bIsValid = true;
+					HitColor = VoxelCoord / 12.f;
+
+					HitColor = UnoccludedDirection * 2 + 1;
+
+					//HitColor = UnoccludedDirection; // (UnoccludedDirection + 1) * 0.5f;
+					//HitColor = float(Density) / 10.f;
+					if (bDebugEnabled)
+					{
+						//AddLine(HitP, HitP + UnoccludedDirection * 3, float4(1, 0, 0, 1), float4(1, 1, 0, 1));
+
+						AddLine(HitP, HitP + Tangent * 3, float4(0, 0, 1, 1), float4(0, 0, 1, 1));
+						AddLine(HitP, HitP + Normal * 3, float4(1, 0, 0, 1), float4(1, 0, 0, 1));
+					}
+
+					break;
+				}
+			}
+		}
+	}
+	
+	if (bIsValid)
+	{
+		OutputTexture[DispatchThreadId.xy] = float4(HitColor, 1);
+	}
+}
+
+#endif //SHADER_PLAIN
+
+
+
+
+#if SHADER_PROCESS
+
+int3 Voxel_Resolution;
+float Voxel_VoxelSize;
+float3 Voxel_MinBound;
+float3 Voxel_MaxBound;
+Buffer<uint> Voxel_DensityBuffer;
+RWBuffer<uint> OutBuffer;
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int3 VoxelCoord = DispatchThreadId.xyz;
+
+	if (any(VoxelCoord >= Voxel_Resolution))
+		return;
+
+	const uint VoxelLinearCoord = CoordToIndex(VoxelCoord, Voxel_Resolution, 0);
+
+	// Dilation
+#if 0
+	uint OutValue   = 0;
+	 int KernelSize = 1;
+	uint ValidCount = 0;
+
+	for (int Z = -KernelSize; Z <= KernelSize; ++Z)
+	for (int Y = -KernelSize; Y <= KernelSize; ++Y)
+	for (int X = -KernelSize; X <= KernelSize; ++X)
+	{
+		int3 C = VoxelCoord + int3(X, Y, Z);
+		if (all(C >= 0) && all(C < Voxel_Resolution))
+		{
+			const uint LinearC = CoordToIndex(C, Voxel_Resolution, 0);
+			OutValue += Voxel_DensityBuffer[LinearC];
+			ValidCount++;
+		}
+	}
+	OutValue /= max(1, ValidCount);
+#endif
+
+	// Occlusion
+#if 1
+	const uint CenterDensity = Voxel_DensityBuffer[VoxelLinearCoord];
+	if (CenterDensity == 0)
+		return;
+
+	int KernelSize = 1;
+	uint ValidCount = 0;
+	float3 OutDirection = 0;
+	for (int Z = -KernelSize; Z <= KernelSize; ++Z)
+	for (int Y = -KernelSize; Y <= KernelSize; ++Y)
+	for (int X = -KernelSize; X <= KernelSize; ++X)
+	{
+		const int3 Offset = int3(X, Y, Z);		
+		const int3 C = VoxelCoord + Offset;
+		if (all(C >= 0) && all(C < Voxel_Resolution) && !all(Offset == int3(0,0,0)))
+		{
+			const uint LinearC = CoordToIndex(C, Voxel_Resolution, 0);
+			const uint Density = Voxel_DensityBuffer[LinearC];
+			if (Density == 0)
+			{
+				OutDirection += normalize(float3(Offset));
+				ValidCount++;
+			}
+		}
+	}
+	if (ValidCount>0)
+	{
+		OutDirection = normalize(OutDirection);
+	}
+	const uint OutValue = PackDirection(OutDirection);
+#endif
+
+	// Pass through
+#if 0
+	const uint OutValue = Voxel_DensityBuffer[VoxelLinearCoord];
+#endif
+
+	OutBuffer[VoxelLinearCoord] = OutValue;
+}
+
+#endif //SHADER_PROCESS

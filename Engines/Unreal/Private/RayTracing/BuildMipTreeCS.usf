@@ -1,0 +1,90 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	BuildMipTreeCS.usf: Build variance map
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "SkyLightMipTreeCommon.ush"
+
+Texture2D RectLightTexture;
+TextureCube Texture;
+SamplerState TextureSampler;
+
+uint2 Dimensions;
+uint FaceIndex;
+uint MipLevel;
+RWBuffer<float> RWMipTree;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildMipTreeCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+	uint2 Bounds = DimensionsAtLevel(Dimensions, MipLevel);
+	if (GridCoordinate.x < 0 || GridCoordinate.x >= Bounds.x || GridCoordinate.y < 0 || GridCoordinate.y >= Bounds.y)
+	{
+		return;
+	}
+
+	float Sum = 0.0;
+	if (MipLevel == 0)
+	{
+		float3 Direction = GetTextureCubeVector(uint3(GridCoordinate.xy, FaceIndex), Dimensions);
+		float3 Value = TextureCubeSample(Texture, TextureSampler, Direction).rgb;
+		Sum += Luminance(Value.rgb);
+	}
+	else
+	{
+		// Report the mean as the aggregate.
+		uint2 PixelOffset = uint2(GridCoordinate.x << 1, GridCoordinate.y << 1);
+		for (int i = 0; i < 4; ++i)
+		{
+			uint2 Pixel = PixelOffset + uint2(i >> 1, i & 1);
+			uint InputIndex = BufferOffsetAtPixel(Pixel, MipLevel - 1, Dimensions);
+			Sum += RWMipTree[InputIndex];
+		}
+		Sum /= 4;
+	}
+	uint OutputIndex = BufferOffsetAtPixel(GridCoordinate.xy, MipLevel, Dimensions);
+	RWMipTree[OutputIndex] = Sum;
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildRectLightMipTreeCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+	uint2 Bounds = DimensionsAtLevel(Dimensions, MipLevel);
+	if (GridCoordinate.x < 0 || GridCoordinate.x >= Bounds.x || GridCoordinate.y < 0 || GridCoordinate.y >= Bounds.y)
+	{
+		return;
+	}
+
+	float Sum = 0.0;
+	if (MipLevel == 0)
+	{
+		uint2 TextureDimensions;
+		RectLightTexture.GetDimensions(TextureDimensions.x, TextureDimensions.y);
+		float2 UV = GridCoordinate.xy / float2(TextureDimensions);
+		UV = 1.0 - UV;
+		float3 Value = Texture2DSample(RectLightTexture, TextureSampler, UV).rgb;
+		Sum += Luminance(Value.rgb);
+	}
+	else
+	{
+		// Report the mean as the aggregate.
+		uint2 PixelOffset = uint2(GridCoordinate.x << 1, GridCoordinate.y << 1);
+		for (int i = 0; i < 4; ++i)
+		{
+			uint2 Pixel = PixelOffset + uint2(i >> 1, i & 1);
+			uint InputIndex = BufferOffsetAtPixel(Pixel, MipLevel - 1, Dimensions);
+			Sum += RWMipTree[InputIndex];
+		}
+		Sum /= 4;
+	}
+	uint OutputIndex = BufferOffsetAtPixel(GridCoordinate.xy, MipLevel, Dimensions);
+	RWMipTree[OutputIndex] = Sum;
+}

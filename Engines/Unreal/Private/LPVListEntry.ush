@@ -1,0 +1,22 @@
+#pragma once
+
+#define PACKED_VPL 1
+
+struct VplData
+{
+	float3 normal;
+	float3 flux;
+};
+
+struct VplListEntry
+{
+#if PACKED_VPL
+	uint	normalPacked;
+	uint	fluxPacked;
+#else
+	float3	normal;
+	float3  flux;
+#endif
+
+	int		nextIndex;
+};

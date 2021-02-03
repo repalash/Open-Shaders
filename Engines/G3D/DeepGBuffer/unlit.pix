@@ -1,0 +1,22 @@
+#version 120 // -*- c++ -*-
+/**
+  \file unlit.pix
+
+  Apply a color and texture.
+  */
+#include <compatibility.glsl>
+#expect HAS_TEXTURE "1 or 0"
+
+uniform vec4      color;
+#if HAS_TEXTURE
+    varying vec2      texCoord;
+    uniform sampler2D textureMap;
+#endif
+
+void main(void) {
+    gl_FragColor = 
+#       if HAS_TEXTURE
+            texture2D(textureMap, texCoord) * 
+#       endif
+        color;
+}

@@ -1,0 +1,80 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	BuildSkyLightColumnCdfComputeShader.usf: Intermediate SkyLight CDF build.
+===============================================================================================*/
+
+#include "../Common.ush"
+
+// Input
+uint Mode;
+uint Level;
+uint3 RowCdfDimensions;
+Buffer<float> RowCdf;
+
+// Output
+RWBuffer<float> RWColumnCdf;
+
+uint LinearRowCdfCoordinate(uint3 GridCoordinate)
+{
+	uint CubefaceOffset = GridCoordinate.z * RowCdfDimensions.x * RowCdfDimensions.y;
+	uint RowOffset = GridCoordinate.y * RowCdfDimensions.x;
+	return CubefaceOffset + RowOffset + GridCoordinate.x;
+}
+
+// Operates on the YZ plane
+uint LinearColumnCdfCoordinate(uint2 GridCoordinate)
+{
+	uint RowOffset = GridCoordinate.y * RowCdfDimensions.y;
+	return RowOffset + GridCoordinate.x;
+}
+
+void PrefixSum(uint2 GridCoordinate, uint Level)
+{
+	if (Level == 0)
+	{
+		uint3 RowCdfCoordinate = uint3(RowCdfDimensions.x - 1, GridCoordinate);
+		RWColumnCdf[LinearColumnCdfCoordinate(GridCoordinate)] = RowCdf[LinearRowCdfCoordinate(RowCdfCoordinate)];
+	}
+	else
+	{
+		uint2 NextCoordinate = GridCoordinate + uint2(1 << (Level - 1), 0);
+		if (NextCoordinate.x < RowCdfDimensions.y)
+		{
+			float Source = RWColumnCdf[LinearColumnCdfCoordinate(GridCoordinate)];
+			float Destination = RWColumnCdf[LinearColumnCdfCoordinate(NextCoordinate)];
+			RWColumnCdf[LinearColumnCdfCoordinate(NextCoordinate)] = Source + Destination;
+		}
+	}
+}
+
+void Normalize(uint2 GridCoordinate)
+{
+	uint2 NormalizeCoordinate = uint2(RowCdfDimensions.y - 1, GridCoordinate.y);
+	RWColumnCdf[LinearColumnCdfCoordinate(GridCoordinate)] /= RWColumnCdf[LinearColumnCdfCoordinate(NormalizeCoordinate)];
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildSkyLightColumnCdfCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint2 GridCoordinate = DispatchThreadId.xy;
+
+	// Out-of-bounds check
+	if (GridCoordinate.x >= RowCdfDimensions.y || GridCoordinate.y >= RowCdfDimensions.z)
+	{
+		return;
+	}
+
+	if (Mode == 0)
+	{
+		PrefixSum(GridCoordinate, Level);
+		// Debug level 0
+		//PrefixSum(GridCoordinate, 0);
+	}
+	else if (Mode == 1)
+	{
+		Normalize(GridCoordinate);
+	}
+}

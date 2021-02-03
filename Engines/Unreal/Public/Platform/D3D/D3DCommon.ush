@@ -1,0 +1,25 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+D3DCommon.usf: Common defines for the d3d shader compiler
+=============================================================================*/
+
+precise float MakePrecise(precise float v) { return v; }
+precise float2 MakePrecise(precise float2 v) { return v; }
+precise float3 MakePrecise(precise float3 v) { return v; }
+precise float4 MakePrecise(precise float4 v) { return v; }
+#define INVARIANT(X) X
+
+#if PLATFORM_SUPPORTS_STATIC_SAMPLERS
+
+// Static sampler table must match D3D12RootSignature.cpp
+SamplerState D3DStaticPointWrappedSampler       : register(s0, space1000);
+SamplerState D3DStaticPointClampedSampler       : register(s1, space1000);
+SamplerState D3DStaticBilinearWrappedSampler    : register(s2, space1000);
+SamplerState D3DStaticBilinearClampedSampler    : register(s3, space1000);
+SamplerState D3DStaticTrilinearWrappedSampler   : register(s4, space1000);
+SamplerState D3DStaticTrilinearClampedSampler   : register(s5, space1000);
+
+#define GetGlobalSampler(Filter, WrapMode) D3DStatic##Filter##WrapMode##Sampler
+
+#endif // PLATFORM_SUPPORTS_STATIC_SAMPLERS

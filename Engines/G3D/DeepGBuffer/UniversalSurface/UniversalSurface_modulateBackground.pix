@@ -1,0 +1,80 @@
+#version 120 or 420 compatibility// -*- c++ -*-
+/**
+  \file UniversalSurface/UniversalSurface_modulateBackground.pix
+  \author Morgan McGuire, http://graphics.cs.williams.edu
+
+  \created 2014-04-04
+  \edited  2014-04-04
+ */
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <UniversalMaterial/UniversalMaterial.glsl>
+
+uniform_UniversalMaterial( );
+	
+/** Surface position in world space */
+varying vec3        wsPosition;
+
+varying vec2        texCoord;
+varying vec3        tan_Z;
+
+float backside = (gl_FrontFacing == g3d_InvertY) ? 1.0 : -1.0;
+
+#ifdef NORMALBUMPMAP
+#   if (PARALLAXSTEPS > 0)
+        /** Un-normalized (interpolated) tangent space eye vector */
+        varying vec3        _tsE;
+#   endif    
+    varying vec3        tan_X, tan_Y;
+#endif
+
+#if HAS_VERTEX_COLORS
+    varying vec4 vertexColor;
+#endif
+
+
+#include <BumpMap/BumpMap.glsl>
+    
+void main() {
+    vec3 wsEyePos = g3d_CameraToWorldMatrix[3].xyz;
+
+#   if defined(NORMALBUMPMAP)
+        float rawNormalLength = 1.0;
+        vec3 wsN;
+        vec2 offsetTexCoord;
+        vec3 tsN;
+#       if (PARALLAXSTEPS > 0)
+            bumpMap(normalBumpMap, bumpMapScale, bumpMapBias, texCoord, tan_X, tan_Y, tan_Z, backside, normalize(_tsE), wsN, offsetTexCoord, tsN, rawNormalLength, PARALLAXSTEPS);
+#       else
+            // Vanilla normal mapping
+            bumpMap(normalBumpMap, 0.0, 0.0,                  texCoord, tan_X, tan_Y, tan_Z, backside, vec3(0.0),       wsN, offsetTexCoord, tsN, rawNormalLength, PARALLAXSTEPS);
+#       endif
+
+#   else
+        // World space normal
+        vec3 wsN = normalize(tan_Z.xyz * backside);
+        vec2 offsetTexCoord = texCoord;
+#   endif
+
+    float coverage = 1.0;
+    {
+        coverage = texture2D(LAMBERTIAN_buffer, offsetTexCoord).a * LAMBERTIAN_readMultiplyFirst.a + LAMBERTIAN_readAddSecond.a;
+#       if HAS_VERTEX_COLORS
+            coverage *= vertexColor.a;
+#       endif
+    }
+
+    // TODO: Implement Fresnel hereW
+    Color3 color;
+#   ifdef TRANSMISSIVEMAP        
+        color = texture2D(transmissiveMap, texCoord).rgb;
+#       if defined(TRANSMISSIVECONSTANT)
+            color *= transmissiveConstant;
+#       endif
+#   elif defined(TRANSMISSIVECONSTANT)
+        color = transmissiveConstant;
+#   endif
+    gl_FragColor = vec4(color, coverage);
+}
+
+

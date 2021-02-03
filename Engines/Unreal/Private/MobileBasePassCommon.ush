@@ -1,0 +1,61 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MobileBasePassCommon.usf: Base pass definitions used by both vertex and pixel shader
+=============================================================================*/
+
+#define FogStruct MobileBasePass.Fog
+#define PlanarReflectionStruct MobileBasePass.PlanarReflection
+
+#define USE_PS_CLIP_PLANE PROJECT_ALLOW_GLOBAL_CLIP_PLANE
+
+#undef NEEDS_LIGHTMAP_COORDINATE
+
+#define NEEDS_LIGHTMAP_COORDINATE		(LQ_TEXTURE_LIGHTMAP)
+#define NEEDS_LIGHTMAP					(NEEDS_LIGHTMAP_COORDINATE)
+
+#ifndef PROJECT_MOBILE_DISABLE_VERTEX_FOG
+	#define PROJECT_MOBILE_DISABLE_VERTEX_FOG 0
+#endif
+
+#define USE_VERTEX_FOG					(!PROJECT_MOBILE_DISABLE_VERTEX_FOG) && MATERIAL_ENABLE_TRANSLUCENCY_FOGGING
+
+#define PACK_INTERPOLANTS (USE_VERTEX_FOG && NUM_VF_PACKED_INTERPOLANTS > 0 && (ES3_1_PROFILE))
+#define LANDSCAPE_BUG_WORKAROUND (IOS && IS_MOBILE_BASEPASS_VERTEX_SHADER && PACK_INTERPOLANTS)
+
+#if COMPILER_METAL
+// @todo-rco: @todo metal: FIXME!
+#define INTERP_TYPE float4
+#else
+#define INTERP_TYPE half4
+#endif
+
+struct FSharedMobileBasePassInterpolants
+{
+#if USE_VERTEX_FOG && !PACK_INTERPOLANTS
+	INTERP_TYPE VertexFog			: TEXCOORD7;
+#endif
+
+	float4 PixelPosition	: TEXCOORD8; // xyz = world position, w = clip z
+
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+	float3 PixelPositionExcludingWPO	: TEXCOORD9;
+#endif
+
+#if USE_PS_CLIP_PLANE
+	float OutClipDistance : OUTCLIPDIST;
+#endif
+
+#if MOBILE_MULTI_VIEW
+	float MultiViewId : VIEW_ID;
+#endif
+
+// Keep this dummy at the bottom of the structure for the DXC compiler
+// as it currently uses indexing for interpolator naming.  Otherwise
+// the VS to PS attribute mapping won't match
+#if LANDSCAPE_BUG_WORKAROUND
+	INTERP_TYPE DummyInterp		: DUMMY_INTERP;
+#endif
+};
+
+#define FMobileBasePassInterpolantsVSToPS FSharedMobileBasePassInterpolants

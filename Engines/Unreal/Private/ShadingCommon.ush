@@ -1,0 +1,100 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// SHADINGMODELID_* occupy the 4 low bits of an 8bit channel and SKIP_* occupy the 4 high bits
+#define SHADINGMODELID_UNLIT				0
+#define SHADINGMODELID_DEFAULT_LIT			1
+#define SHADINGMODELID_SUBSURFACE			2
+#define SHADINGMODELID_PREINTEGRATED_SKIN	3
+#define SHADINGMODELID_CLEAR_COAT			4
+#define SHADINGMODELID_SUBSURFACE_PROFILE	5
+#define SHADINGMODELID_TWOSIDED_FOLIAGE		6
+#define SHADINGMODELID_HAIR					7
+#define SHADINGMODELID_CLOTH				8
+#define SHADINGMODELID_EYE					9
+#define SHADINGMODELID_SINGLELAYERWATER		10
+#define SHADINGMODELID_THIN_TRANSLUCENT		11
+#define SHADINGMODELID_NUM					12
+#define SHADINGMODELID_MASK					0xF		// 4 bits reserved for ShadingModelID			
+
+// The flags are defined so that 0 value has no effect!
+// These occupy the 4 high bits in the same channel as the SHADINGMODELID_*
+#define HAS_ANISOTROPY_MASK				(1 << 4)
+#define SKIP_PRECSHADOW_MASK			(1 << 5)
+#define ZERO_PRECSHADOW_MASK			(1 << 6)
+#define SKIP_VELOCITY_MASK				(1 << 7)
+
+// Hair reflectance component (R, TT, TRT, Local Scattering, Global Scattering, Multi Scattering,...)
+#define HAIR_COMPONENT_R			0x1u
+#define HAIR_COMPONENT_TT			0x2u
+#define HAIR_COMPONENT_TRT			0x4u
+#define HAIR_COMPONENT_LS			0x8u 
+#define HAIR_COMPONENT_GS			0x10u
+#define HAIR_COMPONENT_MULTISCATTER	0x20u
+#define HAIR_COMPONENT_TT_MODEL  	0x40u
+
+// for debugging and to visualize
+float3 GetShadingModelColor(uint ShadingModelID)
+{
+	// TODO: PS4 doesn't optimize out correctly the switch(), so it thinks it needs all the Samplers even if they get compiled out
+	//	This will get fixed after launch per Sony...
+#if PS4_PROFILE
+		 if (ShadingModelID == SHADINGMODELID_UNLIT) return float3(0.1f, 0.1f, 0.2f); // Dark Blue
+	else if (ShadingModelID == SHADINGMODELID_DEFAULT_LIT) return float3(0.1f, 1.0f, 0.1f); // Green
+	else if (ShadingModelID == SHADINGMODELID_SUBSURFACE) return float3(1.0f, 0.1f, 0.1f); // Red
+	else if (ShadingModelID == SHADINGMODELID_PREINTEGRATED_SKIN) return float3(0.6f, 0.4f, 0.1f); // Brown
+	else if (ShadingModelID == SHADINGMODELID_CLEAR_COAT) return float3(0.1f, 0.4f, 0.4f); 
+	else if (ShadingModelID == SHADINGMODELID_SUBSURFACE_PROFILE) return float3(0.2f, 0.6f, 0.5f); // Cyan
+	else if (ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE) return float3(0.2f, 0.2f, 0.8f); // Blue
+	else if (ShadingModelID == SHADINGMODELID_HAIR) return float3(0.6f, 0.1f, 0.5f);
+	else if (ShadingModelID == SHADINGMODELID_CLOTH) return float3(0.7f, 1.0f, 1.0f); 
+	else if (ShadingModelID == SHADINGMODELID_EYE) return float3(0.3f, 1.0f, 1.0f); 
+	else if (ShadingModelID == SHADINGMODELID_SINGLELAYERWATER) return float3(0.5f, 0.5f, 1.0f);
+	else if (ShadingModelID == SHADINGMODELID_THIN_TRANSLUCENT) return float3(1.0f, 0.8f, 0.3f);
+	else return float3(1.0f, 1.0f, 1.0f); // White
+#else
+	switch(ShadingModelID)
+	{
+		case SHADINGMODELID_UNLIT: return float3(0.1f, 0.1f, 0.2f); // Dark Blue
+		case SHADINGMODELID_DEFAULT_LIT: return float3(0.1f, 1.0f, 0.1f); // Green
+		case SHADINGMODELID_SUBSURFACE: return float3(1.0f, 0.1f, 0.1f); // Red
+		case SHADINGMODELID_PREINTEGRATED_SKIN: return float3(0.6f, 0.4f, 0.1f); // Brown
+		case SHADINGMODELID_CLEAR_COAT: return float3(0.1f, 0.4f, 0.4f); // Brown
+		case SHADINGMODELID_SUBSURFACE_PROFILE: return float3(0.2f, 0.6f, 0.5f); // Cyan
+		case SHADINGMODELID_TWOSIDED_FOLIAGE: return float3(0.2f, 0.2f, 0.8f); // Cyan
+		case SHADINGMODELID_HAIR: return float3(0.6f, 0.1f, 0.5f);
+		case SHADINGMODELID_CLOTH: return float3(0.7f, 1.0f, 1.0f);
+		case SHADINGMODELID_EYE: return float3(0.3f, 1.0f, 1.0f);
+		case SHADINGMODELID_SINGLELAYERWATER: return float3(0.5f, 0.5f, 1.0f);
+		case SHADINGMODELID_THIN_TRANSLUCENT: return float3(1.0f, 0.8f, 0.3f);
+		default: return float3(1.0f, 1.0f, 1.0f); // White
+	}
+#endif
+}
+
+
+float DielectricSpecularToF0(float Specular)
+{
+	return 0.08f * Specular;
+}
+
+// [Burley, "Extending the Disney BRDF to a BSDF with Integrated Subsurface Scattering"]
+float DielectricF0ToIor(float F0)
+{
+	return 2.0f / (1.0f - sqrt(F0)) - 1.0f;
+}
+
+float DielectricIorToF0(float Ior)
+{
+	const float F0Sqrt = (Ior-1)/(Ior+1);
+	const float F0 = F0Sqrt*F0Sqrt;
+	return F0;
+}
+
+float3 ComputeF0(float Specular, float3 BaseColor, float Metallic)
+{
+	return lerp(DielectricSpecularToF0(Specular).xxx, BaseColor, Metallic.xxx);
+}
+
+

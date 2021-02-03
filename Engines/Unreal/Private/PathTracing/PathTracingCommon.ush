@@ -1,0 +1,17 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PathTracingCommon.ush: common header used in multiple ray generation shaders
+=============================================================================*/
+
+#pragma once
+
+#ifndef PATHTRACINGCOMMON_USH_INCLUDED
+#define PATHTRACINGCOMMON_USH_INCLUDED // Workarround for UE-66460
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "PathTracingDefinitions.ush"
+
+
+#endif // PATHTRACINGCOMMON_USH_INCLUDED // Workarround for UE-66460
+

@@ -1,0 +1,58 @@
+#version 410 or 460
+/**
+  \file data-files/shader/SlowMesh/SlowMesh_render.pix
+
+  Apply a color and texture.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <g3dmath.glsl>
+#expect HAS_TEXTURE "1 or 0"
+
+in vec3 csNormal;
+in vec3 csPosition;
+
+// For DECLARE_writePixel's computeRefractionOffset helper
+const vec2 backSizeMeters = vec2(1.0);
+
+#if defined(WRITE_PIXEL_FILENAME)
+#   include WRITE_PIXEL_FILENAME
+#else
+    out vec4 _result; void writePixel(vec3 premultipliedReflectionAndEmission, float coverage, vec3 transmissionCoefficient, float smoothness, float etaRatio, vec3 csPosition, vec3 csNormal) { _result = vec4(premultipliedReflectionAndEmission, coverage); }
+#endif
+
+in vec4         color;
+
+#if HAS_TEXTURE
+    in vec2             texCoord;
+    uniform sampler2D   textureMap;
+#endif
+
+void main() {
+    
+    vec4 c = 
+#       if HAS_TEXTURE
+            texture2D(textureMap, texCoord) * 
+#       endif
+        color;
+
+#   if defined(COVERAGE_SAMPLES) && COVERAGE_SAMPLES > 1
+    {
+        // The more clever methods for computing number of bits set
+        // are all a terrible idea on a GPU.
+        int bitmask = gl_SampleMaskIn[0];
+        int sum = 0;
+        for (int b = 0; b < COVERAGE_SAMPLES; ++b) {
+            sum += bitmask & 1;
+            bitmask = bitmask >> 1;
+        }
+        c.a *= float(sum) / float(COVERAGE_SAMPLES);
+    }
+#   endif
+
+    writePixel(c.rgb * c.a, c.a, vec3(0), 1, 1, csPosition, normalize(csNormal));
+}

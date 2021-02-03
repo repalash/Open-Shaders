@@ -1,0 +1,124 @@
+#version 430 // -*- c++ -*-
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+
+// Other dimensions are 1 by default
+layout(local_size_x = 8, local_size_y = 4) in;
+
+layout(rgba32f)  uniform image2D    irradianceImage;
+layout(rg16f)    uniform image2D    visibilityImage;
+
+uniform sampler2D irradianceTexture;
+uniform sampler2D visibilityTexture;
+
+uniform int irradianceSide;
+uniform int visibilitySide;
+
+const int halfLocalSize = (int)gl_WorkGroupSize.x / 2;
+
+// Compute the oct frag coord with (0,0) as the top left of the border
+ivec2 octFragCoord(vec2 fragCoord, int probeSideLength) {
+    ivec2 adjustedCoord = ivec2(fragCoord);
+    return ivec2(mod(adjustedCoord.x, probeSideLength + 2), mod(adjustedCoord.y, probeSideLength + 2));
+}
+
+void main() {
+    ivec2 texelCoord;
+
+    int fullIrradianceBlockSide = 2 * (irradianceSide + 2);
+    int fullVisibilityBlockSide = 2 * (visibilitySide + 2);
+
+    // Add (1,1) for probe border.
+    ivec2 topLeftCornerOf4ProbeIrradianceBlock = ivec2(gl_WorkGroupID.xy) * fullIrradianceBlockSide;// + ivec2(1,1);
+    ivec2 topLeftCornerOf4ProbeVisibilityBlock = ivec2(gl_WorkGroupID.xy) * fullVisibilityBlockSide;// + ivec2(1,1);
+
+    bool irradiance = true;
+
+    ivec2 pixelCoordWithin4Block;
+
+    // First thread processes corners for 2x2 probe block.
+    if (gl_WorkGroupID.z == 0) {
+        irradiance = (gl_LocalInvocationID.x < halfLocalSize);
+
+        ivec2 invocationID = ivec2(gl_LocalInvocationID.x % halfLocalSize, gl_LocalInvocationID.y);
+        int probeSide = irradiance ? irradianceSide : visibilitySide;
+        texelCoord = irradiance ? topLeftCornerOf4ProbeIrradianceBlock : topLeftCornerOf4ProbeVisibilityBlock;
+
+        // Corner pixels
+        pixelCoordWithin4Block = ivec2(invocationID * (probeSide + 1)) - ivec2(probeSide * (invocationID / 2));
+
+        texelCoord += pixelCoordWithin4Block;
+    }
+    else {
+        // Irradiance = 1-4, Visibility = 5-12
+        // With 8x4 launch, need 4 blocks for 4 probes.
+        int irradianceEndIndex = (int)gl_WorkGroupSize.y * (irradianceSide / (int)gl_WorkGroupSize.x);
+        int visibilityStartIndex = irradianceEndIndex + 1;
+
+        irradiance = gl_WorkGroupID.z < visibilityStartIndex;
+        int id = (int)gl_LocalInvocationID.y;
+
+        int probeSide = irradiance ? irradianceSide : visibilitySide;
+        int probeSideOne = probeSide + 1;
+
+        // This makes sense because of int division.
+        // Irradiance (1-4) = 0110, Visibility (5-13) = 01100110
+        int workGroupMod2 = ((int)gl_WorkGroupID.z / 2) % 2;
+
+        int localThreadID = (int)gl_LocalInvocationID.x + (irradiance ? 0 : (int)gl_WorkGroupSize.x * ((int)gl_WorkGroupID.z % 2));
+
+        ivec2 offsetCoord = ivec2(1 + localThreadID + workGroupMod2 * (probeSideOne + 1),
+            id * probeSideOne - ivec2(probeSide * (id / 2)));
+
+        int visibilityHalfIndex = ((int)gl_NumWorkGroups.z + visibilityStartIndex) / 2;
+
+        // If we're in the second half of the visibility or irradiance threads, we're
+        // processing columns, so flip the indices.
+        if (gl_WorkGroupID.z >= visibilityHalfIndex || 
+            (gl_WorkGroupID.z <= irradianceEndIndex && gl_WorkGroupID.z > (irradianceEndIndex / 2))) {
+            offsetCoord = offsetCoord.yx;
+        }
+        texelCoord = offsetCoord + (irradiance ? topLeftCornerOf4ProbeIrradianceBlock : topLeftCornerOf4ProbeVisibilityBlock);
+    }
+
+
+    vec2 octCoord = vec2(octFragCoord(texelCoord, irradiance ? irradianceSide : visibilitySide));
+
+    int probeSideLength = irradiance ? irradianceSide : visibilitySide;
+
+    ivec2 probeSideWithBorderLength = ivec2(probeSideLength + 1);
+
+    // Rescale all border texels to have the correct
+    // offset along their side.
+    ivec2 readOffset = ivec2(-2 * octCoord) + probeSideWithBorderLength;
+
+    // Set only the corner texels to sample from the opposite corner.
+    // Note that only the corner texels will have offsets with
+    // equal absolute value.
+    if (abs(readOffset.x) == abs(readOffset.y)) {
+        readOffset = sign(readOffset) * probeSideLength;
+    }
+
+    // Set border (not corner) texels to have the correct offset
+    // from their side into the valid texels (i.e., 1 or -1). Note that
+    // the body if this IF statement differs from the one above.
+    if (abs(readOffset.x) == probeSideWithBorderLength.x) {
+        readOffset.x = sign(readOffset.x);
+    }
+
+    if (abs(readOffset.y) == probeSideWithBorderLength.y) {
+        readOffset.y = sign(readOffset.y);
+    }
+
+    if (irradiance) {
+        imageStore(irradianceImage,
+            texelCoord, texelFetch(irradianceTexture, texelCoord + readOffset, 0));
+    }
+    else {
+		imageStore(visibilityImage,
+			texelCoord,
+			texelFetch(visibilityTexture, texelCoord + readOffset, 0)
+			//vec4(1, 1, 0, 1)
+			);
+    }
+}

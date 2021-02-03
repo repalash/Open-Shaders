@@ -1,0 +1,359 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessPixelProjectedReflectionMobile.usf
+=============================================================================*/
+
+#include "Common.ush"
+
+#define PROJECTION_CLEAR_VALUE				0xFFFFFFFF
+#define PROJECTION_PLANE_VALUE				0xFFFFFFFE
+#define PROJECTION_OUTPUT_TYPE_BUFFER		0
+#define PROJECTION_OUTPUT_TYPE_TEXTURE		1
+#define QUALITY_LEVEL_BEST_PERFORMANCE		0
+#define QUALITY_LEVEL_BETTER_QUALITY		1
+#define QUALITY_LEVEL_BEST_QUALITY			2
+
+#if QUALITY_LEVEL == QUALITY_LEVEL_BETTER_QUALITY
+	#define PPR_MAX_STEPS					4
+	#define INV_PPR_MAX_STEPS				0.25f
+#elif QUALITY_LEVEL == QUALITY_LEVEL_BEST_QUALITY
+	#define PPR_MAX_STEPS					32
+	#define INV_PPR_MAX_STEPS				0.03125f
+#endif
+
+// After transforming, the Y of the PixelOffset is the longest and positive coordinate
+const static int4 BasisSnappedMatrices[4] = { int4(0, -1, 1, 0) , int4(0, 1, -1, 0), int4(1, 0, 0, 1), int4(-1, 0, 0, -1) };
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
+float4 ReflectionPlane;
+half4 BufferSizeAndInvSize;
+half4 ViewSizeAndInvSize;
+half4 ViewRectMin;
+
+float2 ProjectionPixelToBufferUV(int2 ReflectionPixel)
+{
+#if REFLECTION_PASS_PIXEL_SHADER
+	uint2 ViewportPos = (ReflectionPixel + float2(0.5f, 0.5f) - ViewRectMin.xy) * ViewSizeAndInvSize.zw * ResolvedView.ViewSizeAndInvSize.xy;
+#else
+	uint2 ViewportPos = (ReflectionPixel + float2(0.5f, 0.5f)) * ViewSizeAndInvSize.zw * ResolvedView.ViewSizeAndInvSize.xy;
+#endif
+
+	float2 BufferUV = ((float2)ViewportPos + float2(0.5f, 0.5f) + ResolvedView.ViewRectMin.xy) * ResolvedView.BufferSizeAndInvSize.zw;
+
+	return BufferUV;
+}
+
+#if PROJECTION_PASS_COMPUTE_SHADER
+
+RWTexture2D<half4> OutputSceneColor;
+
+#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
+RWTexture2D<uint> OutputProjection;
+#else
+RWBuffer<uint> OutputProjection;
+#endif
+
+// Calculate coordinate system index based on offset
+uint GetPackingBasisIndexTwoBits (int2 PixelOffset)
+{
+	if (abs(PixelOffset.x) >= abs(PixelOffset.y))
+		return PixelOffset.x >= 0 ? 0 : 1;
+	return PixelOffset.y >= 0 ? 2 : 3;
+}
+
+// Encode offset for ' projection buffer ' storage
+uint EncodeProjectionBufferValue(int2 PixelOffset)
+{
+	// build snapped basis
+	uint PackingBasisIndex = GetPackingBasisIndexTwoBits(PixelOffset);
+	
+	// transform both parts to snapped basis
+	int2 TransformedPixelOffset = int2(dot(BasisSnappedMatrices[PackingBasisIndex].xy, PixelOffset), dot(BasisSnappedMatrices[PackingBasisIndex].zw, PixelOffset));
+
+	uint EncodeValue = 0;
+
+	// pack whole part
+	EncodeValue = ((TransformedPixelOffset.y << 12) | (abs(TransformedPixelOffset.x) << 1) | (TransformedPixelOffset.x >= 0 ? 1 : 0)) << 2;
+
+	// pack basis part
+	EncodeValue += PackingBasisIndex;
+
+	return EncodeValue;
+}
+
+void ProjectionBufferWrite(int2 BufferPos, uint BufferValue)
+{
+#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
+	int2 WriteOffset = BufferPos + ViewRectMin.xy;
+#else
+	int WriteOffset = (BufferPos.x + ViewRectMin.x) + ((BufferPos.y + ViewRectMin.y) * BufferSizeAndInvSize.x);
+#endif
+	uint OriginalValue = 0;
+	InterlockedMin(OutputProjection[WriteOffset], BufferValue, OriginalValue);
+}
+
+void ProjectionPassWrite(int2 ReflectedPixel, half2 ReflectingCoord)
+{
+	for (int y = 0; y < 2; ++y)
+	{
+		for (int x = 0; x < 2; ++x)
+		{
+			int2 ReflectingPixel = floor(ReflectingCoord + half2(x, y));
+
+			int2 PixelOffset = ReflectingPixel - ReflectedPixel;
+
+			{
+				uint ValueToWrite = EncodeProjectionBufferValue(PixelOffset);
+
+				ProjectionBufferWrite(ReflectingPixel, ValueToWrite);
+			}
+		}
+	}
+}
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void ProjectionPassCS(
+	int   GroupIndex : SV_GroupIndex,
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID
+#if INSTANCED_STEREO
+	, uint InstanceId : SV_InstanceID
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in uint ViewId : SV_ViewID
+	, out float MultiViewIndex : VIEW_ID
+#endif
+)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = GetEyeIndex(InstanceId);
+	ResolvedView = ResolveView(EyeIndex);
+	LayerIndex = EyeIndex;
+#elif MOBILE_MULTI_VIEW
+#if COMPILER_GLSL_ES3_1
+	const int MultiViewId = int(ViewId);
+	ResolvedView = ResolveView(uint(MultiViewId));
+	MultiViewIndex = float(MultiViewId);
+#else
+	ResolvedView = ResolveView(ViewId);
+	MultiViewIndex = float(ViewId);
+#endif
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	int2 ReflectedPixel = DispatchThreadId.xy;
+
+	if (all(ReflectedPixel.xy < (int2)ViewSizeAndInvSize.xy))
+	{
+		float2 BufferUV = ProjectionPixelToBufferUV(ReflectedPixel);
+
+		float SceneDepth = ConvertFromDeviceZ(Texture2DSample(SceneDepthTexture, SceneDepthSampler, BufferUV).r);
+
+		float3 ViewPosition = ScreenToViewPos(BufferUV, SceneDepth);
+
+		float PlaneDistance = dot(ReflectionPlane, float4(ViewPosition, -1.0f));
+
+		if (PlaneDistance > 0.01f )
+		{
+			float3 MirroredViewPosition = ViewPosition - ReflectionPlane.xyz * (2.f * PlaneDistance);
+
+			float4 MirroredProjectedPosition = mul(float4(MirroredViewPosition, 1.0f), ResolvedView.ViewToClip);
+			half2 MirroredProjectedUV = MirroredProjectedPosition.xy / MirroredProjectedPosition.w;
+
+			if (all(abs(MirroredProjectedUV.xy) < 1.0f))
+			{
+				half2 ReflectingCoord = (MirroredProjectedUV.xy * half2(0.5f, -0.5f) + 0.5f) * ViewSizeAndInvSize.xy;
+				ProjectionPassWrite(ReflectedPixel, ReflectingCoord);
+			}
+		}
+		else
+		{
+			ProjectionBufferWrite(ReflectedPixel, PROJECTION_PLANE_VALUE);
+		}
+	}
+}
+#endif
+
+#if REFLECTION_PASS_VERTEX_SHADER
+
+float4x4 LocalToWorld;
+
+void ReflectionPassVS(
+	in float2 InPosition : ATTRIBUTE0,
+	out float4 OutPosition : SV_POSITION,
+	out float4 PixelPosition : TEXCOORD0
+#if INSTANCED_STEREO
+	, uint InstanceId : SV_InstanceID
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in uint ViewId : SV_ViewID
+	, out float MultiViewIndex : VIEW_ID
+#endif
+)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = GetEyeIndex(InstanceId);
+	ResolvedView = ResolveView(EyeIndex);
+	LayerIndex = EyeIndex;
+#elif MOBILE_MULTI_VIEW
+#if COMPILER_GLSL_ES3_1
+	const int MultiViewId = int(ViewId);
+	ResolvedView = ResolveView(uint(MultiViewId));
+	MultiViewIndex = float(MultiViewId);
+#else
+	ResolvedView = ResolveView(ViewId);
+	MultiViewIndex = float(ViewId);
+#endif
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	float3 LocalPosition = float3(InPosition, 0);
+
+	float3 RotatedPosition = LocalToWorld[0].xyz * LocalPosition.xxx + LocalToWorld[1].xyz * LocalPosition.yyy + LocalToWorld[2].xyz * LocalPosition.zzz;
+	
+	float4 TranslatedWorldPosition = float4(RotatedPosition + (LocalToWorld[3].xyz + ResolvedView.PreViewTranslation.xyz), 1);
+
+	OutPosition = mul(TranslatedWorldPosition, ResolvedView.TranslatedWorldToClip);
+
+	PixelPosition = TranslatedWorldPosition;
+}
+#endif
+
+#if REFLECTION_PASS_PIXEL_SHADER
+
+#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
+Texture2D<uint> ProjectionBuffer;
+SamplerState ProjectionBufferSampler;
+#else
+Buffer<uint> ProjectionBuffer;
+#endif
+
+uint GetEncodeValue(int2 ReflectingPixel)
+{
+#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
+#if COMPILER_GLSL_ES3_1 // Force to use a point sampler for Texture2D<uint> on OpenGLES platform
+	uint EncodeValue = ProjectionBuffer.SampleLevel(ProjectionBufferSampler, (ReflectingPixel + float2(0.5f, 0.5f)) * BufferSizeAndInvSize.zw, 0).x;
+#else
+	uint EncodeValue = ProjectionBuffer.Load(int3(ReflectingPixel, 0));
+#endif
+#else
+	uint EncodeValue = ProjectionBuffer[ReflectingPixel.x + ReflectingPixel.y * int(BufferSizeAndInvSize.x)];
+#endif
+
+	return EncodeValue;
+}
+
+// Decode value read from 'projection buffer'
+void DecodeProjectionBufferValue(uint EncodeValue, out int2 PixelOffset)
+{
+	// unpack basis part
+	uint PackingBasisIndex = EncodeValue & 3;
+	EncodeValue = EncodeValue >> 2;
+
+	// unpack whole part
+	PixelOffset.x = ((EncodeValue & 1) == 1 ? 1 : -1) * ((EncodeValue >> 1) & 2047);
+	EncodeValue = EncodeValue >> 12;
+	PixelOffset.y = EncodeValue;
+
+	PixelOffset = int2(dot(PixelOffset, BasisSnappedMatrices[PackingBasisIndex].xz), dot(PixelOffset, BasisSnappedMatrices[PackingBasisIndex].yw));
+}
+
+// Make sure the EncodeValue is not equal to PROJECTION_CLEAR_VALUE and PROJECTION_PLANE_VALUE
+half4 DecodeReflectionColor(int2 ReflectingPixel, uint EncodeValue)
+{
+	half4 ReflectionColor = 0.0f;
+
+	int2 PixelOffset;
+
+	DecodeProjectionBufferValue(EncodeValue, PixelOffset);
+
+	int2 ReflectedPixel = ReflectingPixel - PixelOffset;
+
+	half2 ReflectedUV = (ReflectedPixel + 0.5f - ViewRectMin.xy) * ViewSizeAndInvSize.zw;
+
+	ReflectionColor.xyz = Texture2DSample(SceneColorTexture, SceneColorSampler, ProjectionPixelToBufferUV(ReflectedPixel)).xyz;
+
+	//Fade the reflection color to the background color if the ReflectedUV is near the edge of the screen.
+	half2 Vignette = saturate(abs(ReflectedUV * 2.0f - 1.0f) * 5.0f - 4.0f);
+	half FadeAlpha = saturate(1.0 - dot(Vignette, Vignette));
+
+	ReflectionColor.a = FadeAlpha;
+
+	return ReflectionColor;
+}
+
+void ReflectionPassPS(
+	in float4 SvPosition : SV_Position,
+	in float4 PixelPosition : TEXCOORD0,
+#if MOBILE_MULTI_VIEW
+	in float MultiViewId : VIEW_ID,
+#endif
+	out half4 OutColor : SV_Target0)
+{
+#if MOBILE_MULTI_VIEW
+	ResolvedView = ResolveView(uint(MultiViewId));
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	OutColor = half4(0.0f, 0.0f, 0.0f, 0.0f);
+
+#if QUALITY_LEVEL >= QUALITY_LEVEL_BETTER_QUALITY
+	OutColor.xyz = Texture2DSample(SceneColorTexture, SceneColorSampler, ProjectionPixelToBufferUV(uint2(SvPosition.xy)));
+#endif
+
+	int2 ReflectingPixel = SvPosition.xy;
+
+	uint EncodeValue = GetEncodeValue(ReflectingPixel);
+
+	// Write reflection color
+	if (EncodeValue < PROJECTION_PLANE_VALUE)
+	{
+		OutColor = DecodeReflectionColor(ReflectingPixel, EncodeValue);
+	}
+#if QUALITY_LEVEL >= QUALITY_LEVEL_BETTER_QUALITY
+	else if (EncodeValue == PROJECTION_PLANE_VALUE)
+	{
+		half4 ProjectedReflectionNormal = mul(float4(-ReflectionPlane.xyz, 0.0f), ResolvedView.TranslatedWorldToClip);
+
+		half2 PixelMoveDirection = ProjectedReflectionNormal.xy / max(abs(ProjectedReflectionNormal.x), abs(ProjectedReflectionNormal.y));
+
+		PixelMoveDirection.y = -PixelMoveDirection.y;
+
+		uint CurrentStep = 1;
+
+		while (CurrentStep <= PPR_MAX_STEPS)
+		{
+			int2 CurrentReflectingPixel = ReflectingPixel + CurrentStep * PixelMoveDirection;
+
+			CurrentStep += 1;
+
+			if (all(CurrentReflectingPixel >= 0) && all(CurrentReflectingPixel < ViewSizeAndInvSize.xy))
+			{
+				uint CurrentEncodeValue = GetEncodeValue(CurrentReflectingPixel);
+
+				if (CurrentEncodeValue < PROJECTION_PLANE_VALUE)
+				{
+					OutColor = DecodeReflectionColor(CurrentReflectingPixel, CurrentEncodeValue);
+					OutColor.a *= (PPR_MAX_STEPS - CurrentStep + 1) * INV_PPR_MAX_STEPS;
+					break;
+				}
+			}
+		}
+	}
+#endif
+
+#if USE_PREEXPOSURE
+	OutColor.rgb *= ResolvedView.OneOverPreExposure;
+#endif
+}
+#endif

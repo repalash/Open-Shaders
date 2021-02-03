@@ -1,0 +1,127 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MorphTargets.usf: Compute shader for calculating Morph Targets.
+=============================================================================*/
+
+
+#include "Common.ush"
+
+////////////////////////////////////////////////////////////////
+
+#define GMorphTargetDispatchBatchSize 128
+
+RWBuffer<uint> MorphVertexBuffer;
+RWBuffer<int> MorphNormalizationBuffer;
+
+uint4 ThreadOffsets[GMorphTargetDispatchBatchSize / 4];
+float4 MorphTargetWeight[GMorphTargetDispatchBatchSize / 4];
+
+float4 PositionScale;
+float WeightScale;
+uint GlobalDispatchOffset;
+
+Buffer<uint> VertexIndicies;
+Buffer<float> MorphDeltas;
+
+groupshared float LocalWeights[GMorphTargetDispatchBatchSize];
+groupshared uint LocalThreadOffsets[GMorphTargetDispatchBatchSize];
+
+#if 0
+// This is how MorphVertexBuffer is interpreted as (6 floats)
+struct FMorphGPUSkinVertex
+{
+	FFloat16 PosDelta[3];
+	FFloat16 TangentDelta[3];
+};
+#endif
+
+float FindWeight(in uint DispatchIndex, out uint2 Offsets)
+{
+	uint Idx = 0;
+	uint Width = GMorphTargetDispatchBatchSize >> 1;
+	
+	UNROLL
+	while (Width > 0)
+	{
+		Idx += (DispatchIndex < LocalThreadOffsets[Idx + Width]) ? 0 : Width;
+		Width = Width >> 1;
+	}
+
+	Offsets = GlobalDispatchOffset + float2(0, LocalThreadOffsets[Idx + 1]);
+	return LocalWeights[Idx];
+}
+
+void LoadLocalData(uint GroupIndex)
+{
+	if (GroupIndex < GMorphTargetDispatchBatchSize / 4)
+	{
+		uint GroupSharedIndex = GroupIndex * 4;
+		float4 Weight = MorphTargetWeight[GroupIndex];
+		uint4 Offset = ThreadOffsets[GroupIndex];
+
+		for (int i = 0; i < 4; ++i)
+		{
+			LocalWeights[GroupSharedIndex + i] = Weight[i];
+			LocalThreadOffsets[GroupSharedIndex + i] = Offset[i];
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+}
+
+[numthreads(2, 32, 1)]
+void GPUMorphUpdateCS(uint2 DispatchId : SV_DispatchThreadID, uint2 GroupId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+{
+	LoadLocalData(GroupIndex);
+
+	uint2 Offsets;
+	float Weight = FindWeight(DispatchId.y, Offsets);
+
+	const uint WorkItemIndex = DispatchId.y + Offsets.x;
+	if (WorkItemIndex < Offsets.y && (Weight != 0.0f))
+	{		
+		for (uint i = 0; i < 3; i++)
+		{
+			const uint ElementIndex = 3 * GroupId.x + i;
+			const uint MorphVertexBufferStride = 3u + 3u;
+			float MorphDelta = MorphDeltas[MorphVertexBufferStride * WorkItemIndex + ElementIndex];
+			float MorphOffset = Weight * MorphDelta;
+
+			float Scale = (GroupId.x == 0) ? PositionScale[i] : PositionScale[3];
+			int QuantizedOffset = round(MorphOffset * Scale);
+
+			const uint DestVertexIndex = MorphVertexBufferStride * VertexIndicies[WorkItemIndex] + ElementIndex;
+			InterlockedAdd(MorphVertexBuffer[DestVertexIndex], asuint(QuantizedOffset));
+		}
+
+		if (GroupId.x == 0)
+		{
+			int QuantizedWeight = round(Weight * WeightScale);
+			InterlockedAdd(MorphNormalizationBuffer[WorkItemIndex], QuantizedWeight);
+		}
+	}
+}
+
+[numthreads(2, 32, 1)]
+void GPUMorphNormalizeCS(uint2 DispatchId : SV_DispatchThreadID, uint2 GroupId : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint WorkItemIndex = DispatchId.y;
+	for (uint i = 0; i < 3; i++)
+	{
+		const uint ElementIndex = 3 * GroupId.x + i;
+		const uint MorphVertexBufferStride = 3u + 3u;
+		const uint DestVertexIndex = MorphVertexBufferStride * WorkItemIndex + ElementIndex;
+
+		float Scale = (GroupId.x == 0) ? PositionScale[i] : PositionScale[3];
+		float NomalizedResult = float(asint(MorphVertexBuffer[DestVertexIndex])) * Scale;
+		//normalize directions by 1 / accumulated absolute weights
+
+		float Weight = float(MorphNormalizationBuffer[WorkItemIndex]) * WeightScale;
+		if(GroupId.x && Weight > 1.0f)
+		{
+			NomalizedResult /= Weight;
+		}
+		MorphVertexBuffer[DestVertexIndex] = asuint(NomalizedResult);
+	}
+}

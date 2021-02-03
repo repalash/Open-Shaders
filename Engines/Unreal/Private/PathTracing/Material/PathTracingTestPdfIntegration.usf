@@ -1,0 +1,77 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingTestPdfIntegration.usf: BRDF tests 
+===============================================================================================*/
+
+#include "../../Montecarlo.ush"
+#include "../PathTracingDefinitions.ush"
+#include "PathTracingMaterialSampling.ush"
+#include "../Utilities/PathTracingRandomSequence.ush"
+
+
+RWStructuredBuffer<float> PdfsResultsBuffer;
+uint  BrdfType;
+float3 Wo;
+uint  NumThetaSteps;
+uint  NumPhiSteps;
+
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+
+void TestPDFIntegratesToOneCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint2 GridCoordinate = DispatchThreadId.xy;
+
+	if (GridCoordinate.x >= NumPhiSteps || GridCoordinate.y >= NumThetaSteps)
+	{
+		return;
+	}
+
+	uint ThetaIndex = GridCoordinate.x;
+	uint PhiIndex = GridCoordinate.y;
+	
+	// Sample with constant CosTheta instead constant Theta
+	// to divide the hemisphere in patches of equal area
+	float ThetaLength = 1.0 / NumThetaSteps; //Hemisphere only so far
+	float PhiLength = 2*PI / NumPhiSteps;
+
+	FMaterialClosestHitPayload Payload = (FMaterialClosestHitPayload)0;
+	Payload.WorldNormal = float3(0.0, 0.0, 1.0);
+	Payload.DiffuseColor = float3(0.37, 0.37, 0.37);
+	Payload.SpecularColor = float3(0.37, 0.37, 0.37);
+	Payload.Roughness = 0.1;
+
+	float CosTheta = (float)ThetaIndex * ThetaLength;
+	float SinTheta = sqrt(1 - (CosTheta*CosTheta));
+
+	float Phi = ((float)PhiIndex* PhiLength);
+	float SinPhi, CosPhi;
+	sincos(Phi, SinPhi, CosPhi);
+
+	float3 Wi = normalize(float3(SinTheta*CosPhi, SinTheta*SinPhi, CosTheta));
+
+	float PDF;
+	
+	if (BrdfType == 0)
+	{
+		PDF = Lambert_Pdf(Wi, Payload);
+	}
+	else if (BrdfType == 1)
+	{
+		PDF = Glossy_Pdf(Wo, Wi, Payload);
+	}
+	else
+	{
+		// Should never be here, generate invalid outgoing to trigger an error
+		Wi = float3(0.0, 0.0, 0.0);
+		PDF = -1.0;
+	}
+	// Same probability for all samples because CosTheta is constant in all ThetaSteps
+	float P = 1.0 / (2.0*PI);
+	PdfsResultsBuffer[NumPhiSteps*ThetaIndex + PhiIndex] = PDF / P;
+}
+

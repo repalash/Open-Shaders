@@ -1,0 +1,65 @@
+#version 410
+/**
+  \file data-files/shader/combineColorTexture.pix
+
+  A simple shader designed to combine either two textures or a texture and a color using 
+  one of a set of operations. This is used to load COLLADA models which may have multiple textures. 
+  In order to load them into G3D they are combined into a single texture.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+
+#expect COLOR "binary"
+#expect OPERATION "[0-5]"
+
+uniform sampler2D       tex;
+
+#if (COLOR == 1)
+    uniform vec3        color;
+#else
+    uniform sampler2D   tex1;
+#endif
+
+
+#if (COLOR == 1)
+    #define MIXER color
+#else
+    #define MIXER texelFetch(tex1, ivec2(gl_FragCoord.xy), 0).rgb
+#endif
+
+/**
+* Operations for combining textures. defined by the assimp library at:
+* http://assimp.sourceforge.net/lib_html/material_8h.html#afcd3096d69affba13114cedfc6f9ee6b
+**/
+#define MULT_OP 0
+#define ADD_OP 1
+#define SUB_OP 2
+#define DIV_OP 3
+#define SMOOTHADD_OP 4
+#define SIGNEDADD_OP 5
+
+void main(void) {
+
+    gl_FragData[0].a = 1.0;
+#   if OPERATION == MULT_OP
+        gl_FragData[0].rgb = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb * MIXER;
+#   elif OPERATION == ADD_OP
+        gl_FragData[0].rgb =  texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb + MIXER;
+#   elif OPERATION == SUB_OP
+        gl_FragData[0].rgb = MIXER - texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb;
+#   elif OPERATION == DIV_OP
+        gl_FragData[0].rgb = MIXER/texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb;
+#   elif OPERATION == SMOOTHADD_OP
+        gl_FragData[0].rgb = (texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb + MIXER) - 
+            (texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb * MIXER);
+#   elif OPERATION == SIGNEDADD_OP
+        gl_FragData[0].rgb = ( texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb - vec3(0.5, 0.5, 0.5) ) + MIXER;
+#   else
+        gl_FragData[0].rgb = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).rgb;
+#   endif
+}

@@ -1,0 +1,115 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	QuasiRandom.ush: Quasi-random sampling interface and utilities
+=============================================================================*/
+
+#pragma once
+
+#include "BlueNoise.ush"
+#include "Halton.ush"
+#include "MortonCode.ush"
+
+struct FQuasiRandom
+{
+	uint PositionSeed;
+	uint TimeSeed;
+
+	uint HaltonSequence;
+	uint HaltonIteration;
+	uint Dimension;
+
+	uint2 BlueNoiseCoord;
+};
+
+// http://burtleburtle.net/bob/hash/integer.html
+// Bob Jenkins integer hashing function in 6 shifts.
+uint IntegerHash(uint a)
+{
+	a = (a + 0x7ed55d16) + (a << 12);
+	a = (a ^ 0xc761c23c) ^ (a >> 19);
+	a = (a + 0x165667b1) + (a << 5);
+	a = (a + 0xd3a2646c) ^ (a << 9);
+	a = (a + 0xfd7046c5) + (a << 3);
+	a = (a ^ 0xb55a4f09) ^ (a >> 16);
+	return a;
+}
+
+void QuasiRandom_Update(inout FQuasiRandom QuasiRandom, uint Iteration, uint IterationStride);
+
+void QuasiRandom_Initialize(inout FQuasiRandom QuasiRandom, float2 PixelIndex, uint Iteration, uint IterationStride)
+{
+	// Translate PixelIndex to SequenceIndex if scrambling is desired
+	QuasiRandom.PositionSeed = IntegerHash(MortonEncode(PixelIndex));
+
+	uint2 TileIndex = PixelIndex % uint2(HaltonIteration.SequenceColumnCount, HaltonIteration.SequenceRowCount);
+	QuasiRandom.HaltonSequence = MortonEncode(TileIndex);
+	QuasiRandom.BlueNoiseCoord = PixelIndex % BlueNoise.Dimensions.xy;
+
+	QuasiRandom_Update(QuasiRandom, Iteration, IterationStride);
+}
+
+void QuasiRandom_Update(inout FQuasiRandom QuasiRandom, uint Iteration, uint IterationStride)
+{
+	QuasiRandom.TimeSeed = View.StateFrameIndex * IterationStride + Iteration;
+	QuasiRandom.HaltonIteration = Iteration;
+	QuasiRandom.Dimension = 0;
+}
+
+float QuasiRandom_Sample(inout FQuasiRandom QuasiRandom)
+{
+	float RandomSample = 0.0;
+	BRANCH
+	if (QuasiRandom.Dimension < uint(BlueNoise.Dimensions.z * 3))
+	{
+		// Evaluate shift vector
+		float3 BlueNoiseShiftVector = EvalBlueNoise(QuasiRandom.BlueNoiseCoord, QuasiRandom.Dimension / 3);
+		float BlueNoiseShift = BlueNoiseShiftVector[QuasiRandom.Dimension % 3];
+
+		// Evaluate Halton
+		float HaltonSample = HaltonSequence(QuasiRandom.HaltonSequence, QuasiRandom.HaltonIteration, QuasiRandom.Dimension);
+
+		// Wrap sum
+		RandomSample = fmod(HaltonSample + BlueNoiseShift, 1.0);
+	}
+	else
+	{
+		RandomSample = HaltonProcedural(QuasiRandom.PositionSeed + QuasiRandom.TimeSeed, HaltonPrime(QuasiRandom.Dimension));
+	}
+
+	// Increment dimension
+	QuasiRandom.Dimension++;
+
+	// Return shifted Halton sequence value
+	return RandomSample;
+}
+
+float3 QuasiRandom_Sample3(inout FQuasiRandom QuasiRandom)
+{
+	float3 RandomSample = 0.0;
+	BRANCH
+	if (QuasiRandom.Dimension + 2 < uint(BlueNoise.Dimensions.z * 3))
+	{
+		// Evaluate shift vector
+		float3 BlueNoiseShift = EvalBlueNoise(QuasiRandom.BlueNoiseCoord, QuasiRandom.Dimension / 3);
+
+		// Evaluate Halton
+		float3 HaltonSample = HaltonSequence3(QuasiRandom.HaltonSequence, QuasiRandom.HaltonIteration, QuasiRandom.Dimension / 3);
+
+		// Wrap sum
+		RandomSample = fmod(BlueNoiseShift + HaltonSample, 1.0);
+	}
+	else
+	{
+		uint3 Primes = HaltonPrime3(QuasiRandom.Dimension / 3);
+		RandomSample.x = HaltonProcedural(QuasiRandom.PositionSeed + QuasiRandom.TimeSeed, Primes[0]);
+		RandomSample.y = HaltonProcedural(QuasiRandom.PositionSeed + QuasiRandom.TimeSeed, Primes[1]);
+		RandomSample.z = HaltonProcedural(QuasiRandom.PositionSeed + QuasiRandom.TimeSeed, Primes[2]);
+	}
+
+	// Increment dimension
+	QuasiRandom.Dimension += 3;
+
+	// Return shifted Halton sequence value
+	return RandomSample;
+}

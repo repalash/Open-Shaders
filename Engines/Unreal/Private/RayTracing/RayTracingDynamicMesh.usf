@@ -1,0 +1,96 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	RayTracingDynamicMesh.usf
+=============================================================================*/
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+ 
+struct FRayTracingDynamicMeshVSToGS
+{
+	float4 WorldPosition : SV_POSITION;
+};
+
+void RayTracingDynamicMeshVS(
+	FVertexFactoryInput Input,
+	out FRayTracingDynamicMeshVSToGS Output
+	)
+{
+	ResolvedView = ResolveView();
+
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+	Output.WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates) - float4(ResolvedView.PreViewTranslation, 0.0f);
+}
+
+// Must match GetUniformMeshStreamOutLayout and TRIANGLE_VERTEX_DATA_STRIDE
+struct FRayTracingDynamicMeshVertex
+{
+	float4 WorldPosition : SV_POSITION;
+};
+
+[maxvertexcount(3)]
+void RayTracingDynamicMeshGS(triangle FRayTracingDynamicMeshVSToGS Inputs[3], inout TriangleStream<FRayTracingDynamicMeshVertex> OutStream)
+{ 
+	for (int i = 0; i < 3; i++)
+	{
+		FRayTracingDynamicMeshVSToGS Input = Inputs[i];
+
+		FRayTracingDynamicMeshVertex Vertex;
+		Vertex.WorldPosition = Input.WorldPosition;
+
+		OutStream.Append(Vertex);
+	}
+}
+
+#if COMPUTESHADER
+uint UsingIndirectDraw;
+uint NumVertices;
+uint MinVertexIndex;
+uint PrimitiveId;
+uint OutputVertexBaseIndex;
+RWBuffer<float> RWVertexPositions;
+int bApplyWorldPositionOffset;
+
+[numthreads(64, 1, 1)]
+void RayTracingDynamicGeometryConverterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{ 
+	if (DispatchThreadId.x >= NumVertices) return;
+
+	ResolvedView = ResolveView();
+
+	bool bUsingIndirectDraw = UsingIndirectDraw != 0;
+	uint NumActualVertices = bUsingIndirectDraw ? GetNumRayTracingDynamicMeshVerticesIndirect() : NumVertices;
+
+	uint VertexIndex = MinVertexIndex + DispatchThreadId.x;
+
+	if (DispatchThreadId.x < NumActualVertices)
+	{
+		FVertexFactoryInput Input = LoadVertexFactoryInputForDynamicUpdate(VertexIndex / 3, VertexIndex % 3, PrimitiveId);
+		FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+		float4 WorldPosition = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+		float3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);
+		FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPosition.xyz, TangentToLocal);
+
+		WorldPosition.xyz -= ResolvedView.PreViewTranslation;
+		if (bApplyWorldPositionOffset)
+		{
+			// We must guarantee that no NaNs are produced by WPO to avoid a possibility of producing invalid BLAS.
+			// DXR specification allows NaN positions to mark "inactive" primitives, but only when X component each vertex is NaN.
+			// This is impossible to guarantee here, since WPO is evaluated per vertex and not per triangle.
+			WorldPosition.xyz += MakeFinite(GetMaterialWorldPositionOffset(VertexParameters));
+		}
+
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 0] = WorldPosition.x;
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 1] = WorldPosition.y;
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 2] = WorldPosition.z;
+	}
+	else
+	{
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 0] = asfloat(0xFFFFFFFF);
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 1] = 0;
+		RWVertexPositions[OutputVertexBaseIndex + VertexIndex * 3 + 2] = 0;
+	}
+}
+#endif

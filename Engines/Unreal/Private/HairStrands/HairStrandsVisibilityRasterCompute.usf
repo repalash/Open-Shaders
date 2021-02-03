@@ -1,0 +1,418 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "HairStrandsVertexFactoryCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+///////////////////////////////////////////////////////////////////////////
+// 64 bits atomic
+#define RASTER_PLATFORM 0
+#define RASTER_NVIDIA 1
+#define RASTER_AMD_DX11 2
+#define RASTER_AMD_DX12 3
+
+// Add permutation for AMD/other
+#if PERMUTATION_RASTER_ATOMIC == RASTER_NVIDIA
+#define NV_SHADER_EXTN_SLOT u7
+#include "/Engine/Shared/ThirdParty/NVIDIA/nvHLSLExtns.h"
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX11
+#define AmdDxExtShaderIntrinsicsUAVSlot u7
+#include "/Engine/Shared/ThirdParty/AMD/ags_shader_intrinsics_dx11.h"
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX12
+#include "/Engine/Shared/ThirdParty/AMD/ags_shader_intrinsics_dx12.h"
+#endif
+
+#if PERMUTATION_RASTER_ATOMIC == RASTER_PLATFORM && COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS && COMPILER_SUPPORTS_ULONG_TYPES
+#define PackedType UlongType
+PackedType ToPackedType(uint2 Data)
+{
+	return PackUlongType(Data);
+}
+PackedType NextValue(PackedType In, PackedType Out)
+{
+	return In < Out ? In : Out;
+}
+#else
+#define PackedType uint2
+PackedType ToPackedType(uint2 Data)
+{
+	return Data;
+}
+PackedType NextValue(PackedType In, PackedType Out)
+{
+	return In.y < Out.y ? In : Out;
+}
+#endif
+
+PackedType WriteVisibilityData(RWTexture2D<PackedType> OutTexture, uint2 Coords, PackedType Data)
+{
+#if PERMUTATION_RASTER_ATOMIC == RASTER_NVIDIA
+	PackedType PrevData = NvInterlockedMaxUint64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX11
+	PackedType PrevData = AmdDxExtShaderIntrinsics_AtomicMaxU64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_AMD_DX12
+	PackedType PrevData = AmdExtD3DShaderIntrinsics_AtomicMaxU64(OutTexture, Coords, Data);
+	return PrevData;
+#elif PERMUTATION_RASTER_ATOMIC == RASTER_PLATFORM && COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS && COMPILER_SUPPORTS_ULONG_TYPES
+	ImageInterlockedMaxUInt64(OutTexture, Coords, Data);
+	// Need to expose the returned value version of ImageInterlockedMaxUInt64
+	return Data;
+#else
+	return (PackedType)0;
+#endif
+}
+
+///////////////////////////////////////////////////////////////////////////
+uint			DispatchCountX;
+uint			MaxRasterCount;
+uint			FrameIdMod8;
+uint			MacroGroupId;
+uint			ResolutionMultiplier;
+int2			OutputResolution;
+uint			HairMaterialId;
+uint			HairStrandsVF_bIsCullingEnable;
+float			HairStrandsVF_Radius;
+float			HairStrandsVF_Length;
+float			HairStrandsVF_Density;
+uint			HairStrandsVF_bUseStableRasterization;
+float3			HairStrandsVF_PositionOffset;
+uint			HairStrandsVF_VertexCount;
+float4x4		HairStrandsVF_LocalToWorldPrimitiveTransform;
+Buffer<uint4>	HairStrandsVF_PositionBuffer;
+
+#if PERMUTATION_CULLING == 1
+Buffer<uint>	HairStrandsVF_CullingIndirectBuffer;
+Buffer<uint>	HairStrandsVF_CullingIndexBuffer;
+Buffer<float>	HairStrandsVF_CullingRadiusScaleBuffer;
+Buffer<uint>	IndirectBufferArgs;
+#endif
+
+Texture2D<float> SceneDepthTexture;
+
+RWTexture2D<uint>  OutHairCountTexture;
+
+RWTexture2D<PackedType> OutVisibilityTexture0;
+#if PERMUTATION_SPP == 2 || PERMUTATION_SPP == 4
+RWTexture2D<PackedType> OutVisibilityTexture1;
+#endif
+#if PERMUTATION_SPP == 4
+RWTexture2D<PackedType> OutVisibilityTexture2;
+RWTexture2D<PackedType> OutVisibilityTexture3;
+#endif
+
+
+///////////////////////////////////////////////////////////////////////////
+// Helping functions 
+
+float3 NDCToPixelCoord(float4 InDC)
+{
+	const float3 NDC = InDC.xyz / InDC.w;
+	float2 UV = NDC.xy * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz;
+	return float3(UV * OutputResolution, NDC.z);
+}
+
+float ToCoverage(FHairControlPoint CP, float4 NDC, float RadiusAtDepth1Primary)
+{
+	const float SceneDepth = NDC.w;
+	const float PixelRadius = SceneDepth * RadiusAtDepth1Primary;
+	return CP.WorldRadius / max(CP.WorldRadius, PixelRadius);
+}
+
+void Swap(inout float V0, inout float V1)
+{
+	float T = V0;
+	V0 = V1;
+	V1 = T;
+}
+
+void Swap(inout float3 V0, inout float3 V1)
+{
+	float3 T = V0;
+	V0 = V1;
+	V1 = T;
+}
+
+bool IsVisible(float3 SP)
+{
+	const float DeviceZ = SP.z;
+	const uint2 SceneCoord = SP.xy / ResolutionMultiplier;
+	return DeviceZ > SceneDepthTexture.Load(uint3(SceneCoord, 0)); // InverseZ
+}
+
+bool IsVisible(int2 PixelCoords, float HairDeviceZ)
+{
+	const float DeviceZ = SceneDepthTexture.Load(uint3(PixelCoords, 0)); // InverseZ
+	return HairDeviceZ >= DeviceZ;
+}
+
+bool IsInScreen(int2 C)
+{
+	return C.x >= 0 && C.x < OutputResolution.x && C.y >= 0 && C.y < OutputResolution.y;
+}
+
+void Rasterize(int2 Coords, float Ratio, float Depth, uint PrimitiveId, float Coverage)
+{
+	if (IsInScreen(Coords))
+	{
+		// Fine culling per pixel
+		// Fine grain culling is disabled, as it creates some flickering (on Nvidia cards). It is unclear if this is driver bug or another issue.
+		#if 1
+		const bool bIsVisible = IsVisible(Coords, Depth);
+		if (!bIsVisible)
+			return;
+		#endif
+		const uint PackedCoverage = PackCoverageAndHairCount(Ratio * Coverage);
+		InterlockedAdd(OutHairCountTexture[uint2(Coords)], PackedCoverage);
+
+		uint2 PackedVisibility;
+		PackedVisibility.x = PackHairVisSample(PrimitiveId, HairMaterialId);
+		PackedVisibility.y = PackHairVisSampleDepth(Depth, Coverage);
+
+		PackedType In = ToPackedType(PackedVisibility);
+		PackedType Out = 0;
+
+	#if PERMUTATION_SPP == 1
+		WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+	#endif
+
+	#if PERMUTATION_SPP == 2
+		Out = WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+		In  = NextValue(In, Out);
+			
+		WriteVisibilityData(OutVisibilityTexture1, Coords, In);
+	#endif
+
+	#if PERMUTATION_SPP == 4
+		Out = WriteVisibilityData(OutVisibilityTexture0, Coords, In);
+		In  = NextValue(In, Out);
+			
+		Out = WriteVisibilityData(OutVisibilityTexture1, Coords, In);
+		In  = NextValue(In, Out);
+			
+		Out = WriteVisibilityData(OutVisibilityTexture2, Coords, In);
+		In  = NextValue(In, Out);
+			
+		WriteVisibilityData(OutVisibilityTexture3, Coords, In);
+	#endif
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Queued work
+
+struct FRasterInfo
+{
+	bool bIsSteep;
+	uint P0x;
+	uint P1x;
+	float DeltaY;
+	float DeltaZ;
+	float GradientY;
+	float GradientZ;
+};
+
+uint4 PackRasterInfo(FRasterInfo In)
+{
+	uint4 Out;
+	return Out;
+}
+
+FRasterInfo UnpackRasterInfo(uint4 In)
+{
+	return (FRasterInfo)0;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// These number need to match HairStrandsClusterCulling.usf
+#define GROUP_SIZE 32
+#define GROUP_COUNT_X 16
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+#if PERMUTATION_CULLING == 1
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * GROUP_COUNT_X;
+#else
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * DispatchCountX;
+#endif
+
+	uint VertexIndex1 = min(VertexIndex0 + 1, HairStrandsVF_VertexCount - 1);
+	if (VertexIndex0 >= HairStrandsVF_VertexCount)
+	{
+		return;
+	}
+
+	float LodRadiusScale0 = 1;
+	float LodRadiusScale1 = 1;
+#if PERMUTATION_CULLING == 1
+	if (HairStrandsVF_bIsCullingEnable)
+	{
+		const uint VertexCountAfterCulling = HairStrandsVF_CullingIndirectBuffer[3];
+		uint FetchIndex0 = VertexIndex0;
+		uint FetchIndex1 = VertexIndex1;
+		if (FetchIndex0 >= VertexCountAfterCulling)
+		{
+			return;
+		}
+		FetchIndex1 = min(FetchIndex0 + 1, VertexCountAfterCulling - 1);
+
+		VertexIndex0 = HairStrandsVF_CullingIndexBuffer[FetchIndex0];
+		LodRadiusScale0	= HairStrandsVF_CullingRadiusScaleBuffer[FetchIndex0];
+
+		VertexIndex1 = HairStrandsVF_CullingIndexBuffer[FetchIndex1];
+		LodRadiusScale1 = HairStrandsVF_CullingRadiusScaleBuffer[FetchIndex1];
+
+		if (LodRadiusScale0 <= 0.0f)
+		{
+			return;
+		}
+	}
+#endif
+
+	ResolvedView = ResolveView();
+
+	const FHairControlPoint CP0 = UnpackHairControlPoint(
+		HairStrandsVF_PositionBuffer[VertexIndex0],
+		HairStrandsVF_PositionOffset,
+		HairStrandsVF_Radius * LodRadiusScale0,
+		HairStrandsVF_Length);
+
+	if (CP0.Type == HAIR_CONTROLPOINT_END)
+		return;
+
+	const FHairControlPoint CP1 = UnpackHairControlPoint(
+		HairStrandsVF_PositionBuffer[VertexIndex1],
+		HairStrandsVF_PositionOffset,
+		HairStrandsVF_Radius * LodRadiusScale1,
+		HairStrandsVF_Length);
+
+
+	const FHairRenderInfo HairRenderInfo = GetHairRenderInfo(ResolvedView.HairRenderInfo, ResolvedView.HairRenderInfoBits, HairStrandsVF_bUseStableRasterization > 0);
+
+	const float VelocityScale = 0;
+	FHairViewInfo HairViewInfo;
+	HairViewInfo.TranslatedWorldCameraOrigin = ResolvedView.TranslatedWorldCameraOrigin;
+	HairViewInfo.ViewForward = ResolvedView.ViewForward;
+	HairViewInfo.RadiusAtDepth1 = lerp(HairRenderInfo.RadiusAtDepth1Primary, HairRenderInfo.RadiusAtDepth1Velocity, VelocityScale);
+	HairViewInfo.bIsOrthoView = false;
+
+	const float3 WP0  = mul(float4(CP0.Position, 1), HairStrandsVF_LocalToWorldPrimitiveTransform).xyz;
+	const float4 NDC0 = mul(float4(WP0, 1), View.WorldToClip);
+
+	const float3 WP1  = mul(float4(CP1.Position, 1), HairStrandsVF_LocalToWorldPrimitiveTransform).xyz;
+	const float4 NDC1 = mul(float4(WP1, 1), View.WorldToClip);
+	
+	float3 SP0 = NDCToPixelCoord(NDC0);
+	float3 SP1 = NDCToPixelCoord(NDC1);
+
+	// Coarse culling per segment
+	const bool bInClip0 = IsInScreen(SP0.xy);
+	const bool bInClip1 = IsInScreen(SP1.xy);
+	if (!bInClip0 || !bInClip1)
+	{
+		return;
+	}
+
+	const bool bIsVisible0 = IsVisible(SP0);
+	const bool bIsVisible1 = IsVisible(SP1);
+	if (!bIsVisible0 && !bIsVisible1)
+	{
+		return;
+	}
+
+	const float Coverage0 = ToCoverage(CP0, NDC0, HairRenderInfo.RadiusAtDepth1Primary);
+	const float Coverage1 = ToCoverage(CP1, NDC1, HairRenderInfo.RadiusAtDepth1Primary);
+
+	// Conservative line raster (Wu's Algo)
+	// https://en.wikipedia.org/wiki/Xiaolin_Wu%27s_line_algorithm
+	const bool bIsSteep = abs(SP1.y - SP0.y) > abs(SP1.x - SP0.x);
+	if (bIsSteep)
+	{
+		Swap(SP0.x, SP0.y);
+		Swap(SP1.x, SP1.y);
+	}
+	if (SP0.x > SP1.x)
+	{
+		Swap(SP0, SP1);
+	}
+
+	const float3 D = SP1 - SP0;
+	const float GradientY = abs(D.x) < 0.00001f ? 1.0f : D.y / D.x;
+	const float GradientZ = abs(D.x) < 0.00001f ? 1.0f : D.z / D.x;
+
+	float DeltaY = 0;
+	float DeltaZ = 0;
+
+	// First point
+	int2 PX0;
+	{
+		float2 End;
+		End.x = round(SP0.x);
+		End.y = SP0.y + GradientY * (End.x - SP0.x);
+
+		const float XGap = 1.f - frac(SP0.x + 0.5f);
+
+		PX0.x = End.x;
+		PX0.y = floor(End.y);
+
+		const float FracY = frac(End.y);
+		const bool bLower = FracY < 0.5f;
+		int2 Coord = PX0 + (bLower ? int2(0, 0) : int2(0, 1));
+		Coord = bIsSteep ? Coord.yx : Coord.xy;
+		const float Ratio = bLower ? 1 - FracY : FracY;
+		Rasterize(Coord, Ratio * XGap, SP0.z, VertexIndex0, Coverage0);
+
+		DeltaY = End.y + GradientY; // first y-intersection for the main loop
+		DeltaZ = SP1.z + GradientZ; // This is not perspective correct. Interpolate linear depth instead
+	}
+
+	// Second point
+	int2 PX1;
+	{
+		float2 End;
+		End.x = floor(SP1.x + 0.5); // Round
+		End.y = SP1.y + GradientY * (End.x - SP1.x);
+		const float XGap = 1 - frac(SP1.x + 0.5);
+
+		PX1.x = End.x;
+		PX1.y = floor(End.y);
+
+		// In order to avoid doubled rasterizated point at segments connection we exclude 
+		// the last pixel apart for pixel placed at the end of a curve
+		if (CP1.Type == HAIR_CONTROLPOINT_END)
+		{
+			const float FracY = frac(End.y);
+			const bool bLower = FracY < 0.5f;
+			int2 Coord = PX1 + (bLower ? int2(0, 0) : int2(0, 1));
+			Coord = bIsSteep ? Coord.yx : Coord.xy;
+			const float Ratio = bLower ? 1 - FracY : FracY;
+			Rasterize(Coord, Ratio * XGap, SP1.z, VertexIndex0, max(Coverage1,0.01f));
+		}
+	}
+
+	// Inner points
+	const uint MaxIteration = MaxRasterCount;
+	const float PixelCount = abs(PX1.x - (PX0.x + 1));
+	for (int i = PX0.x + 1, j = 0; i < PX1.x && j < MaxIteration; ++i, ++j)
+	{
+		const float S = float(j) / PixelCount;
+		const float FracY = frac(DeltaY);
+		const bool bLower = FracY < 0.5;
+		const float Ratio = bLower ? 1 - FracY : FracY;
+		const float Coverage = lerp(Coverage0, Coverage1, S);
+
+		const float DC_Z = lerp(NDC0.z, NDC1.z, S);
+		const float DC_W = lerp(NDC0.w, NDC1.w, S);
+		const float DeviceZ = DC_Z / DC_W;
+
+		int2 Coord = int2(i, floor(DeltaY)) + (bLower ? int2(0, 0) : int2(0, 1));
+		Coord = bIsSteep ? Coord.yx : Coord.xy;
+		Rasterize(Coord, Ratio, DeviceZ /*DeltaZ*/, VertexIndex0, Coverage);
+
+		DeltaY += GradientY;
+		DeltaZ += GradientZ;
+	}
+}

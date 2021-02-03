@@ -1,0 +1,40 @@
+#version 120 // -*- c++ -*-
+/**
+ \file UniversalSurface_render.vrt
+ \author Morgan McGuire, Michael Mara
+
+ \created 2007-10-22
+ \edited  2012-12-28
+ */
+
+#include <UniversalSurface/UniversalSurface_vertex.glsl>
+#expect USE_BONES "1 or 0"
+
+attribute vec4 g3d_Vertex;
+attribute vec3 g3d_Normal;
+attribute vec2 g3d_TexCoord0;
+attribute vec2 g3d_TexCoord1;
+attribute vec4 g3d_PackedTangent;
+attribute vec4 g3d_VertexColor;
+
+#if USE_BONES
+    attribute vec4      g3d_BoneWeights;
+    attribute ivec4     g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+    uniform sampler2D   prevBoneMatrixTexture;
+#endif
+
+varying vec2 texcoord1;
+
+void main() {
+    // Temporary variables needed because some drivers do not allow modifying attribute variables directly
+    vec4 vertex         = g3d_Vertex;
+    vec3 normal         = g3d_Normal;
+    vec4 packedTangent  = g3d_PackedTangent;
+    texcoord1 = g3d_TexCoord1;
+#   if USE_BONES
+        UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, vertex, normal, packedTangent);
+#   endif
+    UniversalSurface_transform(vertex, normal, packedTangent, g3d_TexCoord0, g3d_TexCoord1, g3d_VertexColor);
+
+}

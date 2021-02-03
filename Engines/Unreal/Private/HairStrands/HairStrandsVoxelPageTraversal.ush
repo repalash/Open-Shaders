@@ -1,0 +1,492 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Enabled page occupancy lookup, to have finer grain empty space skipping
+#ifndef VOXEL_TRAVERSAL_PAGEOCCUPANCY
+#define VOXEL_TRAVERSAL_PAGEOCCUPANCY 0
+#endif
+
+// Enabled when debugging page occupancy
+#ifndef VOXEL_TRAVERSAL_DEBUG_PAGEOCCUPANCY
+#define VOXEL_TRAVERSAL_DEBUG_PAGEOCCUPANCY 0
+#endif
+
+// VOXEL_TRAVERSAL_TYPE needs to be defined for selecting which type of traversal needs to be used
+// Definition of traversal types are defined in HairStrandsVoxelPageCommon.ush
+#ifndef VOXEL_TRAVERSAL_TYPE
+#define VOXEL_TRAVERSAL_TYPE VOXEL_TRAVERSAL_NONE
+#endif
+
+#ifndef VOXEL_TRAVERSAL_DEBUG
+#define VOXEL_TRAVERSAL_DEBUG 0
+#else
+#include "../ShaderDrawDebug.ush"
+#endif
+
+#ifndef VOXEL_TRAVERSAL_FORCE_MIP_ENABLE
+#define VOXEL_TRAVERSAL_FORCE_MIP_ENABLE 0
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if VOXEL_TRAVERSAL_DEBUG 
+void AddLine(bool bEnabled, float3 P0, float3 P1)
+{
+	if (!bEnabled)
+		return;
+	const float4 DebugColor = float4(1, 1, 0, 1);
+	AddLine(P0, P1, DebugColor, DebugColor);
+}
+
+void AddMacroGroupAABB(bool bEnabled, float3 P0, float3 P1)
+{
+	if (!bEnabled)
+		return;
+	AddAABB(P0, P1, float4(1, 0, 1, 1));
+}
+
+void AddPageAABB(bool bEnabled, float3 P0, float3 P1, bool bIsPageValid)
+{
+	if (!bEnabled)
+		return;
+	const float4 DebugColor = bIsPageValid ? float4(0, 1, 1, 1) : float4(1, 0, 0, 1);
+	AddAABB(P0, P1, DebugColor);
+}
+
+void AddStepAABB(bool bEnabled, float3 P0, float3 P1, float3 Color)
+{
+	if (!bEnabled)
+		return;
+	const float4 DebugColor = float4(Color, 1);
+	AddAABB(P0, P1, DebugColor);
+}
+
+void AddAABBVolume(bool bEnabled, float3 P0, float3 P1)
+{
+	if (!bEnabled)
+		return;
+	const float4 DebugColor = float4(1,1,0, 1);
+	AddAABB(P0, P1, DebugColor);
+}
+
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+bool ShouldStopTraversal(const FHairTraversalResult InResult, float InHairCountThreshold, bool InUseOpaqueVisibility=true)
+{
+	// Change this function once we have better result/control over the opaque filtering
+	return (InUseOpaqueVisibility && InResult.Visibility == 0) || (InHairCountThreshold != 0 && InResult.HairCount > InHairCountThreshold);
+}
+
+float3 GetHairVoxelJitter(uint2 PixelCoord, uint Seed)
+{
+	return float3(
+		InterleavedGradientNoise(PixelCoord.xy, Seed),
+		InterleavedGradientNoise(PixelCoord.xy, Seed * 117),
+		InterleavedGradientNoise(PixelCoord.xy, Seed * 7901));
+}
+
+// This assume pages have a resolution of 32x32x32
+bool DoesVoxelContainData(uint2 PageOccupancy, uint3 CoordInPage)
+{
+	// A page with a 32x32x32 resolution contains 4x4x4 bricks of 8x8x8 resolution
+	uint3 QCoord = CoordInPage >> 3;
+	uint  QRes = 4;
+	uint  LinearQCoord = QCoord.x + QCoord.y * QRes + QCoord.z * QRes * QRes;
+	return LinearQCoord < 32 ? ((PageOccupancy.x >> LinearQCoord) & 0x1) : ((PageOccupancy.y >> (LinearQCoord - 32)) & 0x1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FHairTraversalSettings
+{
+	float	DensityScale;
+	float	CountThreshold;
+	float	DistanceThreshold;
+	float	SteppingScale;		// Rate at which the raymarching step increase
+	float3	Random;
+	float	TanConeAngle;
+	float	PixelRadius;
+	float	JitterScale;
+	float	ForcedMip;
+	bool	bUseOpaqueVisibility;
+	bool	bDebugEnabled;
+	bool	bIsPrimaryRay;
+	bool	bUseOccupancy;
+};
+
+float GetHairTraversalMaxT()
+{
+	return 999999;
+}
+
+FHairTraversalSettings InitHairTraversalSettings()
+{
+	FHairTraversalSettings Out;
+	Out.DensityScale = 1;
+	Out.CountThreshold = 0;
+	Out.DistanceThreshold = GetHairTraversalMaxT();
+	Out.SteppingScale = 1;
+	Out.Random = 0.5f;
+	Out.TanConeAngle = 0;
+	Out.PixelRadius = 0;
+	Out.JitterScale = 1;
+	Out.bUseOpaqueVisibility = true;
+	Out.bDebugEnabled = false;
+	Out.bIsPrimaryRay = false;
+	Out.bUseOccupancy = false;
+	Out.ForcedMip = -1;
+	return Out;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Sparse voxel traversal routines
+FHairTraversalResult ComputeHairCountVirtualVoxel(
+	float3 WorldPosition0,
+	float3 WorldPosition1,
+	FVirtualVoxelCommonDesc InCommonDesc,
+	FVirtualVoxelNodeDesc InNodeDesc,
+	Buffer<uint> InPageIndexBuffer,
+	Buffer<uint2> InPageIndexOccupancyBuffer,
+	Texture3D<uint> InPageTexture,
+	FHairTraversalSettings InSettings)
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_NONE
+{
+	Error: VOXEL TRAVERSAL TYPE is undefined
+}
+#endif
+#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_LINEAR || VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_LINEAR_MIPMAP
+{
+	const float MipLevelDistanceScale = 1.0f / InCommonDesc.VoxelWorldSize;
+
+	FHairTraversalResult Out = InitHairTraversalResult();
+
+	int3 CurrentPageIndexCoord = -1;
+	bool bIsPageValid = false;
+	uint3 PageCoord = 0;
+
+	const float2 HitT = LineBoxIntersect(WorldPosition0, WorldPosition1, InNodeDesc.MinAABB, InNodeDesc.MaxAABB);
+	if (HitT.x < HitT.y)
+	{
+		// Count the number of fibers which are within a cylinder defined by the voxel size, 
+		// and the distance between the origin and the extent of the volume
+		// This assumes that the voxel volume is cubic (i.e. equal dimensions on all sides)
+		const float3 O = lerp(WorldPosition0, WorldPosition1, HitT.xxx);
+		const float3 E = lerp(WorldPosition0, WorldPosition1, HitT.yyy);
+		const float OELength = min(length(E - O), InSettings.DistanceThreshold);
+		#if VOXEL_TRAVERSAL_DEBUG
+		if (InSettings.bDebugEnabled)
+		{
+			AddLine(true, O, E);
+			AddAABBVolume(true, InNodeDesc.MinAABB, InNodeDesc.MaxAABB);
+		}
+		#endif
+
+		// Step according to voxel size
+		const float3 D = normalize(E - O) * InCommonDesc.VoxelWorldSize;
+		const float MaxStep = float(min(ceil(OELength / InCommonDesc.VoxelWorldSize), 1024u));
+		const float DeltaWorld = OELength / float(MaxStep);
+		float StepScale = 1.0f;
+		float3 PreviousP = O;
+		float ClosestHitT = -1;
+		uint2 PageOccupancy = 0;
+
+		const float3 RandomStepJitter = InSettings.Random.xyz * 2 - 1; // [-1..1]
+		for (float StepIt = 0.0f; StepIt < MaxStep; StepIt += StepScale)
+		{
+			const float SteppingWorldSize = max(DeltaWorld * StepScale, InSettings.TanConeAngle * StepIt * InCommonDesc.VoxelWorldSize);
+			const float3 HitP = O + StepIt * D + InSettings.JitterScale * RandomStepJitter * SteppingWorldSize * 0.5f;
+
+			#if VOXEL_TRAVERSAL_DEBUG
+			AddStepAABB(InSettings.bDebugEnabled, PreviousP, HitP, float3(0, 1, 0));
+			#endif
+
+			const int3 VolumeCoord = PositionToCoord(HitP, InNodeDesc.MinAABB, InNodeDesc.MaxAABB, InNodeDesc.VirtualResolution);
+			const int3 PageIndexCoord = VolumeCoord / InCommonDesc.PageResolution;
+
+			// Update page index only when needed
+			if (PageIndexCoord.x != CurrentPageIndexCoord.x ||
+				PageIndexCoord.y != CurrentPageIndexCoord.y ||
+				PageIndexCoord.z != CurrentPageIndexCoord.z)
+			{
+				CurrentPageIndexCoord = PageIndexCoord;
+				const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, InNodeDesc.PageIndexResolution, InNodeDesc.PageIndexOffset);
+				const uint PageIndex = InPageIndexBuffer.Load(LinearPageIndexCoord);
+
+				bIsPageValid = PageIndex != INVALID_VOXEL_PAGE_INDEX;
+				#if VOXEL_TRAVERSAL_PAGEOCCUPANCY
+				PageOccupancy = 0;
+				if (bIsPageValid)
+				{
+					PageCoord = IndexToCoord(PageIndex, InCommonDesc.PageCountResolution);
+					PageOccupancy = InPageIndexOccupancyBuffer.Load(LinearPageIndexCoord);
+				}
+				#else
+				{
+					PageCoord = IndexToCoord(PageIndex, InCommonDesc.PageCountResolution);
+				}
+				#endif
+			}
+
+			if (bIsPageValid)
+			{
+				const int3 VoxelPageBase = PageCoord * InCommonDesc.PageResolution;
+				const int3 VoxelPageOffset = VolumeCoord - PageIndexCoord * InCommonDesc.PageResolution;
+				const int3 VoxelPageCoord = VoxelPageBase + VoxelPageOffset;
+
+				#if VOXEL_TRAVERSAL_PAGEOCCUPANCY
+				const bool bIsSubBrickValid = InSettings.bUseOccupancy ? DoesVoxelContainData(PageOccupancy, VoxelPageOffset) : true;
+				if (bIsSubBrickValid)
+				#endif
+				{
+					float HairCountScale = 1;
+					float MipLevel = 0.0f;
+					#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_LINEAR_MIPMAP
+					HairCountScale = SteppingWorldSize * MipLevelDistanceScale;
+					MipLevel = log2(SteppingWorldSize * MipLevelDistanceScale);
+					#endif
+					#if VOXEL_TRAVERSAL_FORCE_MIP_ENABLE
+					MipLevel = InSettings.ForcedMip >= 0 ? InSettings.ForcedMip : MipLevel;
+					#endif
+
+					const FHairTraversalResult StepResult = GetHairVirtualVoxelDensity(VoxelPageCoord, InPageTexture, uint(MipLevel), InSettings.DensityScale * HairCountScale);
+					Acc(Out, StepResult);
+
+					if (InSettings.bIsPrimaryRay && StepResult.HairCount > 0)
+					{
+						ClosestHitT = 1;
+					}
+
+					#if VOXEL_TRAVERSAL_DEBUG
+					if (InSettings.bDebugEnabled)
+					{
+						const float3 WorldOffset = PageIndexCoord * InCommonDesc.PageResolution * InCommonDesc.VoxelWorldSize;
+						const float MipVoxelWorldSize = InCommonDesc.VoxelWorldSize * InCommonDesc.PageResolution / (InCommonDesc.PageResolution >> uint(MipLevel));
+
+						const uint3 MinCoord = VoxelPageOffset >> uint(MipLevel);
+						const uint3 MaxCoord = MinCoord+1;
+						const float3 FetchMinAABB = InNodeDesc.MinAABB + WorldOffset + MinCoord * MipVoxelWorldSize;
+						const float3 FetchMaxAABB = InNodeDesc.MinAABB + WorldOffset + MaxCoord * MipVoxelWorldSize;
+						AddStepAABB(true, FetchMinAABB, FetchMaxAABB, StepResult.Visibility > 0.5f ? float3(0, 0.5f, 1) : float3(1, 0.5f, 0));
+					}
+					#endif
+
+					#if VOXEL_TRAVERSAL_DEBUG_PAGEOCCUPANCY
+					Out.HairCount = 100;
+					Out.HitT = length(HitP - WorldPosition0);
+					return Out;
+					#else
+					if (ShouldStopTraversal(Out, InSettings.CountThreshold, InSettings.bUseOpaqueVisibility))
+					{
+						//Out.HitT = length(HitP - O);
+						Out.HitT = length(HitP - WorldPosition0);
+						return Out;
+					}
+					#endif	
+				}
+			}
+			#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_LINEAR_MIPMAP
+			if (InSettings.bIsPrimaryRay && ClosestHitT < 0)
+			{
+				// Start the mipmap traversal only when we have reach the first hit (primaryview)
+			}
+			else
+			{
+				StepScale = min(InCommonDesc.PageResolution, StepScale * InSettings.SteppingScale);
+			}
+			#endif
+			PreviousP = HitP;
+		}
+
+	}
+
+	return Out;
+}
+#endif
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_SPARSE_LINEAR || VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_SPARSE_MIPMAP
+{
+	FHairTraversalResult Out = InitHairTraversalResult();
+
+	int3 CurrentPageIndexCoord = -1;
+	bool bIsPageValid = false;
+	uint3 PageCoord = 0;
+
+	#if VOXEL_TRAVERSAL_DEBUG
+	AddMacroGroupAABB(InSettings.bDebugEnabled, InNodeDesc.MinAABB, InNodeDesc.MaxAABB);
+	AddLine(InSettings.bDebugEnabled, WorldPosition0, WorldPosition1);
+	#endif
+
+	const float2 HitT = LineBoxIntersect(WorldPosition0, WorldPosition1, InNodeDesc.MinAABB, InNodeDesc.MaxAABB);
+	if (HitT.x < HitT.y)
+	{
+		// Count the number of fibers which are within a cylinder defined by the voxel size, 
+		// and the distance between the origin and the extent of the volume
+		// This assumes that the voxel volume is cubic (i.e. equal dimensions on all sides)
+		const float3 O = WorldPosition0; // lerp(WorldPosition, IntersectEndPoint, HitT.xxx);
+		const float3 E = WorldPosition1; // lerp(WorldPosition, IntersectEndPoint, HitT.yyy);
+		const float OELength = min(length(E - O), InSettings.DistanceThreshold);
+
+	
+		// Init to 1 or -1 depending of the orientation of stepping
+		const float3 UNormD = WorldPosition1 - WorldPosition0;
+		const int3 Step = sign(UNormD);
+
+		// Step according to voxel size
+		const float3 D = normalize(UNormD) * InCommonDesc.VoxelWorldSize;
+
+		float t = HitT.x;
+
+		// this is slop coeff for each axis: how far we need to move in units of t for each axis
+		const float PageWorldSize = InCommonDesc.PageResolution * InCommonDesc.VoxelWorldSize;
+		const float3 tDelta = Step * PageWorldSize / UNormD;
+
+		// Init to the starting voxel
+		int3 PageIndexCoord = -1;
+		float3 tMax = 0;
+		{
+			const float3 HitP = O + HitT.x * UNormD;
+
+			const float Epsilon = 0.000001f;
+			const float3 Coords = clamp(
+				saturate((HitP - InNodeDesc.MinAABB) / (InNodeDesc.MaxAABB - InNodeDesc.MinAABB)) * InNodeDesc.PageIndexResolution,
+				0,
+				InNodeDesc.PageIndexResolution - Epsilon);
+
+			const float3 FractCoords = max(Step, 0) - Step * frac(Coords);
+			tMax = FractCoords * tDelta;
+
+			PageIndexCoord = clamp(uint3(Coords), uint3(0, 0, 0), InNodeDesc.PageIndexResolution-1);
+		}
+
+		// Page stepping is the walking quantity (i.e. number of voxel) for fine ray-marching within a valid page
+		float PageStepping = 1;
+
+		const uint LoopCount = 256u;
+		for (uint LoopIt = 0; LoopIt < LoopCount; ++LoopIt)
+		{
+			const bool bIsInside =
+				PageIndexCoord.x >= 0 && 
+				PageIndexCoord.y >= 0 && 
+				PageIndexCoord.z >= 0 &&
+				PageIndexCoord.x < int(InNodeDesc.PageIndexResolution.x) && 
+				PageIndexCoord.y < int(InNodeDesc.PageIndexResolution.y) && 
+				PageIndexCoord.z < int(InNodeDesc.PageIndexResolution.z);
+			if (!bIsInside)
+			{
+				return Out;
+			}
+
+			const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, InNodeDesc.PageIndexResolution, InNodeDesc.PageIndexOffset);
+			const uint PageIndex = InPageIndexBuffer.Load(LinearPageIndexCoord);
+
+			const bool bIsPageValid = PageIndex != INVALID_VOXEL_PAGE_INDEX;
+			#if VOXEL_TRAVERSAL_DEBUG
+			{
+				const float3 PageMinAABB = PageIndexCoord * InCommonDesc.PageResolution * InCommonDesc.VoxelWorldSize + InNodeDesc.MinAABB;
+				const float3 PageMaxAABB = (PageIndexCoord+float3(1,1,1)) * InCommonDesc.PageResolution * InCommonDesc.VoxelWorldSize + InNodeDesc.MinAABB;
+				AddPageAABB(InSettings.bDebugEnabled, PageMinAABB, PageMaxAABB, bIsPageValid);
+			}
+			#endif
+
+			if (bIsPageValid)
+			{
+				const uint3 PageCoord = IndexToCoord(PageIndex, InCommonDesc.PageCountResolution);
+
+				float3 InnerO = O + t * UNormD;
+				const uint MaxInnerStep = InCommonDesc.PageResolution * 1.75f; // ~ Diagonal step count
+
+				#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_SPARSE_LINEAR
+				const uint IntPageStepping = 1;
+				const uint MipLevel = 0;
+				#endif			
+
+				#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_SPARSE_MIPMAP
+				const uint IntPageStepping = uint(PageStepping);
+				const uint MipLevel = log2(IntPageStepping);
+				#endif
+
+				const uint MipPageResolution = InCommonDesc.PageResolution;
+				const int3 VoxelPageBase = PageCoord * MipPageResolution;
+
+				for (uint InnerStepIt = 0; InnerStepIt < MaxInnerStep; InnerStepIt += IntPageStepping)
+				{
+					const float3 InnerHitP = InnerO + D * InnerStepIt;
+					const int3 VolumeCoord = PositionToCoordUnclampled(InnerHitP, InNodeDesc.MinAABB, InNodeDesc.MaxAABB, InNodeDesc.VirtualResolution);
+					const int3 VoxelPageOffset = VolumeCoord - PageIndexCoord * InCommonDesc.PageResolution;
+
+					#if VOXEL_TRAVERSAL_DEBUG
+					if (InSettings.bDebugEnabled)
+					{
+						if (InnerStepIt==0)
+							AddStepAABB(InSettings.bDebugEnabled, InnerHitP - D * 2, InnerHitP + D*2, float3(0,1,0));
+						else
+							AddStepAABB(InSettings.bDebugEnabled, InnerHitP, InnerHitP + D, float3(1, 0, 1));
+					}
+					#endif
+
+					const bool bIsInsideInner =
+						VoxelPageOffset.x >= 0 && 
+						VoxelPageOffset.y >= 0 && 
+						VoxelPageOffset.z >= 0 &&
+						VoxelPageOffset.x < int(MipPageResolution) &&
+						VoxelPageOffset.y < int(MipPageResolution) &&
+						VoxelPageOffset.z < int(MipPageResolution);
+					if (!bIsInsideInner)
+					{
+						break;
+					}
+
+					const int3 VoxelPageCoord = VoxelPageBase + VoxelPageOffset;
+
+					#if VOXEL_TRAVERSAL_DEBUG
+					{
+						const float VoxelExtent = InCommonDesc.VoxelWorldSize * (1 << MipLevel) * 0.5f;
+						const float3 P = (PageIndexCoord*InCommonDesc.PageResolution + VoxelPageOffset) * InCommonDesc.VoxelWorldSize + InNodeDesc.MinAABB;
+						AddStepAABB(InSettings.bDebugEnabled, P - VoxelExtent, P + VoxelExtent, float3(0, 0.5f, 1));
+					}
+					#endif
+
+					const FHairTraversalResult StepResult = GetHairVirtualVoxelDensity(VoxelPageCoord, InPageTexture, MipLevel, InSettings.DensityScale);
+					Acc(Out, StepResult);
+
+					if (ShouldStopTraversal(Out, InSettings.CountThreshold))
+					{
+						#if VOXEL_TRAVERSAL_DEBUG
+						AddStepAABB(InSettings.bDebugEnabled, InnerHitP - D * 2, InnerHitP + D * 2, float3(1, 0.25f, 0));
+						#endif
+						Out.HitT = length(InnerHitP - O);
+						return Out;
+					}
+				}
+			}
+
+			#if VOXEL_TRAVERSAL_TYPE == VOXEL_TRAVERSAL_SPARSE_MIPMAP
+			// Increase the stepping size as we walk away from the start point. 
+			// Hypothesis: 
+			// * don't increase the stepping too soon as we might miss important closeby details
+			// * don't increase too much the stepping other wise we will miss important thing or look too coarse
+			PageStepping = clamp(PageStepping += 0.5f, 1.f, 8.f);
+			#endif		
+
+			// t is used for defining the intersection point at the entry of a valid page
+			t = min(tMax.x, min(tMax.y, tMax.z));
+
+			// Find the next page indx to visit and update the tmax, accordingly
+			const float3 Mask = tMax.x < tMax.y ?
+				(tMax.x < tMax.z ? float3(1, 0, 0) : float3(0, 0, 1)) :
+				(tMax.y < tMax.z ? float3(0, 1, 0) : float3(0, 0, 1));
+			PageIndexCoord += Step * Mask;
+			tMax += tDelta * Mask;
+			
+			const float3 NewDelta = tDelta * Mask;
+		}
+	}
+
+
+	return Out;
+}
+#endif

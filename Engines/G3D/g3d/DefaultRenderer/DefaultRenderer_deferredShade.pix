@@ -1,0 +1,253 @@
+#version 460 or 410 // -*- c++ -*-
+/** \file DefaultRenderer_deferredShade.pix */
+
+//#ifndef SECOND_ORDER_SHADING
+//#   define SECOND_ORDER_SHADING 0
+//#endif
+//
+//#ifndef GLOSSY_TO_MATTE
+//#   define GLOSSY_TO_MATTE 0
+//#endif
+
+//#ifndef ENABLE_SECOND_ORDER_GLOSSY
+//#define ENABLE_SECOND_ORDER_GLOSSY 0
+//#endif
+
+#if defined(SECOND_ORDER_SHADING) && SECOND_ORDER_SHADING
+#   define G3D_NO_SHADOW_FILTERING 1
+#endif
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Light/Light.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <reconstructFromDepth.glsl>
+#include <LightingEnvironment/LightingEnvironment_LightUniforms.glsl>
+#include <LightingEnvironment/LightingEnvironment_environmentMapUniforms.glsl>
+
+#expect NUM_DDGIVOLUMES, "Length of ddgiVolume array"
+
+#if NUM_DDGIVOLUMES > 0
+#include <DDGIVolume/DDGIVolume.glsl>
+#endif
+
+uniform_GBuffer(gbuffer_);
+
+// Must be after GBuffer declaration
+#include <deferredHelpers.glsl>
+
+// Not expecting these makes the shader more modular.
+//#expect ENABLE_DIFFUSE_GI
+//#expect ENABLE_SECOND_ORDER_GLOSSY
+//#expect USE_GLOSSY_INDIRECT_BUFFER "1 = ray traced or 0 = DDGI for 2nd order glossy"
+//#expect OVERRIDE_SKYBOX "1 to replace infinite pixels with the current skybox"
+
+#if OVERRIDE_SKYBOX
+    // For handling ray misses
+#   ifndef gbuffer_WS_RAY_DIRECTION_notNull
+#      error "OVERRIDE_SKYBOX requires gbuffer_WS_RAY_DIRECTION_notNull"
+#   endif
+
+    uniform float skybox_alpha;
+
+#   ifdef skybox_texture0_notNull
+        uniform samplerCube skybox_texture0_buffer;
+        uniform vec4        skybox_texture0_readMultiplyFirst;
+        uniform vec4        skybox_texture0_readAddSecond;
+#   endif
+
+#   ifdef skybox_texture1_notNull
+        uniform samplerCube skybox_texture1_buffer;
+        uniform vec4        skybox_texture1_readMultiplyFirst;
+        uniform vec4        skybox_texture1_readAddSecond;
+#   endif
+#endif
+
+
+#ifdef ambientOcclusion_notNull
+uniform_Texture(sampler2D, ambientOcclusion_);
+uniform ivec2              ambientOcclusion_offset;
+#endif
+
+#ifdef scatteredIndirectTexture_notNull
+uniform_Texture(sampler2D, scatteredIndirectTexture_);
+#endif
+
+#if defined(NUM_DDGIVOLUMES) && (NUM_DDGIVOLUMES > 0)
+uniform DDGIVolume                  ddgiVolumeArray[NUM_DDGIVOLUMES];
+#endif
+
+#ifndef DEGENERATE_RAY_COLOR
+#define DEGENERATE_RAY_COLOR Color3(0.1f)
+#endif
+
+uniform float                       energyPreservation;
+uniform sampler2D                   glossyIndirectBuffer;
+
+uniform vec3						cameraPos;
+
+out Color3                          result;
+
+Radiance3 computeScatteredIndirect(ivec2 C, UniversalMaterialSample surfel, Vector3 w_o, float AO) {
+    // Incident W/m^2
+    Irradiance3 matteLight =
+#if defined(NUM_DDGIVOLUMES) && ENABLE_DIFFUSE_GI && (NUM_DDGIVOLUMES != 0)
+        sampleIrradiance(ddgiVolumeArray,
+            surfel.position,
+			surfel.shadingNormal * 0.2 + w_o * 0.8,
+            surfel.shadingNormal,
+			cameraPos) * energyPreservation
+#else
+    vec3(0)
+#endif
+    ;
+
+
+    // When shading irradiance probe rays, add the glossy coefficient 
+    // in to the matte term for a single albedo.
+#if defined(GLOSSY_TO_MATTE) && (GLOSSY_TO_MATTE == 0)
+   
+    // For mirror reflection, w_h = n and cos_o = cos_i
+    float cos_o = dot(surfel.glossyShadingNormal, w_o);
+
+    // For mirror reflection (which is the only thing we can use for the evt light), the
+    // half vector is the normal, so w_h . w_o == n . w_o == n . w_i. Push towards normal incidence
+    // by using the sqrt of the dot product, to avoid over glossy reflection
+    Color3 F = schlickFresnel(surfel.fresnelReflectionAtNormalIncidence, sqrt(max(0.001, cos_o)), surfel.smoothness);
+
+    Vector3 w_mi = normalize(surfel.glossyShadingNormal * (2.0 * cos_o) - w_o);
+
+    float glossyExponent = smoothnessToBlinnPhongExponent(surfel.smoothness);
+    Radiance3 glossyLight = computeGlossyEnvironmentMapLighting(w_mi, (surfel.smoothness == 1.0), glossyExponent, false);
+
+    if (F.r + F.g + F.b > 0.00001) {
+#       if defined(USE_GLOSSY_INDIRECT_BUFFER) && USE_GLOSSY_INDIRECT_BUFFER
+            glossyLight = texelFetch(glossyIndirectBuffer, C, 0).rgb * 0.5;
+#       else
+        {
+            // If diffuse GI is enabled, use it to approximate second-order glossy reflections.
+#if         ENABLE_DIFFUSE_GI && ENABLE_SECOND_ORDER_GLOSSY && NUM_DDGIVOLUMES != 0
+                // No glossy buffer when applying to traced rays, since they *are* glossy
+                glossyLight = sampleIrradiance(ddgiVolumeArray, surfel.position, surfel.glossyShadingNormal + w_o * 1.5, w_mi, cameraPos);
+#           endif
+        }
+#       endif
+    }
+
+    // All of the BSDF cancels out because we've preblurred and normalized the incident radiance;
+    // it effectively is *always* a mirror reflection. So (w_h . n) == 1 and there's no normalizing denominator.
+    // We're left with only the Fresnel term.
+    Color3 glossyColor = F;
+#else
+    // Make the glossy term compile out
+    const float F = 0;
+    const float glossyLight = 0;
+    const float glossyColor = 0;
+#endif
+
+    // m(w_i, w_o) = rho / pi
+    Color3 lambertianColor = square(1.0 - F) * surfel.lambertianReflectivity * invPi;
+
+    Radiance3 lambertianAmbient;
+#if ENABLE_DIFFUSE_GI
+    lambertianAmbient = (1.05 * AO) * /*pi * 0.5 **/ matteLight;
+#else
+    //if (numLightMapDirections == 0) {
+        lambertianAmbient = computeLambertianEnvironmentMapLighting(surfel.shadingNormal);
+    //}
+    //else {
+    //    lambertianAmbient += surfel.lightMapRadiance;
+    //}
+#endif
+    
+    // Because AO can only darken, restore some of the matte 
+    // term lost to its baked in overblurred AO by upscaling lambertian indirect 5%.
+    return lambertianAmbient * lambertianColor + glossyLight * glossyColor;
+}
+
+
+void main() {
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    Vector3 w_o;
+    UniversalMaterialSample surfel;
+    
+#ifdef gbuffer_WS_RAY_DIRECTION_notNull
+	// Degenerate ray means sleeping probe
+    // This probe should never be used, but due to weight clamping it might
+    // leak a little in a worst-case situation, so we set it to a nonzero value
+    // to avoid creating a dark leak.
+	if (texelFetch(gbuffer_WS_RAY_DIRECTION_buffer, C, 0).w < 0.0) {
+		result = DEGENERATE_RAY_COLOR;
+		return;
+	}
+#endif
+
+// We cull backfaces by passing flags to the intersection call.
+#ifdef gbuffer_WS_POSITION_notNull
+    // Backface test
+    // 1.0f = front face, 0.0f = backface, -1.0f = miss (skybox)
+    if (texelFetch(gbuffer_WS_POSITION_buffer, C, 0).w < 0.0) {
+        result = Color3(0,0,0);
+        return;
+    }
+#endif
+    if (! readUniversalMaterialSampleFromGBuffer(C, false, true, w_o, surfel)) {
+#       if OVERRIDE_SKYBOX
+            Vector3 wsDirection = normalize(texelFetch(gbuffer_WS_RAY_DIRECTION_buffer, C, 0).xyz) * gbuffer_WS_RAY_DIRECTION_readMultiplyFirst.xyz + gbuffer_WS_RAY_DIRECTION_readAddSecond.xyz;
+            result = vec3(0);
+            if (dot(wsDirection, wsDirection) > 0.1) {
+                // Not a degenerate ray
+                wsDirection = normalize(wsDirection);
+    #           ifdef skybox_texture0_notNull
+                    result += (texture(skybox_texture0_buffer, wsDirection).rgb  * skybox_texture0_readMultiplyFirst.rgb + skybox_texture0_readAddSecond.rgb) * (1.0 - skybox_alpha);
+    #           endif
+    #           ifdef skybox_texture1_notNull
+                    result += (texture(skybox_texture1_buffer, wsDirection).rgb * skybox_texture1_readMultiplyFirst.rgb + skybox_texture1_readAddSecond.rgb) * skybox_alpha;
+    #           endif
+            }
+#       else
+            result = surfel.emissive;
+#       endif
+        return;
+    }
+           
+#   if defined(GLOSSY_TO_MATTE) && GLOSSY_TO_MATTE
+        surfel.lambertianReflectivity = surfel.lambertianReflectivity * (1 - surfel.fresnelReflectionAtNormalIncidence) + surfel.fresnelReflectionAtNormalIncidence; 
+        surfel.smoothness = 0;
+        surfel.fresnelReflectionAtNormalIncidence = Color3(0,0,0);
+#   endif
+
+		float AO =
+#       ifdef ambientOcclusion_notNull
+		(0.95 * texelFetch(ambientOcclusion_buffer, min(ivec2(gl_FragCoord.xy) + ambientOcclusion_offset, ivec2(ambientOcclusion_size.xy) - ivec2(1, 1)), 0).r + 0.05);
+#       else
+			1.0;
+#       endif
+
+    Radiance3 L_scatteredDirect = computeDirectLighting(surfel, w_o, 1.0);
+
+    Radiance3 L_scatteredIndirect = 
+
+		// Old deferred shading path.
+#       ifdef scatteredIndirectLightTexture_notNull
+		texelFetch(C, scatteredIndirectLightTexture_buffer, 0).rgb;
+#       else
+		computeScatteredIndirect(C, surfel, w_o, AO * AO)
+#endif
+	;
+
+
+    // How much ambient occlusion to apply to direct illumination (sort of approximates area lights,
+    // more importantly: NPR term that adds local contrast)
+    const float aoInfluenceOnDirectIllumination = 0.5;
+    float directAO = lerp(1.0, AO, aoInfluenceOnDirectIllumination);
+
+#ifdef gbuffer_WS_POSITION_notNull
+    // Disable screen space effects like AO for 
+    // world space shading (like probe rays).
+    AO = 1.0f;
+#endif
+
+    result = surfel.emissive + L_scatteredDirect * directAO + L_scatteredIndirect * AO;
+}

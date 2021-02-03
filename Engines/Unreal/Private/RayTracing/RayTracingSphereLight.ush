@@ -1,0 +1,90 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../LightShaderParameters.ush"
+
+bool GenerateSphereLightOcclusionRayWithAreaSampling(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+)
+{
+	float4 Result = UniformSampleSphere(RandSample);
+	float3 LightNormal = Result.xyz;
+	float3 LightPosition = LightParameters.Position + LightNormal * LightParameters.SourceRadius;
+	float3 LightDirection = LightPosition - WorldPosition;
+	float RayLength = length(LightDirection);
+	LightDirection /= RayLength;
+
+	RayOrigin = WorldPosition;
+	RayDirection = LightDirection;
+	RayTMin = 0.0;
+	RayTMax = RayLength;
+
+	float SolidAnglePdf = Result.w * saturate(dot(LightNormal, -LightDirection)) / (RayLength * RayLength);
+	RayPdf = SolidAnglePdf;
+	return true;
+}
+
+bool GenerateSphereLightOcclusionRayWithSolidAngleSampling(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+	)
+{
+	RayOrigin = 0.0;
+	RayDirection = 0.0;
+	RayTMin = 0.0;
+	RayTMax = 0.0;
+	RayPdf = 0.0;
+
+	// Determine if shading point is contained within sphere light
+	float3 LightDirection = LightParameters.Position - WorldPosition;
+	float RayLength2 = dot(LightDirection, LightDirection);
+	float Radius2 = LightParameters.SourceRadius * LightParameters.SourceRadius;
+
+	BRANCH
+	if (RayLength2 <= Radius2)
+	{
+		return GenerateSphereLightOcclusionRayWithAreaSampling(LightParameters, WorldPosition, WorldNormal, RandSample,
+			RayOrigin, RayDirection, RayTMin, RayTMax, RayPdf);
+	}
+
+	// Sample uniformly about a cone aligned with the z-axis
+	float SinThetaMax2 = Radius2 / RayLength2;
+	float CosThetaMax2 = 1.0 - SinThetaMax2;
+	float CosThetaMax = sqrt(CosThetaMax2);
+
+	// NOTE: Same as UniformSampleCone(), but CosTheta and SinTheta are needed
+	// float3 RayDirectionTangent = UniformSampleCone(RandSample, CosThetaMax).xyz;
+	// RayPdf = UniformSampleCone(RandSample, CosThetaMax).w;
+	float CosTheta = lerp(1.0, CosThetaMax, RandSample.x);
+	float SinTheta = sqrt(1.0 - CosTheta * CosTheta);
+	float Phi = RandSample.y * 2.0 * PI;
+	float3 RayDirectionTangent = float3(cos(Phi) * SinTheta, sin(Phi) * SinTheta, CosTheta);
+
+	RayOrigin = WorldPosition;
+	// Project ray direction to world-space, such that z-axis aligns with LightDirection
+	float RayLength = sqrt(RayLength2);
+	LightDirection *= rcp(RayLength + 1e-4);
+	RayDirection = TangentToWorld(RayDirectionTangent, LightDirection);
+	
+	RayTMin = 0.0;
+	// Clip length to closest intersection with the sphere
+	RayTMax = RayLength * CosTheta - sqrt(Radius2 - RayLength2 * SinTheta * SinTheta);
+	RayPdf = 1.0 / (2.0 * PI * (1 - CosThetaMax));
+	return true;
+}

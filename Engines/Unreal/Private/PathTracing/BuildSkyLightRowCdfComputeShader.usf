@@ -1,0 +1,125 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+BuildSkyLightRowCdfComputeShader.usf: Intermediate SkyLight CDF build.
+===============================================================================================*/
+
+#include "../Common.ush"
+
+TextureCube TextureCube0;
+SamplerState TextureCubeSampler0;
+
+uint  Mode;
+
+uint  CubeFace;
+uint  Level;
+uint3 RowCdfDimensions;
+RWBuffer<float> RWRowCdf;
+
+uint LinearCoordinate(uint3 GridCoordinate)
+{
+	uint CubefaceOffset = GridCoordinate.z * RowCdfDimensions.x * RowCdfDimensions.y;
+	uint RowOffset = GridCoordinate.y * RowCdfDimensions.x;
+	return CubefaceOffset + RowOffset + GridCoordinate.x;
+}
+
+float3 GetTextureCubeVector(uint3 TexelCoord)
+{
+	float3 Vector;
+
+	float2 UV = TexelCoord.xy / float2(RowCdfDimensions.xy);
+	UV = UV * 2.0 - 1.0;
+
+	uint Cubeface = TexelCoord.z;
+	if (Cubeface == 0)
+	{
+		Vector = float3(1, -UV.y, -UV.x);
+	}
+	else if (Cubeface == 1)
+	{
+		Vector = float3(-1, -UV.y, UV.x);
+	}
+	else if (Cubeface == 2)
+	{
+		Vector = float3(UV.x, 1, UV.y);
+	}
+	else if (Cubeface == 3)
+	{
+		Vector = float3(UV.x, -1, -UV.y);
+	}
+	else if (Cubeface == 4)
+	{
+		Vector = float3(UV.x, -UV.y, 1);
+	}
+	else if (Cubeface == 5)
+	{
+		Vector = float3(-UV.x, -UV.y, -1);
+	}
+
+	return Vector;
+}
+
+void PrefixSum(uint3 GridCoordinate, uint Level)
+{
+	if (Level == 0)
+	{
+		float3 Vector = GetTextureCubeVector(GridCoordinate);
+		float3 Color = TextureCubeSampleLevel(TextureCube0, TextureCubeSampler0, Vector, 0).rgb;
+		RWRowCdf[LinearCoordinate(GridCoordinate)] = Luminance(Color);
+	}
+	else
+	{
+		uint3 NextCoordinate = GridCoordinate + uint3(1 << Level - 1, 0, 0);
+		if (NextCoordinate.x < RowCdfDimensions.x)
+		{
+			float Source = RWRowCdf[LinearCoordinate(GridCoordinate)];
+			float Destination = RWRowCdf[LinearCoordinate(NextCoordinate)];
+			RWRowCdf[LinearCoordinate(NextCoordinate)] = Source + Destination;
+		}
+	}
+}
+
+void Normalize(uint3 GridCoordinate)
+{
+	uint3 NormalizeCoordinate = uint3(RowCdfDimensions.x - 1, GridCoordinate.y, GridCoordinate.z);
+
+#if 1
+	RWRowCdf[LinearCoordinate(GridCoordinate)] /= RWRowCdf[LinearCoordinate(NormalizeCoordinate)];
+#else
+	// TODO: direct assignment into last index is causing some temporal instability.
+	// May need to double-buffer anyway..
+	uint Index = LinearCoordinate(GridCoordinate);
+	uint NormalizeIndex = LinearCoordinate(NormalizeCoordinate);
+
+	RWRowCdf[Index] /= RWRowCdf[NormalizeIndex];
+	if (GridCoordinate.x == NormalizeCoordinate.x)
+	{
+		RWRowCdf[Index] = 1.0;
+	}
+#endif
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildSkyLightRowCdfCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint3 GridCoordinate = DispatchThreadId;
+
+	// Out-of-bounds check
+	if (GridCoordinate.x >= RowCdfDimensions.x || GridCoordinate.y >= RowCdfDimensions.y || GridCoordinate.z >= RowCdfDimensions.z)
+	{
+		return;
+	}
+
+	GridCoordinate.z = CubeFace;
+	if (Mode == 0)
+	{
+		PrefixSum(GridCoordinate, Level);
+		//PrefixSum(GridCoordinate, 0);
+	}
+	else if (Mode == 1)
+	{
+		Normalize(GridCoordinate);
+	}
+}

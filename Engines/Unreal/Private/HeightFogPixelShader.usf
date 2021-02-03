@@ -1,0 +1,73 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	HeightFogPixelShader.usf: Scene fogging pixel shader.
+=============================================================================*/
+
+#include "Common.ush"
+#include "SceneTexturesCommon.ush"
+#include "SHCommon.ush"
+#include "HeightFogCommon.ush"
+
+float bOnlyOnRenderedOpaque;
+float bUseLinearDepthTexture;
+
+float4 LinearDepthTextureMinMaxUV;
+
+Texture2D OcclusionTexture;
+SamplerState OcclusionSampler;
+
+Texture2D LinearDepthTexture;
+SamplerState LinearDepthSampler;
+
+void ExponentialPixelMain(
+	float2 TexCoord : TEXCOORD0,
+	float3 ScreenVector : TEXCOORD1,
+	float4 SVPos : SV_POSITION,
+	out float4 OutColor : SV_Target0
+	)
+{
+	float SceneDepth;
+	float DeviceZ;
+	if (bUseLinearDepthTexture > 0.0f)
+	{
+		float2 SampleUV = clamp(TexCoord, LinearDepthTextureMinMaxUV.xy, LinearDepthTextureMinMaxUV.zw);
+		SceneDepth = Texture2DSampleLevel(LinearDepthTexture, LinearDepthSampler, SampleUV, 0).r * bUseLinearDepthTexture; // bUseLinearDepthTexture is also a scale to get depth in correct range
+		DeviceZ = ConvertToDeviceZ(SceneDepth);
+	}
+	else
+	{
+	#if SCENE_TEXTURES_DISABLED
+		float SceneDepth = SCENE_TEXTURES_DISABLED_SCENE_DEPTH_VALUE;
+		DeviceZ = ConvertToDeviceZ(SceneDepth);
+	#else
+		DeviceZ = Texture2DSampleLevel(SceneTexturesStruct.SceneDepthTexture, SceneTexturesStruct_SceneDepthTextureSampler, TexCoord, 0).r;
+		SceneDepth = ConvertFromDeviceZ(DeviceZ); // Fetch the depth buffer Z / W value, solve for W
+	#endif
+	}
+
+	bool bIsRendered = (DeviceZ != 0.0);
+
+	float3 WorldPositionRelativeToCamera = ScreenVector.xyz * SceneDepth;
+
+	float ZSlice = log2(SceneDepth * View.VolumetricFogGridZParams.x + View.VolumetricFogGridZParams.y) * View.VolumetricFogGridZParams.z * View.VolumetricFogInvGridSize.z;
+	float3 VolumeUV = float3((SVPos.xy - View.ViewRectMin.xy) * View.VolumetricFogSVPosToVolumeUV, ZSlice);
+
+	float4 HeightFogInscatteringAndOpacity = CalculateHeightFog(WorldPositionRelativeToCamera);
+
+	float4 FogInscatteringAndOpacity = CombineVolumetricFog(HeightFogInscatteringAndOpacity, VolumeUV, 0);
+	float LightShaftMask = Texture2DSample(OcclusionTexture, OcclusionSampler, TexCoord).x;
+	FogInscatteringAndOpacity.rgb *= LightShaftMask;
+
+#if USE_PREEXPOSURE 
+	FogInscatteringAndOpacity.rgb *= View.PreExposure;
+#endif
+
+	if (bOnlyOnRenderedOpaque > 0.0 && !bIsRendered)
+	{
+		FogInscatteringAndOpacity.rgb = 0;
+		FogInscatteringAndOpacity.a = 1;
+	}
+
+	OutColor = RETURN_COLOR(float4(FogInscatteringAndOpacity.rgb, FogInscatteringAndOpacity.w));
+}

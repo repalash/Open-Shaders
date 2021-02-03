@@ -1,0 +1,240 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../CommonViewUniformBuffer.ush"
+
+#include "../SceneTexturesCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+#if SHADER_SUBCOLOR
+
+Texture2D<float4> SubPixelColorTexture;
+Texture2D<uint4> CategorisationTexture;
+
+void SubColorPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor  : SV_Target0, 
+	out float  OutDepth : SV_DEPTH)
+{
+	const uint2 PixelCoord = floor(Input.Position.xy);
+	OutColor = SubPixelColorTexture.Load(uint3(PixelCoord, 0));
+
+	// Early out writing to not write stencil value for full coverred pixels (or not covered at all)
+	//if (OutColor.a == 0)
+	//	discard;
+
+	const FCategorizationData CategorisationData = DecodeCategorizationData(CategorisationTexture.Load(uint3(Input.Position.xy, 0)));
+	OutDepth = CategorisationData.ClosestDepth;
+}
+
+#endif // SHADER_SUBCOLOR
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_FASTRESOLVE_MSAA
+
+#ifndef PERMUTATION_MSAACOUNT 
+#error PERMUTATION_MSAACOUNT is not defined
+#endif
+
+float VelocityThreshold;
+Texture2DMS<float2, PERMUTATION_MSAACOUNT> HairVisibilityVelocityTexture;
+
+void FastResolvePS(in FScreenVertexOutput Input)
+{
+	const uint2 PixelCoord = floor(Input.Position.xy);
+
+	bool bNeedFastResolve = false;
+	for (uint SampleIt = 0; SampleIt < PERMUTATION_MSAACOUNT; ++SampleIt)
+	{
+		const float2 EncodedVelocity = HairVisibilityVelocityTexture.Load(PixelCoord, SampleIt);
+		const float2 Velocity = DecodeVelocityFromTexture(float4(EncodedVelocity, 0.0, 0.0)).xy;
+		const float VelocityMagnitude = sqrt(dot(Velocity, Velocity));
+		if (EncodedVelocity.x > 0 && VelocityMagnitude > VelocityThreshold)
+		{
+			bNeedFastResolve = true;
+			break;
+		}
+	}
+
+	if (!bNeedFastResolve)
+		discard;
+}
+
+#endif // SHADER_FASTRESOLVE_MSAA
+
+
+#if SHADER_FASTRESOLVE_MASK
+
+Texture2D<uint> ResolveMaskTexture;
+
+void FastResolvePS(in FScreenVertexOutput Input)
+{
+	const uint2 PixelCoord = floor(Input.Position.xy);
+	const bool bNeedFastResolve = ResolveMaskTexture.Load(uint3(PixelCoord, 0)) > 0;
+
+	if (!bNeedFastResolve)
+		discard;
+}
+
+#endif // SHADER_FASTRESOLVE_MASK
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_COMPOSE_SAMPLE
+
+#include "../HeightFogCommon.ush"
+#include "../SkyAtmosphereCommon.ush"
+
+int2 OutputResolution;
+uint bComposeDofDepth;
+uint bEmissiveEnable;
+
+Texture2D<float4>	HairEmissiveTexture;
+Texture2D<float>	HairDOFDepthTexture;
+Texture2D<uint>		HairSampleCount;
+Texture2D<uint4>	HairCategorizationTexture;
+Texture2D<uint>		HairVisibilityNodeOffsetAndCount;
+Texture2D<float4>	HairLightingSampleBuffer;
+
+float4 EvaluateVolumetric(float3 WorldPosition)
+{
+	const float3 CameraRelative_WorldPosition = WorldPosition - View.WorldCameraOrigin;
+	float4 HeightFogging = CalculateHeightFog(CameraRelative_WorldPosition);
+	float4 Fogging = HeightFogging;
+
+	if (FogStruct.ApplyVolumetricFog > 0)
+	{
+		const uint EyeIndex = 0;
+		float3 VolumeUV = ComputeVolumeUV(WorldPosition, View.WorldToClip);
+		Fogging = CombineVolumetricFog(HeightFogging, VolumeUV, EyeIndex);
+	}
+#if USE_PREEXPOSURE 
+	Fogging.rgb *= View.PreExposure;
+#endif
+
+	if (View.SkyAtmosphereApplyCameraAerialPerspectiveVolume > 0.0f)
+	{
+		const float OneOverPreExposure = USE_PREEXPOSURE ? View.OneOverPreExposure : 1.0f;
+		float4 NDCPosition = mul(float4(WorldPosition.xyz, 1), View.WorldToClip);
+
+		// Sample the aerial perspective (AP).
+		Fogging = GetAerialPerspectiveLuminanceTransmittanceWithFogOver(
+			View.RealTimeReflectionCapture, 
+			View.SkyAtmosphereCameraAerialPerspectiveVolumeSizeAndInvSize,
+			NDCPosition, 
+			WorldPosition.xyz * CM_TO_SKY_UNIT, 
+			View.WorldCameraOrigin.xyz * CM_TO_SKY_UNIT,
+			View.CameraAerialPerspectiveVolume, 
+			View.CameraAerialPerspectiveVolumeSampler,
+			View.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolutionInv,
+			View.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolution,
+			View.SkyAtmosphereAerialPerspectiveStartDepthKm,
+			View.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKm,
+			View.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKmInv,
+			OneOverPreExposure, 
+			Fogging);
+	}
+
+	return Fogging;
+}
+
+void ComposeSamplePS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0,
+	out float  OutDepth : SV_DEPTH)
+{
+	OutColor = 0.0f;
+	const uint3 PixelCoord = uint3(floor(Input.Position.xy), 0);
+
+	FNodeDesc NodeDesc = DecodeNodeDesc(HairVisibilityNodeOffsetAndCount.Load(PixelCoord));
+	if (NodeDesc.Count == 0)
+	{
+		discard;
+	}
+
+	const FCategorizationData CatData = DecodeCategorizationData(HairCategorizationTexture.Load(PixelCoord));
+	const float PixelCoverage = min(CatData.PixelCoverage, 1);
+	if (PixelCoverage == 0)
+		discard;
+
+	const uint TotalNodeCount = HairSampleCount.Load(uint3(0, 0, 0));
+	const uint Resolution = uint(ceil(sqrt(float(TotalNodeCount))));
+
+	const float3 ClosetPointWorldPosition = SvPositionToWorld(float4(Input.Position.xy, CatData.ClosestDepth, 1.0));;
+	const float4 Volumetric = EvaluateVolumetric(ClosetPointWorldPosition);
+
+	float3 LocalAccColor = 0;
+	LOOP
+	for (uint SampleIt = 0; SampleIt < NodeDesc.Count; SampleIt++)
+	{
+		const uint LocalOffset = NodeDesc.Offset + SampleIt;
+		const uint2 Coord = uint2(LocalOffset % Resolution, LocalOffset / Resolution);
+		const float4 LightingSample = HairLightingSampleBuffer.Load(uint3(Coord,0));
+		const float4 EmissiveSample = HairEmissiveTexture.Load(uint3(Coord, 0));
+		LocalAccColor += LightingSample.rgb + EmissiveSample.rgb;
+	}
+	OutColor.rgb = LocalAccColor * Volumetric.a + Volumetric.rgb;
+
+	OutColor.rgb *= PixelCoverage;
+	OutColor.a = PixelCoverage;
+	OutDepth = CatData.ClosestDepth;
+	if (bComposeDofDepth)
+	{
+		OutDepth = HairDOFDepthTexture.Load(PixelCoord);
+	}
+}
+
+#endif // SHADER_COMPOSE_SAMPLE
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_DOFDEPTH
+#include "../CircleDOFCommon.ush"
+
+Texture2D<float>	SceneDepthTexture;
+Texture2D<uint4>	HairCategorizationTexture;
+
+void DOFDepthPS(
+	in FScreenVertexOutput Input,
+	out float OutTexture : SV_Target0)
+{
+	OutTexture = 0.0f;
+	const uint3 PixelCoord = uint3(floor(Input.Position.xy), 0);
+
+	const FCategorizationData CatData = DecodeCategorizationData(HairCategorizationTexture.Load(PixelCoord));
+	const float PixelCoverage = min(CatData.PixelCoverage, 1);
+	if (PixelCoverage == 0)
+	{
+		return;
+	}
+	   
+	const float HalfResToFullRes = 2;
+
+	float SceneDeviceZ = 0;
+	float SceneDepth = 0;
+	float SceneCoC = 0; // Radius in pixel
+	{
+		SceneDeviceZ = SceneDepthTexture.Load(PixelCoord);
+		SceneDepth = ConvertFromDeviceZ(SceneDeviceZ);
+		SceneDeviceZ = 1 - SceneDeviceZ;
+		SceneCoC = DepthToCoc(SceneDepth) * HalfResToFullRes;
+	}
+
+	float HairLuminance = 0;
+	float HairDeviceZ = 0;
+	float HairDepth = 0;
+	float HairCoC = 0; // Radius in pixel
+	{
+		HairDeviceZ = CatData.ClosestDepth;
+		HairDepth = ConvertFromDeviceZ(HairDeviceZ);
+		HairDeviceZ = 1 - HairDeviceZ;
+		HairCoC = DepthToCoc(HairDepth) * HalfResToFullRes;
+	}
+
+	const float OutDeviceZ = lerp(SceneDeviceZ, HairDeviceZ, PixelCoverage);
+	OutTexture = 1 - OutDeviceZ;
+}
+
+#endif // SHADER_DOFDEPTH

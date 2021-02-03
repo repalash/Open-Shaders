@@ -1,0 +1,457 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// EDeferredMaterialMode
+#define DEFERRED_MATERIAL_MODE_NONE   0
+#define DEFERRED_MATERIAL_MODE_GATHER 1
+#define DEFERRED_MATERIAL_MODE_SHADE  2
+
+#ifndef DIM_DEFERRED_MATERIAL_MODE
+#define DIM_DEFERRED_MATERIAL_MODE DEFERRED_MATERIAL_MODE_NONE
+#endif
+
+#include "../Common.ush"
+#include "../RectLight.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShadingModels.ush"
+#include "../SceneTextureParameters.ush"
+
+#include "RayTracingCommon.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+#include "RayTracingHitGroupCommon.ush"
+#include "RayTracingGatherPoints.ush"
+
+#include "../PathTracing/Light/PathTracingLightSampling.ush"
+#include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+
+#include "../QuasiRandom.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+uint GatherSamplesPerPixel;
+uint SamplesPerPixel;
+uint SampleIndex;
+uint MaxBounces;
+uint UpscaleFactor;
+uint RenderTileOffsetX;
+uint RenderTileOffsetY;
+float MaxRayDistanceForGI;
+float MaxShadowDistance;
+float NextEventEstimationSamples;
+float DiffuseThreshold;
+float MaxNormalBias;
+uint EvalSkyLight;
+uint UseRussianRoulette;
+uint GatherFilterWidth;
+
+int2 GatherPointsResolution;
+uint2 TileAlignedResolution;
+uint SortTileSize;
+
+RWStructuredBuffer<FGatherPoints> RWGatherPointsBuffer;
+// Material buffer and tile size are used for sorted materials.
+RWStructuredBuffer<FDeferredMaterialPayload> MaterialBuffer;
+
+uint DispatchThreadIdToLinearIndex(uint2 DispatchThreadId)
+{
+	return DispatchThreadId.y * GatherPointsResolution.x + DispatchThreadId.x;
+}
+
+void GenerateUniformRay(
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+)
+{
+	float4 SampleResult = UniformSampleSphere(RandSample);
+	float3 Direction_World = SampleResult.xyz;
+
+	RayOrigin = WorldPosition;
+	RayDirection = Direction_World;
+	RayTMin = 0.05;
+	RayTMax = MaxRayDistanceForGI;
+	RayPdf = SampleResult.w;
+}
+
+void GenerateCosineNormalRay(
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+)
+{
+	// Perform cosine-hemispherical sampling and convert to world-space
+	float4 Direction_Tangent = CosineSampleHemisphere(RandSample);
+	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
+
+	RayOrigin = WorldPosition;
+	RayDirection = Direction_World;
+	RayTMin = 0.05;
+	RayTMax = MaxRayDistanceForGI;
+	RayPdf = Direction_Tangent.w;
+}
+
+bool ShouldTraceRay(uint2 DispatchThreadId, FGBufferData GBufferData)
+{
+	bool bTraceRay = true;
+
+	// Cull based on shading model
+	uint ShadingModelID = GBufferData.ShadingModelID;
+	if (ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		bTraceRay = false;
+	}
+
+	// Cull based on diffuse threshold
+	float3 DiffuseColor = GBufferData.DiffuseColor;
+	if (Luminance(DiffuseColor) < DiffuseThreshold)
+	{
+		bTraceRay = false;
+	}
+
+	// Cull based on ViewRect
+	if (any(DispatchThreadId >= GatherPointsResolution))
+	{
+		bTraceRay = false;
+	}
+
+	return bTraceRay;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsTraceRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin + uint2(RenderTileOffsetX, RenderTileOffsetY);
+
+	FDeferredMaterialPayload DeferredMaterialPayload;
+	DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID;
+	DeferredMaterialPayload.PixelCoordinates = DispatchThreadId.x | (DispatchThreadId.y << 16);
+
+	// Get G-Buffer surface data
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+
+#if 0
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+	//#dxr-todo: workaround for flickering. UE-87281
+	FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+
+	// Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+	if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+	{
+		GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+	}
+
+	// Get sample-center's normal for sample generation
+	uint2 SampleCenterCoord = PixelCoord - (PixelCoord % GatherFilterWidth) + (GatherFilterWidth / 2);
+	FGBufferData SampleCenterGBufferData = GetGBufferDataFromSceneTexturesLoad(SampleCenterCoord);
+	float3 SampleCenterNormal = SampleCenterGBufferData.WorldNormal;
+
+	// Construct position, normal, and view direction
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	float3 WorldNormal = GBufferData.WorldNormal;
+
+	// Determine blue-noise coordinate, based on the local neighborhood
+	uint2 BlueNoiseCoord = PixelCoord / GatherFilterWidth;
+	uint Iteration = (PixelCoord.y % GatherFilterWidth) * GatherFilterWidth + (PixelCoord.x % GatherFilterWidth);
+
+	FQuasiRandom QuasiRandom;
+	QuasiRandom_Initialize(QuasiRandom, BlueNoiseCoord, Iteration, SamplesPerPixel);
+
+	bool bTraceRay = ShouldTraceRay(DispatchThreadId, GBufferData);
+	if (bTraceRay)
+	{
+		float3 RandSample = QuasiRandom_Sample3(QuasiRandom);
+
+		// Initialize ray
+		RayDesc Ray;
+		float RayPdf = 1.0;
+		GenerateCosineNormalRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		//GenerateUniformRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		//GenerateCosineNormalRay(WorldPosition, SampleCenterNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+
+		uint RayFlags = 0;
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+		DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS;
+		TraceRay(
+			TLAS,								// AccelerationStructure
+			RayFlags,
+			InstanceInclusionMask,				// InstanceInclusionMask
+			RAY_TRACING_SHADER_SLOT_MATERIAL,	// RayContributionToHitGroupIndex
+			RAY_TRACING_NUM_SHADER_SLOTS,		// MultiplierForGeometryContributionToShaderIndex
+			0,									// MissShaderIndex
+			Ray,								// RayDesc
+			DeferredMaterialPayload
+		);
+	}
+
+	uint LinearStoreIndex = DispatchRaysIndex().y * TileAlignedResolution.x + DispatchRaysIndex().x;
+	uint StoreIndex = LinearStoreIndex;
+
+	if (SortTileSize > 0) // Store payload in tile order
+	{
+		uint2 Block = DispatchRaysIndex().xy / SortTileSize;
+		uint2 Thread = DispatchRaysIndex().xy % SortTileSize;
+
+		uint IndexInsideBlock = Thread.y * SortTileSize + Thread.x;
+		uint ElementsPerBlock = SortTileSize * SortTileSize;
+		uint BlocksPerRow = TileAlignedResolution.x / SortTileSize;
+		uint BlockIndex = Block.y * BlocksPerRow + Block.x;
+
+		StoreIndex = BlockIndex * ElementsPerBlock + IndexInsideBlock;
+	}
+
+	MaterialBuffer[StoreIndex] = DeferredMaterialPayload;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
+{
+	FDeferredMaterialPayload DeferredMaterialPayload;
+	DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID;
+
+	uint2 DispatchThreadId;
+	if (DIM_DEFERRED_MATERIAL_MODE == DEFERRED_MATERIAL_MODE_SHADE)
+	{
+		DeferredMaterialPayload = MaterialBuffer[DispatchRaysIndex().x];
+		DispatchThreadId.x = DeferredMaterialPayload.PixelCoordinates & 0xFFFF;
+		DispatchThreadId.y = DeferredMaterialPayload.PixelCoordinates >> 16;
+
+		if (DeferredMaterialPayload.SortKey == RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID)
+		{
+			return;
+		}
+	}
+	else
+	{
+		DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin + uint2(RenderTileOffsetX, RenderTileOffsetY);
+	}
+
+	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
+
+	// Default initialization
+	FGatherSample GatherSample = (FGatherSample)0.0;
+	WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+
+	// Get G-Buffer surface data
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+
+#if 0
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+	//#dxr-todo: workaround for flickering. UE-87281
+	FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+
+	// Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+	if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+	{
+		GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+	}
+
+	// Construct position, normal, and view direction
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	float3 WorldNormal = GBufferData.WorldNormal;
+
+	// Determine blue-noise coordinate, based on the local neighborhood
+	uint2 BlueNoiseCoord = PixelCoord / GatherFilterWidth;
+	uint Iteration = (PixelCoord.y % GatherFilterWidth) * GatherFilterWidth + (PixelCoord.x % GatherFilterWidth);
+
+	// Get sample-center's normal for sample generation
+	uint2 SampleCenterCoord = PixelCoord - (PixelCoord % GatherFilterWidth) + (GatherFilterWidth / 2);
+
+	FGBufferData SampleCenterGBufferData = GetGBufferDataFromSceneTexturesLoad(SampleCenterCoord);
+	float3 SampleCenterNormal = SampleCenterGBufferData.WorldNormal;
+
+	FQuasiRandom QuasiRandom;
+	QuasiRandom_Initialize(QuasiRandom, BlueNoiseCoord, Iteration, SamplesPerPixel);
+
+	bool bTraceRay = ShouldTraceRay(DispatchThreadId, GBufferData);
+	if (bTraceRay)
+	{
+#if 0
+		// Adaptive rejection optimization
+		{
+			float3 GPPosition = RWGatherPointsBuffer[GatherPointsIndex].CreationPoint[SampleIndex];
+			if (length(GPPosition - WorldPosition) < 10.0) continue;
+		}
+#endif
+		float3 Irradiance = 0;
+		float3 Position = 0;
+		float3 Normal = 0;
+
+		float3 RandSample = QuasiRandom_Sample3(QuasiRandom);
+
+		// Initialize ray
+		RayDesc Ray;
+		float RayPdf = 1.0;
+		GenerateCosineNormalRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		//GenerateUniformRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		//GenerateCosineNormalRay(WorldPosition, SampleCenterNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		// Distribution PDF is not used for gather points, only gather queries.
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+
+			uint RayFlags = 0;
+			const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+			const bool bEnableSkyLightContribution = true;
+			const bool bIgnoreTranslucentMaterials = false;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+			RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+		if (DIM_DEFERRED_MATERIAL_MODE == DEFERRED_MATERIAL_MODE_SHADE)
+		{
+			if (DeferredMaterialPayload.SortKey < RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS)
+			{
+				const float ShortRayLength = 1.0f; // 1cm is arbitrarily chosen
+				Ray.TMin = max(0, DeferredMaterialPayload.HitT - ShortRayLength * 0.5f);
+
+				// TMax can only be used if alpha masked materials are handled during initial ray tracing (material gathering)
+				// Ray.TMax = DeferredMaterialPayload.HitT + ShortRayLength * 0.5f;
+			}
+			else
+			{
+				Ray.TMax = 0;
+			}
+		}
+
+		{
+			// Cast ray
+			const bool bDisableSkyLightContribution = false;
+
+			FRayCone RayCone = (FRayCone)0;
+			FMaterialClosestHitPayload Payload = TraceMaterialRay(
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				Ray,
+				RayCone,
+				PixelCoord,
+				bEnableSkyLightContribution,
+				bIgnoreTranslucentMaterials);
+
+			// TODO: impossible based on formulation
+			if (Payload.HitT > MaxRayDistanceForGI) return;
+
+			// Update intersection
+			Ray.Origin += Ray.Direction * Payload.HitT;
+
+			// Create faux GBuffer to use with EvaluateBxDF
+			FGBufferData GBufferData = (FGBufferData)0;
+			GBufferData.Depth = 1.f; // Do not use depth
+			GBufferData.WorldNormal = Payload.WorldNormal;
+			GBufferData.BaseColor = Payload.BaseColor;
+			GBufferData.CustomData = Payload.CustomData;
+			GBufferData.GBufferAO = Payload.GBufferAO;
+			GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+			GBufferData.SpecularColor = Payload.SpecularColor;
+			GBufferData.DiffuseColor = Payload.DiffuseColor;
+			GBufferData.Metallic = Payload.Metallic;
+			GBufferData.Specular = Payload.Specular;
+			GBufferData.Roughness = Payload.Roughness;
+			GBufferData.ShadingModelID = Payload.ShadingModelID;
+			GBufferData.CustomData = Payload.CustomData;
+
+			Position = Ray.Origin;
+			Normal = Payload.WorldNormal;
+
+			// Perform next-event estimation
+			float SplitFactor = 1.0 / NextEventEstimationSamples;
+			for (uint NeeTrial = 0; NeeTrial < NextEventEstimationSamples; ++NeeTrial)
+			{
+				// Light selection
+				int LightId;
+				float3 LightUV;
+				float NeePdf = 0.0;
+
+				float4 RandSample4;
+				RandSample4.xyz = QuasiRandom_Sample3(QuasiRandom);
+				RandSample4.w = QuasiRandom_Sample3(QuasiRandom).x;
+				SampleLight(Ray, Payload, RandSample4, LightId, LightUV, NeePdf);
+
+				if (NeePdf > 0.0)
+				{
+					RayDesc LightRay;
+					GenerateLightRay(Ray, LightId, LightUV, LightRay);
+					LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+					bool bTransmission = HasTransmission(LightId);
+					float3 BiasNormal = Payload.WorldNormal;
+					if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+					{
+						BiasNormal = -BiasNormal;
+					}
+					ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+					// Trace visibility ray
+					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						NeeRayFlags,
+						NeeInstanceInclusionMask,
+						PixelCoord,
+						LightRay);
+
+					// No hit indicates successful next-event connection
+					if (NeePayload.IsMiss())
+					{
+						// Evaluate radiance
+						float3 Radiance;
+						EvalLight(LightId, LightUV, LightRay, Radiance);
+
+						// Evaluate material
+						half3 N = Payload.WorldNormal;
+						half3 V = -Ray.Direction;
+						half3 L = LightRay.Direction;
+						float NoL = saturate(dot(N, L));
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+						float3 MaterialThroughput = LightingSample.Diffuse;
+						if (bTransmission)
+						{
+							MaterialThroughput += LightingSample.Transmission;
+						}
+
+						// Record the contribution
+						float3 ExitantRadianceSample = Radiance * MaterialThroughput * SplitFactor / NeePdf;
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+					}
+				}
+			}
+		}
+
+		FGatherSample GatherSample = (FGatherSample)0.0;
+		GatherSample.CreationPoint = WorldPosition;
+		GatherSample.Position = Position;
+		GatherSample.Irradiance = Irradiance;
+		GatherSample.Pdf = RayPdf;
+
+		WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+	}
+}

@@ -1,0 +1,13 @@
+#version 120 or 150 compatibility // -*- c++ -*-
+#include <compatibility.glsl>
+
+uniform sampler2D  source;
+uniform int2       offset;
+uniform int        scale;
+
+// For inverting the y-axis
+uniform int        yOffset, ySign;
+
+void main(void) {
+    gl_FragColor = texelFetch(source, int2(gl_FragCoord.x, yOffset + ySign * gl_FragCoord.y) / scale + offset, 0);
+}

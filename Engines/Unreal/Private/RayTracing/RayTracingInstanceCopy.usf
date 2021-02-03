@@ -1,0 +1,41 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayTracingInstanceCopy.usf: Build ray tracing instances in the GPU 
+===============================================================================================*/
+
+#include "../Common.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 1
+#endif
+
+// Should match D3D12_RAYTRACING_INSTANCE_DESC size
+//#dxr-todo: support other platforms with a define set when the shader is dispatched
+struct FInstanceDescriptor
+{
+	float3x4 Transform;
+	uint InstanceIdAndMask;
+	uint InstanceContributionToHitGroupIndexAndFlags;
+	uint AccelerationStructure[2]; //uint64
+};
+
+uint InstancesCPUCount;
+uint DescBufferOffset;
+StructuredBuffer<float3x4> InstancesTransforms;
+RWStructuredBuffer<FInstanceDescriptor> InstancesDescriptors;
+
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void RayTracingInstanceCopyShaderCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint InstanceIndex = DispatchThreadId.x;	
+
+	float3x4 InstanceXForm = InstancesTransforms[InstanceIndex];
+	uint DescIndex = DescBufferOffset + InstanceIndex;
+
+	if (InstanceIndex < InstancesCPUCount)
+	{
+		InstancesDescriptors[DescIndex].Transform = InstanceXForm;
+	}
+}

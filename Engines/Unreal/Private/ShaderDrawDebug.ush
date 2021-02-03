@@ -1,0 +1,184 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#ifndef SHADER_DRAW_DEBUG
+#define SHADER_DRAW_DEBUG 1
+#endif
+
+struct FShaderDrawElement 
+{
+	float3 Pos0;
+	float3 Pos1;
+	float4 Color0;
+	float4 Color1;
+};
+
+// Note: Unaligned structures used for structured buffers is an unsupported and/or sparsely
+//         supported feature in VK (VK_EXT_scalar_block_layout) and Metal. Consequently, we do
+//         manual packing in order to accommodate.
+struct FPackedShaderDrawElement 
+{
+	float4 Pos0_ColorX;		// float3 Pos0 + Color.x
+	float4 Pos1_ColorY;		// float3 Pos1 + Color.y
+};
+
+FPackedShaderDrawElement PackShaderElement(FShaderDrawElement E)
+{
+	uint4 PackedC0 = 255.0f * saturate(E.Color0);
+	uint4 PackedC1 = 255.0f * saturate(E.Color1);
+
+	FPackedShaderDrawElement PackedE;
+	PackedE.Pos0_ColorX = float4(E.Pos0, asfloat((PackedC0.x << 24) | (PackedC0.y << 16) | (PackedC0.z << 8) | (PackedC0.w)));
+	PackedE.Pos1_ColorY = float4(E.Pos1, asfloat((PackedC1.x << 24) | (PackedC1.y << 16) | (PackedC1.z << 8) | (PackedC1.w)));
+	return PackedE;
+}
+
+FShaderDrawElement UnpackShaderElement(FPackedShaderDrawElement PackedE)
+{
+	uint2 PackedColor01 = uint2(asuint(PackedE.Pos0_ColorX.w), asuint(PackedE.Pos1_ColorY.w));
+
+	FShaderDrawElement E;
+	E.Pos0 = PackedE.Pos0_ColorX.xyz;
+	E.Pos1 = PackedE.Pos1_ColorY.xyz;
+	E.Color0 = float4((PackedColor01.x >> 24) & 0xFF, (PackedColor01.x >> 16) & 0xFF, (PackedColor01.x >> 8) & 0xFF, (PackedColor01.x) & 0xFF) / 255.0f;
+	E.Color1 = float4((PackedColor01.y >> 24) & 0xFF, (PackedColor01.y >> 16) & 0xFF, (PackedColor01.y >> 8) & 0xFF, (PackedColor01.y) & 0xFF) / 255.0f;
+	return E;
+}
+
+#if SHADER_DRAW_DEBUG == 1
+
+RWStructuredBuffer<FPackedShaderDrawElement>	OutShaderDrawPrimitive;
+RWBuffer<uint>								OutputShaderDrawIndirect;
+
+int2 ShaderDrawCursorPos;
+uint ShaderDrawMaxElementCount; 
+
+int2 GetCursorPos()
+{
+	return ShaderDrawCursorPos;
+}
+
+void AddLine(float3 Pos0, float3 Pos1, float4 Color0, float4 Color1)
+{
+	uint PreviousPrimitiveCount = 0;
+	InterlockedAdd(OutputShaderDrawIndirect[1], 1, PreviousPrimitiveCount);
+	if ((PreviousPrimitiveCount+1) <= ShaderDrawMaxElementCount)
+    {
+		FShaderDrawElement Element;
+		Element.Pos0 = Pos0;
+		Element.Pos1 = Pos1;
+		Element.Color0 = Color0;
+		Element.Color1 = Color1;
+
+		OutShaderDrawPrimitive[PreviousPrimitiveCount] = PackShaderElement(Element);
+    }
+	else
+	{
+		InterlockedAdd(OutputShaderDrawIndirect[1], -1, PreviousPrimitiveCount);// Make sure we stay in the safe zone for indirect draw
+	}
+}
+
+void AddQuad(float3 Pos0, float3 Pos1, float3 Pos2, float3 Pos3, float4 Color)
+{
+	uint PreviousPrimitiveCount = 0;
+	InterlockedAdd(OutputShaderDrawIndirect[1], 4, PreviousPrimitiveCount);
+	if ((PreviousPrimitiveCount+4) <= ShaderDrawMaxElementCount)
+	{
+		FShaderDrawElement Element;
+		Element.Color0 = Element.Color1 = Color;
+
+		Element.Pos0 = Pos0; Element.Pos1 = Pos1;
+		OutShaderDrawPrimitive[PreviousPrimitiveCount + 0] = PackShaderElement(Element);
+
+		Element.Pos0 = Pos1; Element.Pos1 = Pos2;
+		OutShaderDrawPrimitive[PreviousPrimitiveCount + 1] = PackShaderElement(Element);
+
+		Element.Pos0 = Pos2; Element.Pos1 = Pos3;
+		OutShaderDrawPrimitive[PreviousPrimitiveCount + 2] = PackShaderElement(Element);
+
+		Element.Pos0 = Pos3; Element.Pos1 = Pos0;
+		OutShaderDrawPrimitive[PreviousPrimitiveCount + 3] = PackShaderElement(Element);
+	}
+	else
+	{
+		InterlockedAdd(OutputShaderDrawIndirect[1], -4, PreviousPrimitiveCount);// Make sure we stay in the safe zone for indirect draw
+	}
+}
+
+void AddAABB(float3 Min, float3 Max, float4 Color)
+{
+	uint PreviousPrimitiveCount = 0;
+	InterlockedAdd(OutputShaderDrawIndirect[1], 12, PreviousPrimitiveCount);
+	if ((PreviousPrimitiveCount + 12) <= ShaderDrawMaxElementCount)
+	{
+		float3 P0 = float3(Min.x, Min.y, Min.z);
+		float3 P1 = float3(Max.x, Min.y, Min.z);
+		float3 P2 = float3(Max.x, Max.y, Min.z);
+		float3 P3 = float3(Min.x, Max.y, Min.z);
+		float3 P4 = float3(Min.x, Min.y, Max.z);
+		float3 P5 = float3(Max.x, Min.y, Max.z);
+		float3 P6 = float3(Max.x, Max.y, Max.z);
+		float3 P7 = float3(Min.x, Max.y, Max.z);
+
+		FShaderDrawElement Element;
+		Element.Color0 = Element.Color1 = Color;
+
+		Element.Pos0 = P0; Element.Pos1 = P1; OutShaderDrawPrimitive[PreviousPrimitiveCount + 0] = PackShaderElement(Element);
+		Element.Pos0 = P1; Element.Pos1 = P2; OutShaderDrawPrimitive[PreviousPrimitiveCount + 1] = PackShaderElement(Element);
+		Element.Pos0 = P2; Element.Pos1 = P3; OutShaderDrawPrimitive[PreviousPrimitiveCount + 2] = PackShaderElement(Element);
+		Element.Pos0 = P3; Element.Pos1 = P0; OutShaderDrawPrimitive[PreviousPrimitiveCount + 3] = PackShaderElement(Element);
+
+		Element.Pos0 = P4; Element.Pos1 = P5; OutShaderDrawPrimitive[PreviousPrimitiveCount + 4] = PackShaderElement(Element);
+		Element.Pos0 = P5; Element.Pos1 = P6; OutShaderDrawPrimitive[PreviousPrimitiveCount + 5] = PackShaderElement(Element);
+		Element.Pos0 = P6; Element.Pos1 = P7; OutShaderDrawPrimitive[PreviousPrimitiveCount + 6] = PackShaderElement(Element);
+		Element.Pos0 = P7; Element.Pos1 = P4; OutShaderDrawPrimitive[PreviousPrimitiveCount + 7] = PackShaderElement(Element);
+
+		Element.Pos0 = P0; Element.Pos1 = P4; OutShaderDrawPrimitive[PreviousPrimitiveCount + 8] = PackShaderElement(Element);
+		Element.Pos0 = P1; Element.Pos1 = P5; OutShaderDrawPrimitive[PreviousPrimitiveCount + 9] = PackShaderElement(Element);
+		Element.Pos0 = P2; Element.Pos1 = P6; OutShaderDrawPrimitive[PreviousPrimitiveCount +10] = PackShaderElement(Element);
+		Element.Pos0 = P3; Element.Pos1 = P7; OutShaderDrawPrimitive[PreviousPrimitiveCount +11] = PackShaderElement(Element);
+	}
+	else
+	{
+		InterlockedAdd(OutputShaderDrawIndirect[1], -12, PreviousPrimitiveCount);// Make sure we stay in the safe zone for indirect draw
+	}
+}
+
+void AddCross(float3 Pos, float Size, float4 Color)
+{
+	AddLine(Pos - float3(Size,0,0), Pos + float3(Size,0,0), Color, Color);
+	AddLine(Pos - float3(0,Size,0), Pos + float3(0,Size,0), Color, Color);
+	AddLine(Pos - float3(0,0,Size), Pos + float3(0,0,Size), Color, Color);
+}
+
+void AddReferential(float3 Pos, float3 T, float3 B, float3 N)
+{
+	const float4 Red = float4(1, 0, 0, 1);
+	const float4 Green = float4(0, 1, 0, 1);
+	const float4 Blue = float4(0, 0, 1, 1);
+
+	AddLine(Pos, Pos + T, Red, Red);
+	AddLine(Pos, Pos + B, Green, Green);
+	AddLine(Pos, Pos + N, Blue, Blue);
+}
+
+void AddReferential(float3 Pos, float3 TangentZ)
+{
+	const float Sign = TangentZ.z >= 0 ? 1 : -1;
+	const float a = -rcp(Sign + TangentZ.z);
+	const float b = TangentZ.x * TangentZ.y * a;
+
+	const float3 TangentX = { 1 + Sign * a * Pow2(TangentZ.x), Sign * b, -Sign * TangentZ.x };
+	const float3 TangentY = { b,  Sign + a * Pow2(TangentZ.y), -TangentZ.y };
+
+	AddReferential(Pos, TangentX, TangentY, TangentZ);
+}
+
+void AddLineTriangle(float3 P0, float3 P1, float3 P2, float4 Color)
+{
+	AddLine(P0, P1, Color, Color);
+	AddLine(P1, P2, Color, Color);
+	AddLine(P2, P0, Color, Color);
+}
+#endif

@@ -1,0 +1,24 @@
+#version 120 // -*- c++ -*-
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+
+uniform sampler2D lambertianBuffer;
+uniform sampler2D indirectBuffer;
+uniform sampler2D directBuffer;
+uniform ivec2       aoBufferOffset;
+
+uniform float   saturatedLightBoost;
+uniform float   unsaturatedLightBoost;
+#include "../colorBoost.glsl"
+#include <g3dmath.glsl>
+
+void main() {
+    // Screen-space point being shaded
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    vec3 indirect = texelFetch(indirectBuffer, C, 0).rgb;
+
+    vec3 direct = texelFetch(directBuffer, C, 0).rgb;
+    vec3 lambertianColor = texelFetch(lambertianBuffer, C, 0).rgb / pi ;
+
+    gl_FragColor.rgb = direct + indirect * lambertianColor * colorBoost(indirect, unsaturatedLightBoost, saturatedLightBoost);
+}

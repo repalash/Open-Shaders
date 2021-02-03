@@ -1,0 +1,138 @@
+#version 410
+/**
+  \file data-files/shader/DefaultRenderer/DefaultRenderer_upsampleOIT.pix
+
+  Upsample low-resolution A, B+D^2, and delta buffers to full resolution
+  using joint-bilateral upsampling based on a depth key.
+
+  From:
+
+    McGuire and Mara, A Phenomenological Scattering Model for Order-Independent Transparency, 
+    Proceedings of the ACM Symposium on Interactive 3D Graphics and Games (I3D), Feburary 28, 2016
+    http://graphics.cs.williams.edu/papers/TransparencyI3D16/
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <octahedral.glsl>
+
+#expect FILTER_RADIUS "integer > 0"
+#expect HAS_NORMALS   "1 or 0. Determines whether sourceOctNormal is bound"
+
+/** sum(rgb * a, a) */
+uniform sampler2D   accumTexture;
+
+/** (beta_r, beta_g, beta_b, diffusion) */
+uniform sampler2D   backgroundModulationAndDiffusionTexture;
+
+/** (delta_x, delat_y) */
+uniform sampler2D   deltaTexture;
+
+/** Low resolution */
+uniform sampler2D   sourceDepth;
+uniform vec2        sourceSize;
+#if HAS_NORMALS
+    uniform sampler2D sourceOctNormal;
+#endif
+
+/** Full resolution */
+uniform sampler2D   destDepth;
+
+#if HAS_NORMALS
+    /** Camera-space cartesian normal */
+    uniform Texture2D   destNormal;
+#endif // HAS_NORMALS
+    
+uniform int         downsampleFactor;
+
+in Point2           g3d_TexCoord;
+
+layout(location = 0) out float4          accum;
+layout(location = 1) out float4          backgroundModulationAndDiffusion;
+layout(location = 2) out float2          delta;
+
+void main() {
+    int2 fullPixelIndex = int2(gl_FragCoord.xy);
+
+    // Bilinear bilateral upsample.  Find the texture samples most like this one
+    float targetDepth = texelFetch(destDepth, fullPixelIndex, 0).r;
+
+#   if HAS_NORMALS
+        Vector3 targetNormal = normalize(texelFetch(destNormal.sampler, fullPixelIndex, 0).xyz * destNormal.readMultiplyFirst.xyz + destNormal.readAddSecond.xyz);
+#   endif
+
+    // Small pixel, fractional value. Integer values correspond to the
+    // upper-left of a pixel.
+    float2 P = g3d_TexCoord * sourceSize;
+
+    // Small pixel index corresponding to the tile containing this full pixel.
+    int2    smallPixelIndex = int2(P);
+
+    Color4 backgroundModulationAndDiffusionSum = Color4(0, 0, 0, 0);
+    float2 deltaSum = float2(0, 0);
+    float4 accumSum = float4(0, 0, 0, 0);
+    float  weightSum = 0.0;
+
+    // Gather from a small group of small pixels, using simple bilinear weights
+    for (int2 offset = int2(-FILTER_RADIUS, -FILTER_RADIUS); offset.y <= FILTER_RADIUS; ++offset.y) {
+        for (offset.x = -FILTER_RADIUS; offset.x <= FILTER_RADIUS; ++offset.x) {
+            int2 Q = smallPixelIndex + offset;            
+
+            // Using this branch is faster than multiplying the weight by this expression later
+            if ((min(Q.x, Q.y) >= 0) && (Q.x < sourceSize.x) && (Q.y < sourceSize.y)) {
+                float   depth = texelFetch(sourceDepth, Q, 0).r;
+
+                float   depthError = abs(depth - targetDepth);
+
+#               if HAS_NORMALS
+                {
+                    Vector3 normal = octDecode(texelFetch(sourceOctNormal, Q, 0).xy);
+                    
+                    // Allow more depth error when looking at glancing surfaces...but don't allow
+                    // this term to go *too* low and thus wipe out all depth discrimination. This term
+                    // Avoids striping on floors and walls seen at angles.
+                    depthError *= max(0.075, max(targetNormal.z, normal.z));
+                }
+#               endif
+
+                
+                // Tuned for human-scale scenes, in meters
+                float   depthWeight = (1.0 - saturate(depthError * 2500.0)) + 0.05;
+
+
+                // Pyramid weight with a width of 1 pixel from the center.  Could use
+                // radial cone weights or a smoothstep here if needed.
+
+                // Increasing gradient weight offset makes the upsample blocky but improves edge cutout.
+                // The sqrt() is a way of boosting weights without a constant offset.
+                // If depth variance is high, add an offset to the gradient weight because we want to be dominated by depth weight
+                float2  delta = abs((float2(Q) + 0.5) - P) * (1.0 / float(max(1, FILTER_RADIUS)));
+                float   gradientWeight =
+                    max(0.0, (1.0 - delta.x)) * max(0.0, (1.0 - delta.y)) + max(0.02, (1.0 - depthWeight) * 0.1);
+
+                //  sqrt(max(0.0, (1.0 - delta.x)) * max(0.0, (1.0 - delta.y))) + 0.02;
+                //  unitSmoothstep(max(0.0, (1.0 - delta.x))) * unitSmoothstep(max(0.0, (1.0 - delta.y))) + 0.02;
+                //  unitSmoothstep(max(0.0, (1.0 - delta.x)) * max(0.0, (1.0 - delta.y))) + 0.02;
+                float weight = depthWeight * gradientWeight + 0.0001;
+                weightSum += weight;
+
+                backgroundModulationAndDiffusionSum += texelFetch(backgroundModulationAndDiffusionTexture, Q, 0) * weight;
+                deltaSum += texelFetch(deltaTexture, Q, 0).xy * weight;
+                accumSum += texelFetch(accumTexture, Q, 0)    * weight;
+            }
+        }
+    }
+
+    float invWeightSum = 1.0 / weightSum;
+
+    backgroundModulationAndDiffusion = backgroundModulationAndDiffusionSum * invWeightSum;
+    backgroundModulationAndDiffusion.rgb = 1.0 - backgroundModulationAndDiffusion.rgb;
+    delta = deltaSum * invWeightSum;
+    accum = accumSum * invWeightSum;
+}

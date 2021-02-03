@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "HairStrandsAABBCommon.ush"
+
+#if SHADER_AABBUPDATE
+
+uint bClearBuffer;
+uint MacroGroupId;
+uint MacroGroupValid;
+
+// Group data packed as {uint3 AABBMin, uint3 AABBMax}
+Buffer<int> InGroupAABBBuffer0;
+Buffer<int> InGroupAABBBuffer1;
+Buffer<int> InGroupAABBBuffer2;
+Buffer<int> InGroupAABBBuffer3;
+Buffer<int> InGroupAABBBuffer4;
+Buffer<int> InGroupAABBBuffer5;
+Buffer<int> InGroupAABBBuffer6;
+Buffer<int> InGroupAABBBuffer7;
+RWBuffer<int> OutMacroGroupAABBBuffer;
+
+void UpdateValue(inout FHairAABB B, in uint Index, in Buffer<int> InBuffer)
+{
+	FHairAABB A = ReadHairAABB(Index, InBuffer);
+	B = UnionHairAABB(A, B);
+}
+
+[numthreads(1, 1, 1)]
+void Main(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x == 0)
+	{
+		FHairAABB Bound = InitHairAABB();
+		if (bClearBuffer == 0)
+		{
+			Bound = ReadHairAABB(MacroGroupId, OutMacroGroupAABBBuffer);
+		}
+
+		if (MacroGroupValid & 1)   { UpdateValue(Bound, 0, InGroupAABBBuffer0); }
+		if (MacroGroupValid & 2)   { UpdateValue(Bound, 0, InGroupAABBBuffer1); }
+		if (MacroGroupValid & 4)   { UpdateValue(Bound, 0, InGroupAABBBuffer2); }
+		if (MacroGroupValid & 8)   { UpdateValue(Bound, 0, InGroupAABBBuffer3); }
+		if (MacroGroupValid & 16)  { UpdateValue(Bound, 0, InGroupAABBBuffer4); }
+		if (MacroGroupValid & 32)  { UpdateValue(Bound, 0, InGroupAABBBuffer5); }
+		if (MacroGroupValid & 64)  { UpdateValue(Bound, 0, InGroupAABBBuffer6); }
+		if (MacroGroupValid & 128) { UpdateValue(Bound, 0, InGroupAABBBuffer7); }
+
+		WriteHairAABB(MacroGroupId, Bound, OutMacroGroupAABBBuffer);
+	}
+}
+
+#endif
+

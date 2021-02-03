@@ -1,0 +1,383 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define CHEAP_RECT	0
+
+#include "DeferredShadingCommon.ush"
+#include "MonteCarlo.ush"
+#include "ShadingModels.ush"
+#include "RectLight.ush"
+
+float3 ClampToRect( float3 L, FRect Rect )
+{
+	// Bias toward plane
+	//L -= Rect.Axis[2] * saturate( 0.001 + dot( Rect.Axis[2], L ) );
+	//L = normalize( L );
+
+	// Intersect ray with plane
+	float3 PointOnPlane = L * ( dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], L ) );
+	//float3 PointOnPlane = L * ( dot( Rect.Axis[2], Rect.Origin ) / -saturate( 0.001 - dot( Rect.Axis[2], L ) ) );
+
+	float2 PointInRect;
+	PointInRect.x = dot( Rect.Axis[0], PointOnPlane - Rect.Origin );
+	PointInRect.y = dot( Rect.Axis[1], PointOnPlane - Rect.Origin );
+
+	// Clamp point to rect
+	PointInRect = clamp( PointInRect, -Rect.Extent, Rect.Extent );
+
+	float3 ToRect = Rect.Origin;
+	ToRect += PointInRect.x * Rect.Axis[0];
+	ToRect += PointInRect.y * Rect.Axis[1];
+
+	return normalize( ToRect );
+}
+
+bool RayHitRect( float3 L, FRect Rect )
+{
+	// Intersect ray with plane
+	float t = dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], L );
+	float3 PointOnPlane = L * t;
+
+	bool InExtentX = abs( dot( Rect.Axis[0], PointOnPlane - Rect.Origin ) ) <= Rect.Extent.x;
+	bool InExtentY = abs( dot( Rect.Axis[1], PointOnPlane - Rect.Origin ) ) <= Rect.Extent.y;
+
+	return t >= 0 && InExtentX && InExtentY;
+}
+
+float IntegrateLight( FRect Rect, FRectTexture SourceTexture )
+{
+	// No visibile rect light due to barn door occlusion
+	if (Rect.Extent.x == 0 || Rect.Extent.y == 0) return 0;
+
+	float NoL;
+	float Falloff;
+
+#if 0	// Reference quality
+	float3 L = RectIrradianceRef( 0, Rect, Falloff, NoL );
+#elif !CHEAP_RECT	// Optimized Lambert
+	float3 L = RectIrradianceLambert( 0, Rect, Falloff, NoL );
+#elif 1	// Karis
+	float3 L = RectIrradianceApproxKaris( 0, Rect, Falloff, NoL );
+#elif 1	// Lagarde
+	float3 L = RectIrradianceApproxLagarde( 0, Rect, Falloff, NoL );
+#else	// Drobot
+	float3 L = RectIrradianceApproxDrobot( 0, Rect, Falloff, NoL );
+#endif
+
+	float3 FalloffColor = SampleSourceTexture( L, Rect, SourceTexture);
+	
+	return Falloff;
+}
+
+FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, FRect Rect, FShadowTerms Shadow, FRectTexture SourceTexture )
+{
+	float NoL;
+	float Falloff;
+	
+	// No-visible rect light due to barn door occlusion
+	if (Rect.Extent.x == 0 || Rect.Extent.y == 0) 
+        return (FDirectLighting)0;
+
+#if 0	// Reference quality
+	float3 L = RectIrradianceRef( N, Rect, Falloff, NoL );
+#elif !CHEAP_RECT	// Optimized Lambert
+	float3 L = RectIrradianceLambert( N, Rect, Falloff, NoL );
+#elif 1	// Karis
+	float3 L = RectIrradianceApproxKaris( N, Rect, Falloff, NoL );
+#elif 1	// Lagarde
+	float3 L = RectIrradianceApproxLagarde( N, Rect, Falloff, NoL );
+#else	// Drobot
+	float3 L = RectIrradianceApproxDrobot( N, Rect, Falloff, NoL );
+#endif
+
+	float3 FalloffColor = SampleSourceTexture( L, Rect, SourceTexture );
+
+#if CHEAP_RECT
+	float3 R = reflect( -V, N );
+
+#if 0
+	float NoV = saturate( dot( N, V ) );
+
+	L = lerp( L, R, saturate( -2*dot( Rect.Axis[2], R ) ) );
+	L = normalize( L );
+
+	UNROLL
+	for( int k = 0; k < 2; k++ )
+	{
+#if 1
+		float NoL = dot( N, L );
+		float NoV = dot( N, V );
+		float VoL = dot( V, L );
+		float NoHInvLenH = ( NoL + NoV ) / ( 2 + 2*VoL );
+		float3 Gradient = ( ( N - L*NoL ) - ( V - L*VoL ) * NoHInvLenH ) * (2*NoHInvLenH);
+#else
+		float RoL = dot( R, L );
+		float3 Gradient = 2 * RoL * ( R - L * RoL );
+#endif
+
+		Gradient -= Rect.Axis[2] * dot( Rect.Axis[2], Gradient );
+		Gradient = lerp( Gradient, 0, (1 - NoV) * saturate( 2*dot( Rect.Axis[2], L ) ) );
+
+		L = ClampToRect( L + Gradient * ( 2.0 / ( 2.0 + k ) ), Rect );
+	}
+#elif 1
+	float3 Ls = L;
+
+	float3 v[4];
+	v[0] = Rect.Origin - Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	v[1] = Rect.Origin + Rect.Axis[0] * Rect.Extent.x - Rect.Axis[1] * Rect.Extent.y;
+	v[2] = Rect.Origin + Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+	v[3] = Rect.Origin - Rect.Axis[0] * Rect.Extent.x + Rect.Axis[1] * Rect.Extent.y;
+
+	float3 e0 = v[0];
+	float3 e1 = v[1];
+
+	float3 MinEdgeN = 0;
+	float  MinEdgeCos = 1;
+
+	UNROLL
+	for( uint i = 0; i < 4; i++ )
+	{
+		float3 v0 = v[i];
+		float3 v1 = v[ (i+1) % 4 ];
+
+		float3 EdgeN = normalize( cross( v0, v1 ) );
+		float  EdgeCos = dot( R, EdgeN );
+
+		if( EdgeCos < MinEdgeCos )
+		{
+			MinEdgeN   = EdgeN;
+			MinEdgeCos = EdgeCos;
+
+			e0 = v0;
+			e1 = v1;
+		}
+	}
+
+	if( MinEdgeCos > 0 )
+	{
+		Ls = R;
+	}
+	else
+	{
+#if 0
+		Ls = SmallestAnglePointOnLineToRay( e0, e1, length( e0 - e1 ), R );
+#else
+		float3 Rp = R - MinEdgeCos * MinEdgeN;
+		if(		dot( cross( Rp, e0 ), R ) < 0 )	Ls = e0;
+		else if(dot( cross( e1, Rp ), R ) < 0 )	Ls = e1;
+		else									Ls = Rp;
+#endif
+		Ls = normalize( Ls );
+	}
+
+	float a = Pow2( GBuffer.Roughness );
+	//L = lerp( Ls, L, a );
+	L = normalize( Ls );
+#else
+	L = R;
+	if( !RayHitRect( R, Rect ) )
+	{
+		float3 MaxL = R;
+		float  MaxNoH = -1;
+
+		uint NumSteps = 128;
+		for( uint i = 0; i < NumSteps; i++ )
+		{
+			float Theta = (2*PI) * i / (float)NumSteps;
+			float2 p;
+			p.x = cos( Theta );
+			p.y = sin( Theta );
+
+			p.xy /= dot( 1, abs(p) );
+			float2 PointInRect = float2( p.x + p.y, p.x - p.y ) * Rect.Extent;
+
+			//0.5 * sqrt( 2 + (2*sqrt(2.0)) * 
+
+			float3 ToRect = Rect.Origin;
+			ToRect += PointInRect.x * Rect.Axis[0];
+			ToRect += PointInRect.y * Rect.Axis[1];
+
+			L = normalize( ToRect );
+			
+			float RoL = dot( R, L );
+
+			BxDFContext Context;
+			Context.Init( N, V, L );
+
+			if( Context.NoH > MaxNoH )
+			{
+				MaxNoH = Context.NoH;
+				MaxL = L;
+			}
+		}
+
+		L = MaxL;
+	}
+
+	for( int k = 0; k < 0; k++ )
+	{
+		float NoL = dot( N, L );
+		float NoV = dot( N, V );
+		float VoL = dot( V, L );
+		float NoHInvLenH = ( NoL + NoV ) / ( 2 + 2*VoL );
+		float3 Gradient = ( ( N - L*NoL ) - ( V - L*VoL ) * NoHInvLenH ) * (2*NoHInvLenH);
+
+		L = ClampToRect( L + Gradient * ( 2.0 / ( 2.0 + k ) ), Rect );
+	}
+#endif
+	
+	GBuffer.Roughness = max( GBuffer.Roughness, 0.02 );
+
+	FAreaLight AreaLight;
+	AreaLight.SphereSinAlpha = sqrt( Falloff * (1.0 / PI) );
+	AreaLight.SphereSinAlphaSoft = 0;
+	AreaLight.LineCosSubtended = 1;
+	AreaLight.FalloffColor = 1;
+	AreaLight.Rect = Rect;
+	AreaLight.Texture = SourceTexture;
+	AreaLight.bIsRect = false;
+#else
+	FAreaLight AreaLight;
+	AreaLight.SphereSinAlpha = 0;
+	AreaLight.SphereSinAlphaSoft = 0;
+	AreaLight.LineCosSubtended = 1;
+	AreaLight.FalloffColor = FalloffColor;
+	AreaLight.Rect = Rect;
+	AreaLight.Texture = SourceTexture;
+	AreaLight.bIsRect = true;
+#endif
+
+	return IntegrateBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow );
+}
+
+FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, FRect Rect, FShadowTerms Shadow, FRectTexture SourceTexture, uint2 SVPos )
+{
+	FDirectLighting Lighting = (FDirectLighting)0;
+
+	const float SurfaceArea = 4 * Rect.Extent.x * Rect.Extent.y;
+	const float SurfaceColor = 2.0 / SurfaceArea;
+
+	// Rect normal points away from point
+	if( dot( Rect.Axis[2], Rect.Origin ) < 0 )
+		return Lighting;
+	
+	// No-visible rect light due to barn door occlusion
+	if (Rect.Extent.x == 0 || Rect.Extent.y == 0) 
+		return Lighting;
+
+	FSphericalRect SphericalRect = BuildSphericalRect( Rect );
+	
+	const uint NumSets = 4;
+	const uint NumSamples[ NumSets ] =
+	{
+		0,	// Cosine hemisphere
+		16,	// GGX
+		0,	// Light area
+		16,	// Spherical rect
+	};
+
+	uint2 SobolBase = SobolPixel( SVPos );
+	uint2 SobolFrame = SobolIndex( SobolBase, View.StateFrameIndexMod8, 3 );
+
+	UNROLL
+	for( uint Set = 0; Set < NumSets; Set++ )
+	{
+		LOOP
+		for( uint i = 0; i < NumSamples[ Set ]; i++ )
+		{
+			uint2 Random = Rand3DPCG16( uint3( SVPos.xy, View.Random ^ Set ) ).xy;
+
+			float2 E = float2( SobolIndex( SobolFrame, i << 3 ) ) / 0x10000;
+			//float2 E = Hammersley( i, NumSamples[ Set ], Random );
+			//float2 E = CorrelatedMultiJitter2D( i, NumSamples[ Set ], Random.x );
+			
+			float3 L, H;
+			switch( Set )
+			{
+				case 0:
+				{
+					L = TangentToWorld( CosineSampleHemisphere( E ).xyz, N );
+					H = normalize( V + L );
+					break;
+				}
+				case 1:
+				{
+					H = TangentToWorld( ImportanceSampleGGX( E, Pow4(GBuffer.Roughness) ).xyz, N );
+					L = 2 * dot( V, H ) * H - V;
+					break;
+				}
+				case 2:
+				{
+					float3 ToArea = Rect.Origin;
+					ToArea += (E.x * 2 - 1) * Rect.Axis[0] * Rect.Extent.x;
+					ToArea += (E.y * 2 - 1) * Rect.Axis[1] * Rect.Extent.y;
+					L = normalize( ToArea );
+					H = normalize( V + L );
+					break;
+				}
+				case 3:
+				{
+					float3 ToArea = UniformSampleSphericalRect( E, SphericalRect );
+					L = normalize( ToArea );
+					H = normalize( V + L );
+					break;
+				}
+			}
+
+			float NoL = saturate( dot(N, L) );
+			float NoH = saturate( dot(N, H) );
+			float VoH = saturate( dot(V, H) );
+
+			if( NoL > 0 && VoH > 0 )
+			{
+				// Intersect ray with plane
+				float t = dot( Rect.Axis[2], Rect.Origin ) / dot( Rect.Axis[2], L );
+				float3 PointOnPlane = L * t;
+
+				float2 PointInRect;
+				PointInRect.x = dot( Rect.Axis[0], PointOnPlane - Rect.Origin );
+				PointInRect.y = dot( Rect.Axis[1], PointOnPlane - Rect.Origin );
+
+				float2 RectUV = PointInRect / Rect.Extent * float2( 0.5, -0.5 ) + 0.5;
+				float3 LightColor = SampleRectTexture(SourceTexture, RectUV, 0, true);
+
+				if( Set == 0 || Set == 1 )
+				{
+					bool InExtentX = abs( PointInRect.x ) <= Rect.Extent.x;
+					bool InExtentY = abs( PointInRect.y ) <= Rect.Extent.y;
+
+					BRANCH
+					if( t < 0 || !InExtentX || !InExtentY )
+					{
+						// Missed rect
+						continue;
+					}
+				}
+
+				float PDF[] =
+				{
+					NoL * (1 / PI),
+					D_GGX( Pow4(GBuffer.Roughness), NoH ) * NoH / (4 * VoH),
+					dot( PointOnPlane, PointOnPlane ) / ( SurfaceArea * abs( dot( L, Rect.Axis[2] ) ) ),
+					1.0 / SphericalRect.SolidAngle,
+				};
+
+				// MIS power heuristic
+				float InvWeight = 0;
+				UNROLL for( uint j = 0; j < NumSets; j++ )
+				{
+					InvWeight += Square( PDF[j] * NumSamples[j] );
+				}
+				float Weight = rcp( InvWeight ) * PDF[Set] * NumSamples[Set];
+
+				FDirectLighting LightingSample = EvaluateBxDF( GBuffer, N, V, L, NoL, Shadow );
+
+				Lighting.Diffuse		+= ( LightColor * Weight ) * LightingSample.Diffuse;
+				Lighting.Specular		+= ( LightColor * Weight ) * LightingSample.Specular;
+				Lighting.Transmission	+= ( LightColor * Weight ) * LightingSample.Transmission;
+			}
+		}
+	}
+
+	return Lighting;
+}

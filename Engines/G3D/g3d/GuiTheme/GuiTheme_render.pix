@@ -1,0 +1,20 @@
+#version 330
+/**
+  \file data-files/shader/GuiTheme/GuiTheme_render.pix
+
+  Apply a color and texture.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+in vec2           texCoord;
+uniform sampler2D textureMap;
+
+out vec4 result;
+
+void main(void) {
+    result = texture(textureMap, texCoord);
+}

@@ -1,0 +1,30 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+uint MaxSampleCount;
+Buffer<uint> SampleIndicesBuffer;
+Buffer<float> InterpolationWeightsBuffer;
+
+Buffer<float4> SampleRestPositionsBuffer;
+Buffer<float4> SampleDeformedPositionsBuffer;
+
+RWBuffer<float4> OutSampleDeformationsBuffer; 
+
+[numthreads(128, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{ 
+	const uint SampleIndex = DispatchThreadId.x;
+	if (SampleIndex >= (MaxSampleCount+4)) 
+		return;
+	
+	uint WeightsOffset = SampleIndex * (MaxSampleCount+4);
+	float3 SampleDeformation = float3(0,0,0);
+	for(uint i = 0; i < MaxSampleCount; ++i, ++WeightsOffset)
+	{
+		SampleDeformation += InterpolationWeightsBuffer[WeightsOffset] * 
+				(SampleDeformedPositionsBuffer[i]-SampleRestPositionsBuffer[i]);
+	}
+
+	OutSampleDeformationsBuffer[SampleIndex] = float4(SampleDeformation,1);
+}

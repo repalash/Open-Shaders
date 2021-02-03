@@ -1,0 +1,149 @@
+#version 330 or 420 compatibility
+/**
+  \file data-files/shader/Film/Film_composite.pix
+
+  This is the final compositing pass
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl> 
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include "Film_toneMap.glsl"
+#expect BLOOM "1 or 0"
+
+uniform_Texture(sampler2D, sourceTexture_);
+
+#if (BLOOM != 0)
+    uniform sampler2D bloomTexture;
+    uniform float     bloomStrengthScaled;
+#endif
+
+uniform int         ySign, yOffset;
+uniform float       sensitivity;
+
+/* 1.0 / monitorGamma.  Usually about invGamma = 0.45*/
+uniform float       invGamma;
+
+uniform float       vignetteTopStrength;
+uniform float       vignetteBottomStrength;
+uniform float       vignetteSize;
+uniform float       toneCurveStrength;
+
+uniform int2        guardBandSize;
+
+uniform sampler2D   toneCurve;
+
+uniform bool        invertX;
+uniform bool        invertY;
+
+in vec2             g3d_TexCoord;
+
+out vec4            result;
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to process. used for VR. <= 0 to disable"
+
+// From https://www.shadertoy.com/view/4sf3D2
+float hash(vec2 p) {return fract(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3) * 1e3); }
+
+void main(void) {
+    vec2 texCoord = g3d_TexCoord;
+    vec2 fragCoord = gl_FragCoord.xy;
+
+    if (invertX) {
+        texCoord.x = 1.0 - texCoord.x;
+        fragCoord.x = g3d_FragCoordMax.x - fragCoord.x;
+    }
+    if (invertY) {
+        texCoord.y = 1.0 - texCoord.y;
+        fragCoord.y = g3d_FragCoordMax.y - fragCoord.y;
+    }
+
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(fragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(fragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            discard;
+        }
+#   endif
+
+    vec2 srcCoord = texCoord.xy * (sourceTexture_size.xy - 2 * guardBandSize) + guardBandSize;
+    // This just inverts twice; the rect2d bounds already handle flipping texture coords
+    // X.y = X.y * ySign + yOffset;
+
+    // TODO: if rescaling, allow bilinear here. Use texelFetch for performance when in the common
+    //       case of NOT rescaling
+    float3 src = texelFetch(sourceTexture_buffer, int2(srcCoord), 0).rgb;
+
+    src = toneMap(src, sensitivity, toneCurve);
+
+#   if (BLOOM == 1)
+        // The bloom texture has already been reduced by the guard band size
+        float2 bloomCoord = vec2(texCoord.x, (ySign < 0.0) ? (1.0 - texCoord.y) : texCoord.y);
+        vec2 step = vec2(1.0) / textureSize(bloomTexture, 0);
+        // At small radii, the low-resolution bloom texture creates aliasing, so make a final blur pass
+        float3 bloom = 
+           (textureLod(bloomTexture, bloomCoord + vec2(-step.x, -step.y), 0).rgb +
+            textureLod(bloomTexture, bloomCoord + vec2(    0.0, -step.y), 0).rgb * 1.5 +
+            textureLod(bloomTexture, bloomCoord + vec2(+step.x, -step.y), 0).rgb +
+
+            textureLod(bloomTexture, bloomCoord + vec2(-step.x, 0.0), 0).rgb * 1.5 +
+            textureLod(bloomTexture, bloomCoord + vec2(    0.0, 0.0), 0).rgb * 4 +
+            textureLod(bloomTexture, bloomCoord + vec2(+step.x, 0.0), 0).rgb * 1.5 +
+
+            textureLod(bloomTexture, bloomCoord + vec2(-step.x, +step.y), 0).rgb +
+            textureLod(bloomTexture, bloomCoord + vec2(    0.0, +step.y), 0).rgb * 1.5 +
+            textureLod(bloomTexture, bloomCoord + vec2(+step.x, +step.y), 0).rgb) * (1.0 / 14.0);
+            src += bloom * bloomStrengthScaled;
+#   endif
+        
+    vec2 q = texCoord.st;
+    float vignette = pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 3.0 * vignetteSize);
+
+    // Scale by parameters
+    vignette = lerp(1.0, vignette, mix(vignetteTopStrength, vignetteBottomStrength, texCoord.y));
+
+    // Add noise to break up the color banding
+    vignette = min(1.0, (hash(fragCoord.xy) * 0.05 + 1.0) * vignette);
+
+    src *= vignette;
+
+#   if BLOOM == 1
+        ///////////////////////////////////////////////////////////
+        // Fix out-of-gamut saturation
+        // Maximumum channel:
+        float m = max(max(src.r, src.g), src.b);
+
+        // Normalized color when the maximum channel exceeds 1.0
+        src *= 1.0 / max(1.0, m);
+
+        if (m > 1.0) {
+            // When very bright, aggressively roll back intensity
+            // to avoid the following desaturation pass for highlights
+            // and emissives.
+            m = pow(m, 0.2);
+        }
+        // Fade towards white when the max is bright (like a light saber core)
+        src = mix(src, vec3(1.0), min(0.9, pow3(2.0 * max(0.0, m - 0.85))));
+        ////////////////////////////////////////////////////////////
+#   endif
+
+    // Invert the gamma curve
+    float3 dst = pow(src, float3(invGamma));
+
+    result.rgb = dst;
+    
+    //result.rgb = vec3(int(gl_FragCoord.y) % 4);
+
+	// Output luminance in the alpha channel for FXAA
+	result.a =
+		// Real CIE luminance:
+		dot(float3(0.2126, 0.7152, 0.0722), dst);
+
+		// Average:
+		// dot(float3(1.0 / 3.0), dst);
+
+		// Incorrect luminance from FXAA documentation:
+	    // dot(dst, float3(0.299, 0.587, 0.114));
+}

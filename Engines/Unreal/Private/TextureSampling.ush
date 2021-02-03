@@ -1,0 +1,188 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	TextureSampling.usf: Hold helper to do custom texture sampling.
+=============================================================================*/
+
+#pragma once
+
+
+/** Returns the exact UV coordinate of the center of the closest pixel. */
+float2 SnapToClosestPixelCenterUVEx(float2 SampleUV, float2 TextureSize, float2 TextureInvSize, float MipLevelPow2, float InvMipLevelPow2)
+{
+	return (TextureInvSize * InvMipLevelPow2) * (floor((TextureSize * MipLevelPow2) * SampleUV) + 0.5);
+}
+
+float2 SnapToClosestPixelCenterUV(float2 SampleUV, float2 TextureSize, float2 TextureInvSize, const uint MipLevel = 0)
+{
+	return SnapToClosestPixelCenterUVEx(SampleUV, TextureSize, TextureInvSize, 1 << MipLevel, rcp(float(1 << MipLevel)));
+}
+
+
+/** Pixel offsets to use for manual bilinear filtering. */
+static const uint2 BilinearSamplingOffsets2x2[4] =
+{
+	int2(0,  0),
+	int2(1,  0),
+	int2(0,  1),
+	int2(1,  1),
+};
+
+
+/** Holds all information to do bilinear sample manually. */
+struct FBilinearSampleInfos
+{
+	// The texture's inverse size.
+	float2 TextureInvSize;
+
+	// Pixel coordinate of the top left sample.
+	float2 TopLeftPixelCoord;
+
+	// Bilinear interpolation to perform on X and Y axis.
+	float2 BilinearInterp;
+};
+
+
+/** Generate all information necessary for doing bilinear texture sampling manually. */
+FBilinearSampleInfos GetBilinearSampleLevelInfosEx(float2 SampleUV, float2 TextureSize, float2 TextureInvSize, float MipLevelPow2, float InvMipLevelPow2)
+{
+	FBilinearSampleInfos Infos;
+
+	float2 HistoryBufferPixelCoord = SampleUV * TextureSize * InvMipLevelPow2;
+
+	Infos.TextureInvSize = TextureInvSize * MipLevelPow2;
+	Infos.TopLeftPixelCoord = floor(HistoryBufferPixelCoord - 0.5);
+	Infos.BilinearInterp = frac(HistoryBufferPixelCoord - 0.5);
+	return Infos;
+}
+
+FBilinearSampleInfos GetBilinearSampleLevelInfos(float2 SampleUV, float2 TextureSize, float2 TextureInvSize, const uint MipLevel = 0)
+{
+	return GetBilinearSampleLevelInfosEx(SampleUV, TextureSize, TextureInvSize, 1 << MipLevel, rcp(float(1 << MipLevel)));
+}
+
+/** Return the weight of a sample <SampleId>. */
+float GetSampleWeight(FBilinearSampleInfos SampleInfos, const uint SampleId)
+{
+	float BilinearSampleWeights[4] = {
+		(1 - SampleInfos.BilinearInterp.x) * (1 - SampleInfos.BilinearInterp.y),
+		(SampleInfos.BilinearInterp.x) * (1 - SampleInfos.BilinearInterp.y),
+		(1 - SampleInfos.BilinearInterp.x) * (SampleInfos.BilinearInterp.y),
+		(SampleInfos.BilinearInterp.x) * (SampleInfos.BilinearInterp.y),
+	};
+	return BilinearSampleWeights[SampleId];
+}
+
+/** Return the uv of the sample <SampleId>. */
+float2 GetSampleUV(FBilinearSampleInfos SampleInfos, const uint SampleId)
+{
+	return (SampleInfos.TopLeftPixelCoord + (BilinearSamplingOffsets2x2[SampleId] + 0.5)) * SampleInfos.TextureInvSize;
+}
+
+/** Return the pixel coordinate of sample <SampleId>. */
+uint2 GetSamplePixelCoord(FBilinearSampleInfos SampleInfos, const uint SampleId)
+{
+	return uint2(SampleInfos.TopLeftPixelCoord) + BilinearSamplingOffsets2x2[SampleId];
+}
+
+
+void Bicubic2DCatmullRom(in float2 UV, in float2 Size, in float2 InvSize, out float2 Sample[3], out float2 Weight[3])
+{
+	UV *= Size;
+
+	float2 tc = floor(UV - 0.5) + 0.5;
+	float2 f = UV - tc;
+	float2 f2 = f * f;
+	float2 f3 = f2 * f;
+
+	float2 w0 = f2 - 0.5 * (f3 + f);
+	float2 w1 = 1.5 * f3 - 2.5 * f2 + 1;
+	float2 w3 = 0.5 * (f3 - f2);
+	float2 w2 = 1 - w0 - w1 - w3;
+
+	Weight[0] = w0;
+	Weight[1] = w1 + w2;
+	Weight[2] = w3;
+
+	Sample[0] = tc - 1;
+	Sample[1] = tc + w2 / Weight[1];
+	Sample[2] = tc + 2;
+
+	Sample[0] *= InvSize;
+	Sample[1] *= InvSize;
+	Sample[2] *= InvSize;
+}
+
+#define BICUBIC_CATMULL_ROM_SAMPLES 5
+
+struct FCatmullRomSamples
+{
+	// Constant number of samples (BICUBIC_CATMULL_ROM_SAMPLES)
+	uint Count;
+
+	// Constant sign of the UV direction from master UV sampling location.
+	int2 UVDir[BICUBIC_CATMULL_ROM_SAMPLES];
+
+	// Bilinear sampling UV coordinates of the samples
+	float2 UV[BICUBIC_CATMULL_ROM_SAMPLES];
+
+	// Weights of the samples
+	float Weight[BICUBIC_CATMULL_ROM_SAMPLES];
+
+	// Final multiplier (it is faster to multiply 3 RGB values than reweights the 5 weights)
+	float FinalMultiplier;
+};
+
+FCatmullRomSamples GetBicubic2DCatmullRomSamples(float2 UV, float2 Size, in float2 InvSize)
+{
+	FCatmullRomSamples Samples;
+	Samples.Count = BICUBIC_CATMULL_ROM_SAMPLES;
+
+	float2 Weight[3];
+	float2 Sample[3];
+	Bicubic2DCatmullRom(UV, Size, InvSize, Sample, Weight);
+
+	// Optimized by removing corner samples
+	Samples.UV[0] = float2(Sample[1].x, Sample[0].y);
+	Samples.UV[1] = float2(Sample[0].x, Sample[1].y);
+	Samples.UV[2] = float2(Sample[1].x, Sample[1].y);
+	Samples.UV[3] = float2(Sample[2].x, Sample[1].y);
+	Samples.UV[4] = float2(Sample[1].x, Sample[2].y);
+
+	Samples.Weight[0] = Weight[1].x * Weight[0].y;
+	Samples.Weight[1] = Weight[0].x * Weight[1].y;
+	Samples.Weight[2] = Weight[1].x * Weight[1].y;
+	Samples.Weight[3] = Weight[2].x * Weight[1].y;
+	Samples.Weight[4] = Weight[1].x * Weight[2].y;
+
+	Samples.UVDir[0] = int2(0, -1);
+	Samples.UVDir[1] = int2(-1, 0);
+	Samples.UVDir[2] = int2(0, 0);
+	Samples.UVDir[3] = int2(1, 0);
+	Samples.UVDir[4] = int2(0, 1);
+
+	// Reweight after removing the corners
+	float CornerWeights;
+	CornerWeights = Samples.Weight[0];
+	CornerWeights += Samples.Weight[1];
+	CornerWeights += Samples.Weight[2];
+	CornerWeights += Samples.Weight[3];
+	CornerWeights += Samples.Weight[4];
+	Samples.FinalMultiplier = 1 / CornerWeights;
+
+	return Samples;
+}
+
+MaterialFloat4 Texture2DSampleBicubic(Texture2D Tex, SamplerState Sampler, float2 UV, float2 Size, in float2 InvSize)
+{
+	FCatmullRomSamples Samples = GetBicubic2DCatmullRomSamples(UV, Size, InvSize);
+
+	float4 OutColor = 0;
+	for (uint i = 0; i < Samples.Count; i++)
+	{
+		OutColor += Tex.SampleLevel(Sampler, Samples.UV[i], 0) * Samples.Weight[i];
+	}
+	OutColor *= Samples.FinalMultiplier;
+
+	return OutColor;
+}

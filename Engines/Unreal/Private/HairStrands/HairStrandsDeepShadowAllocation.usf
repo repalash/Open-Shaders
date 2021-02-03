@@ -1,0 +1,155 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+//#include "HairStrandsVoxelPageCommonStruct.ush"
+
+#include "../Common.ush"
+#include "../Matrices.ush"
+#include "HairStrandsDeepShadowCommonStruct.ush"
+#include "HairStrandsAABBCommon.ush"
+
+#if SHADER_ALLOCATE
+
+#ifndef MAX_SLOT_COUNT
+#error MAX_SLOT_COUNT needs to be defined
+#endif
+
+////////////////////////////////////////////////////////////////////////////////
+
+float4x4 ComputeWorldToLight(
+	const FHairAABB Aabb,
+	const float3 LightDirection,
+	const float3 LightPosition,
+	const bool bIsDirectional)
+{
+	const float3 Extents = GetExtents(Aabb);
+	const float3 Center = GetCenter(Aabb);
+	const float  Radius = length(Extents);
+
+	if (bIsDirectional) // (LightType == LightType_Directional)
+	{
+		return LookAtMatrix(Center - LightDirection * Radius, Center, float3(0, 0, 1));
+	}
+	else // if (LightType == LightType_Spot || LightType == LightType_Point || LightType == LightType_Rect)
+	{
+		return LookAtMatrix(LightPosition, Center, float3(0, 0, 1));
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+float4				LightDirections[MAX_SLOT_COUNT];
+float4				LightPositions[MAX_SLOT_COUNT];
+uint4				MacroGroupIndices[MAX_SLOT_COUNT];
+
+// For testing parity with CPU version
+float3				CPU_MinAABB;
+uint				CPU_bUseCPUData;
+float3				CPU_MaxAABB;
+float				RasterizationScale;
+float				AABBScale;
+
+int2				SlotResolution;
+uint				SlotIndexCount;
+uint				MacroGroupCount;
+
+Buffer<int>								MacroGroupAABBBuffer;
+RWStructuredBuffer<FDeepShadowViewInfo>	OutShadowViewInfoBuffer;
+RWStructuredBuffer<FDeepShadowTransform>OutShadowWorldToLightTransformBuffer;
+
+
+float DegreesToRadians(float InDeg)
+{
+	return InDeg / 180.f * PI;
+}
+
+float ComputeMinStrandRadiusAtDepth1(const int2 Resolution, const float InFOVInRad, const float InRasterizationScale)
+{
+	const float DiameterToRadius = 0.5f;
+	const float vFOV = InFOVInRad;
+	const float StrandDiameterAtDepth1 = tan(vFOV * 0.5f) / (0.5f * Resolution.y);
+	return DiameterToRadius * InRasterizationScale * StrandDiameterAtDepth1;
+}
+
+// This function is similar to the CPU version in HairStrandsDeepShadow.cpp
+void ComputeWorldToLightClip(
+	inout float4x4	OutWorldToClipTransform,
+	inout float		OutMinStrandRadiusAtDepth1,
+	inout float3	OutLightDirection,
+	const FHairAABB World_AABB,
+	const uint		SlotIndex)
+{
+	const float3 LightDirection = LightDirections[SlotIndex].xyz;
+	const float3 LightPosition  = LightPositions[SlotIndex].xyz;
+	const bool bIsDirectional	= LightPositions[SlotIndex].w == 0;
+
+	float3 Center = GetCenter(World_AABB);
+	OutLightDirection = bIsDirectional ? LightDirection : -normalize(LightPosition - Center);
+
+	const float4x4 Coarse_WorldToLight = ComputeWorldToLight(World_AABB, LightDirection, LightPosition, bIsDirectional);
+
+	const FHairAABB Light_AABB = Transform(World_AABB, Coarse_WorldToLight);
+	const float3 Light_Extents = GetExtents(Light_AABB);
+
+	const float Radius = length(Light_Extents.xy) * AABBScale;
+	float MinZ = -Light_Extents.z * AABBScale;
+	float MaxZ = +Light_Extents.z * AABBScale;
+
+	// Update AABB center based on the tigher Z entents
+	Center = ((MaxZ * OutLightDirection) + (MinZ * OutLightDirection)) * 0.5f + Center;
+
+	const float StrandHairStableRasterizationScale = max(RasterizationScale, 1.0f);
+	OutMinStrandRadiusAtDepth1 = 1;
+	OutWorldToClipTransform = 0;
+
+	if (bIsDirectional) // (LightType == LightType_Directional)
+	{
+		const float4x4 WorldToLight	= LookAtMatrix(Center - LightDirection * abs(MinZ), Center, float3(0, 0, 1));
+		const float4x4 ProjMatrix	= ReversedZOrthoMatrix(Radius, Radius, 1.f / (MaxZ-MinZ), 0);
+		OutWorldToClipTransform		= mul(WorldToLight, ProjMatrix);
+
+		const float RadiusAtDepth1	= Radius / min(SlotResolution.x, SlotResolution.y);
+		OutMinStrandRadiusAtDepth1	= RadiusAtDepth1 * RasterizationScale;
+	}
+	else // if (LightType == LightType_Spot || LightType == LightType_Point || LightType == LightType_Rect)
+	{
+		MinZ = max(0.1f, length(LightPosition - Center)) + MinZ;
+		MaxZ = max(0.2f, length(LightPosition - Center)) + MaxZ;
+
+		const float SphereDistance	= length(LightPosition - Center);
+		const float HalfFov			= asin(Radius / SphereDistance);
+
+		const float4x4 WorldToLight = LookAtMatrix(LightPosition, Center, float3(0, 0, 1));
+		const float4x4 ProjMatrix	= ReversedZPerspectiveMatrix(HalfFov, 1, 1, MinZ, MaxZ);
+		OutWorldToClipTransform		= mul(WorldToLight, ProjMatrix);
+
+		OutMinStrandRadiusAtDepth1 = ComputeMinStrandRadiusAtDepth1(SlotResolution, 2 * HalfFov, RasterizationScale);
+	}
+}
+
+// This code assume we have less than 32 macro group (which fit into a single CU/SM)
+[numthreads(MAX_SLOT_COUNT, 1, 1)]
+void CreateViewInfo(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint SlotIndex = DispatchThreadId.x;
+
+	if (SlotIndex > SlotIndexCount)
+		return;
+
+	const uint MacroGroupId = MacroGroupIndices[SlotIndex].x;
+
+	FHairAABB Bound = InitHairAABB();
+	if (MacroGroupId < MacroGroupCount)
+	{
+		Bound = ReadHairAABB(MacroGroupId, MacroGroupAABBBuffer);
+	}
+
+	FDeepShadowViewInfo ViewInfo;
+	ComputeWorldToLightClip(ViewInfo.WorldToClip, ViewInfo.MinRadiusAtDepth1, ViewInfo.ViewForward, Bound, SlotIndex);
+
+	FDeepShadowTransform Transform;
+	Transform.WorldToClip = ViewInfo.WorldToClip;
+
+	OutShadowViewInfoBuffer[SlotIndex] = ViewInfo;
+	OutShadowWorldToLightTransformBuffer[SlotIndex] = Transform;
+}
+#endif

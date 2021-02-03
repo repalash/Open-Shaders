@@ -1,0 +1,392 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "HairStrandsMeshProjectionCommon.ush"
+
+#if SHADER_PROJECTION 
+
+uint bClear;
+uint MaxRootCount;
+float DistanceThreshold;
+
+uint MeshPrimitiveOffset_Iteration;
+uint MeshPrimitiveCount_Iteration;
+uint MeshSectionIndex;
+uint MeshMaxIndexCount;
+uint MeshMaxVertexCount;
+uint MeshIndexOffset;
+Buffer<uint> MeshIndexBuffer;
+Buffer<float> MeshPositionBuffer;
+
+Buffer<float4> RootPositionBuffer;
+Buffer<float4> RootNormalBuffer;
+
+RWBuffer<uint> OutRootTriangleIndex;
+RWBuffer<uint> OutRootTriangleBarycentrics;
+RWStructuredBuffer<float> OutRootTriangleDistance;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Curve projection onto A mesh
+// The projection is executed by running on curve's root per thread, which test all triangles
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// Closest point on A triangle from another point
+// Code from the book "Real-Time Collision Detection" by Christer Ericson
+struct FTrianglePoint
+{
+	float3 P;
+	float3 Barycentric;
+};
+
+FTrianglePoint ComputeClosestPoint(const FHairMeshTriangle Tri, const float3 P)
+{
+	const float3 A = Tri.P0;
+	const float3 B = Tri.P1;
+	const float3 C = Tri.P2;
+
+	// Check if P is in vertex region outside A.
+	float3 AB = B - A;
+	float3 AC = C - A;
+	float3 AP = P - A;
+	float D1 = dot(AB, AP);
+	float D2 = dot(AC, AP);
+	if (D1 <= 0.f && D2 <= 0.f)
+	{
+		FTrianglePoint Out;
+		Out.P = A;
+		Out.Barycentric = float3(1, 0, 0);
+		return Out;
+	}
+
+	// Check if P is in vertex region outside B.
+	float3 BP = P - B;
+	float D3 = dot(AB, BP);
+	float D4 = dot(AC, BP);
+	if (D3 >= 0.f && D4 <= D3)
+	{
+		FTrianglePoint Out;
+		Out.P = B;
+		Out.Barycentric = float3(0, 1, 0);
+		return Out;
+	}
+
+	// Check if P is in edge region of AB, and if so, return the projection of P onto AB.
+	float VC = D1 * D4 - D3 * D2;
+	if (VC <= 0.f && D1 >= 0.f && D3 <= 0.f)
+	{
+		float V = D1 / (D1 - D3);
+
+		FTrianglePoint Out;
+		Out.P = A + V * AB;
+		Out.Barycentric = float3(1 - V, V, 0);
+		return Out;
+	}
+
+	// Check if P is in vertex region outside C.
+	float3 CP = P - C;
+	float D5 = dot(AB, CP);
+	float D6 = dot(AC, CP);
+	if (D6 >= 0.f && D5 <= D6)
+	{
+		FTrianglePoint Out;
+		Out.P = C;
+		Out.Barycentric = float3(0, 0, 1);
+		return Out;
+	}
+
+	// Check if P is in edge region of AC, and if so, return the projection of P onto AC.
+	float VB = D5 * D2 - D1 * D6;
+	if (VB <= 0.f && D2 >= 0.f && D6 <= 0.f)
+	{
+		float W = D2 / (D2 - D6);
+		FTrianglePoint Out;
+		Out.P = A + W * AC;
+		Out.Barycentric = float3(1 - W, 0, W);
+		return Out;
+	}
+
+	// Check if P is in edge region of BC, and if so, return the projection of P onto BC.
+	float VA = D3 * D6 - D5 * D4;
+	if (VA <= 0.f && D4 - D3 >= 0.f && D5 - D6 >= 0.f)
+	{
+		float W = (D4 - D3) / (D4 - D3 + D5 - D6);
+		FTrianglePoint Out;
+		Out.P = B + W * (C - B);
+		Out.Barycentric = float3(0, 1 - W, W);
+		return Out;
+	}
+
+	// P must be inside the face region. Compute the closest point through its barycentric coordinates (u,V,W).
+	float Denom = 1.f / (VA + VB + VC);
+	float V = VB * Denom;
+	float W = VC * Denom;
+
+	FTrianglePoint Out;
+	Out.P = A + AB * V + AC * W;
+	Out.Barycentric = float3(1-V-W, V, W);
+	return Out;
+}
+
+[numthreads(128, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Shift root index with thread index to reduce/avoid collisions
+	const uint RootIndex = DispatchThreadId.x;
+
+	if (RootIndex >= MaxRootCount) return;
+
+	const float3 RootPosition = RootPositionBuffer[RootIndex].xyz;
+	const float3 RootNormal = RootNormalBuffer[RootIndex].xyz;
+
+	float MinDistance = bClear ? 999999999 : OutRootTriangleDistance[RootIndex];
+	int TriangleIndex = -1;
+	float3 TriangleBarycentric = float3(0,0,0);
+	for (uint PrimitiveIt = 0; PrimitiveIt < MeshPrimitiveCount_Iteration; ++PrimitiveIt)
+	{
+		const FHairMeshTriangle Tri = GetTriangleData(PrimitiveIt, MeshPositionBuffer, MeshIndexBuffer, MeshIndexOffset, MeshMaxIndexCount, MeshMaxVertexCount);
+		
+		const float3 B = 0.5f;
+		FTrianglePoint C = ComputeClosestPoint(Tri, RootPosition);
+		const float Distance = distance(C.P, RootPosition);
+		if (abs(Distance) < MinDistance)
+		{			
+			MinDistance = abs(Distance);
+			TriangleBarycentric = C.Barycentric;
+			TriangleIndex = MeshPrimitiveOffset_Iteration + PrimitiveIt;
+		}
+	}
+
+	if (TriangleIndex >= 0)
+	{
+		const uint EncodedIndex = EncodeTriangleIndex(TriangleIndex, MeshSectionIndex);
+		const uint EncodedBarycentric = EncodeBarycentrics(TriangleBarycentric.xy);
+		OutRootTriangleIndex[RootIndex] = EncodedIndex;
+		OutRootTriangleBarycentrics[RootIndex] = EncodedBarycentric;
+		OutRootTriangleDistance[RootIndex] = MinDistance;
+	}
+}
+
+#endif // SHADER_PROJECTION
+
+
+#if SHADER_MESHTRANSFER
+
+uint bNeedClear;
+
+uint Source_MeshPrimitiveCount_Iteration;
+uint Source_MeshMaxIndexCount;
+uint Source_MeshMaxVertexCount;
+uint Source_MeshIndexOffset;
+uint Source_MeshUVsChannelOffset;
+uint Source_MeshUVsChannelCount;
+
+Buffer<uint>   Source_MeshIndexBuffer;
+Buffer<float>  Source_MeshPositionBuffer;
+Buffer<float2> Source_MeshUVsBuffer;
+
+uint Target_MeshMaxVertexCount;
+uint Target_MeshUVsChannelOffset;
+uint Target_MeshUVsChannelCount;
+uint Target_SectionId;
+
+Buffer<uint>	Target_VertexSectionId;
+Buffer<float2>  Target_MeshUVsBuffer;
+RWBuffer<float> Target_MeshPositionBuffer;
+
+RWBuffer<uint>  OutDistanceBuffer;
+
+
+// Closest point on A triangle from another point
+// Code from the book "Real-Time Collision Detection" by Christer Ericson
+struct FTrianglePoint
+{
+	float3 P;
+	float3 Barycentric;
+};
+
+FTrianglePoint ComputeClosestPoint(const FHairMeshTriangleWithUVs Tri, const float2 UVs)
+{
+	const float3 A = float3(Tri.UV0, 0);
+	const float3 B = float3(Tri.UV1, 0);
+	const float3 C = float3(Tri.UV2, 0);
+	const float3 P = float3(UVs, 0);
+
+	// Check if P is in vertex region outside A.
+	float3 AB = B - A;
+	float3 AC = C - A;
+	float3 AP = P - A;
+	float D1 = dot(AB, AP);
+	float D2 = dot(AC, AP);
+	if (D1 <= 0.f && D2 <= 0.f)
+	{
+		FTrianglePoint Out;
+		Out.P = A;
+		Out.Barycentric = float3(1, 0, 0);
+		return Out;
+	}
+
+	// Check if P is in vertex region outside B.
+	float3 BP = P - B;
+	float D3 = dot(AB, BP);
+	float D4 = dot(AC, BP);
+	if (D3 >= 0.f && D4 <= D3)
+	{
+		FTrianglePoint Out;
+		Out.P = B;
+		Out.Barycentric = float3(0, 1, 0);
+		return Out;
+	}
+
+	// Check if P is in edge region of AB, and if so, return the projection of P onto AB.
+	float VC = D1 * D4 - D3 * D2;
+	if (VC <= 0.f && D1 >= 0.f && D3 <= 0.f)
+	{
+		float V = D1 / (D1 - D3);
+
+		FTrianglePoint Out;
+		Out.P = A + V * AB;
+		Out.Barycentric = float3(1 - V, V, 0);
+		return Out;
+	}
+
+	// Check if P is in vertex region outside C.
+	float3 CP = P - C;
+	float D5 = dot(AB, CP);
+	float D6 = dot(AC, CP);
+	if (D6 >= 0.f && D5 <= D6)
+	{
+		FTrianglePoint Out;
+		Out.P = C;
+		Out.Barycentric = float3(0, 0, 1);
+		return Out;
+	}
+
+	// Check if P is in edge region of AC, and if so, return the projection of P onto AC.
+	float VB = D5 * D2 - D1 * D6;
+	if (VB <= 0.f && D2 >= 0.f && D6 <= 0.f)
+	{
+		float W = D2 / (D2 - D6);
+		FTrianglePoint Out;
+		Out.P = A + W * AC;
+		Out.Barycentric = float3(1 - W, 0, W);
+		return Out;
+	}
+
+	// Check if P is in edge region of BC, and if so, return the projection of P onto BC.
+	float VA = D3 * D6 - D5 * D4;
+	if (VA <= 0.f && D4 - D3 >= 0.f && D5 - D6 >= 0.f)
+	{
+		float W = (D4 - D3) / (D4 - D3 + D5 - D6);
+		FTrianglePoint Out;
+		Out.P = B + W * (C - B);
+		Out.Barycentric = float3(0, 1 - W, W);
+		return Out;
+	}
+
+	// P must be inside the face region. Compute the closest point through its barycentric coordinates (u,V,W).
+	float Denom = 1.f / (VA + VB + VC);
+	float V = VB * Denom;
+	float W = VC * Denom;
+
+	FTrianglePoint Out;
+	Out.P = A + AB * V + AC * W;
+	Out.Barycentric = float3(1 - V - W, V, W);
+	return Out;
+}
+
+[numthreads(128, 1, 1)]
+void MainMeshTransferCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const float DistancePrecision = 100000;
+
+	const uint VertexIndex = DispatchThreadId.x;
+	if (VertexIndex >= Target_MeshMaxVertexCount) return;
+
+	if (bNeedClear)
+	{
+		Target_MeshPositionBuffer[VertexIndex * 3] = 0;
+		Target_MeshPositionBuffer[VertexIndex * 3 + 1] = 0;
+		Target_MeshPositionBuffer[VertexIndex * 3 + 2] = 0;
+
+		OutDistanceBuffer[VertexIndex] = ~0;
+	}
+
+	if (Target_VertexSectionId[VertexIndex] != Target_SectionId) return;
+
+	float ClosestDistance = OutDistanceBuffer[VertexIndex] / DistancePrecision;
+	float OriginalClosestDistance = ClosestDistance;
+
+	const uint UVIndex = Target_MeshUVsChannelOffset + Target_MeshUVsChannelCount * VertexIndex;
+	const float2 TargetUV = Target_MeshUVsBuffer[UVIndex];
+
+	float3 VertexPosition = 0;
+	for (uint PrimitiveIt = 0; PrimitiveIt < Source_MeshPrimitiveCount_Iteration; ++PrimitiveIt)
+	{
+		const FHairMeshTriangleWithUVs SourceTri = GetTriangleData(
+			PrimitiveIt,
+			Source_MeshPositionBuffer,
+			Source_MeshUVsBuffer,
+			Source_MeshIndexBuffer,
+			Source_MeshIndexOffset,
+			Source_MeshMaxIndexCount,
+			Source_MeshMaxVertexCount,
+			Source_MeshUVsChannelOffset,
+			Source_MeshUVsChannelCount);
+
+		// Project on triangle and find the closest distance
+		{
+			const FTrianglePoint ClosestPoint = ComputeClosestPoint(SourceTri, TargetUV);
+			const float DistanceToTriangle = distance(ClosestPoint.P.xy, TargetUV);
+			if (DistanceToTriangle < ClosestDistance)
+			{
+				VertexPosition = 
+					ClosestPoint.Barycentric.x * SourceTri.P0 + 
+					ClosestPoint.Barycentric.y * SourceTri.P1 + 
+					ClosestPoint.Barycentric.z * SourceTri.P2;
+				ClosestDistance = DistanceToTriangle;
+			}
+		}
+	}
+
+	if (ClosestDistance < OriginalClosestDistance)
+	{
+		Target_MeshPositionBuffer[VertexIndex * 3] = VertexPosition.x;
+		Target_MeshPositionBuffer[VertexIndex * 3 + 1] = VertexPosition.y;
+		Target_MeshPositionBuffer[VertexIndex * 3 + 2] = VertexPosition.z;
+		OutDistanceBuffer[VertexIndex] = uint(ClosestDistance * DistancePrecision);
+	}
+}
+
+#endif // SHADER_TRANSFER
+
+#if SHADER_SECTIONID
+
+uint MeshSectionId;
+uint MeshSectionPrimitiveCount;
+uint MeshMaxIndexCount;
+uint MeshMaxVertexCount;
+uint MeshIndexOffset;
+
+Buffer<uint>	MeshIndexBuffer;
+RWBuffer<uint>  OutVertexSectionId;
+
+[numthreads(128, 1, 1)]
+void MainMarkSectionIdCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= MeshSectionPrimitiveCount*3) return;
+
+	if (Index + MeshIndexOffset >= MeshMaxIndexCount) return;
+
+	const uint VertexIndex = MeshIndexBuffer[Index + MeshIndexOffset];
+	if (VertexIndex < MeshMaxVertexCount)
+	{
+		// Use atomic min as a vertex can belong to several sections. Since 
+		// currently one of the assumption is that the transfered section will 
+		// be section 0, this works fine.
+		InterlockedMin(OutVertexSectionId[VertexIndex], MeshSectionId);
+	}
+}
+
+#endif // SHADER_SECTIONID

@@ -1,0 +1,20 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingFixedPointArithmetic.ush: Utilities for fixed-point arithmetic. Necessary for encoding
+	floating point into integer buffers to take advantage of atomic instructions.
+===============================================================================================*/
+
+#pragma once
+
+uint FloatToFixedPoint(float Value, uint DecimalBits)
+{
+	uint ScaleFactor = 1 << DecimalBits;
+	return Value * ScaleFactor;
+}
+
+float FixedPointToFloat(uint Value, uint DecimalBits)
+{
+	float ScaleFactor = 1 << DecimalBits;
+	return Value / ScaleFactor;
+}

@@ -1,0 +1,26 @@
+#version 120 // -*- c++ -*-
+
+/** 
+\file ArticulateModel_blitShader.pix 
+\author Michael Mara, http://www.illuminationcodified.com/
+*/
+
+#include <compatibility.glsl>
+
+uniform sampler2D   blittedTexture;
+uniform int         xOffset;
+uniform int         yOffset;
+uniform int         texHeight;
+uniform int         texWidth;
+
+void main() {
+	ivec2 dest = ivec2(gl_FragCoord.xy);
+
+	ivec2 source = dest - ivec2(xOffset, yOffset);
+	if (source.x < 0 || source.x >= texWidth || source.y < 0 || source.y >= texHeight) {
+		discard;
+	}
+
+    gl_FragColor = texelFetch(blittedTexture, source, 0);
+}
+

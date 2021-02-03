@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathCompaction.usf: Reference path tracing
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "../PostProcessCommon.ush"
+#include "Utilities/PathTracingFixedPointArithmetic.ush"
+
+Texture2D<float4>	RadianceTexture;
+Texture2D<uint>		SampleCountTexture;
+Texture2D<uint>		PixelPositionTexture;
+
+RWTexture2D<uint>	RadianceSortedRedRT;
+RWTexture2D<uint>	RadianceSortedGreenRT;
+RWTexture2D<uint>	RadianceSortedBlueRT;
+RWTexture2D<uint>	RadianceSortedAlphaRT;
+RWTexture2D<uint>	SampleCountSortedRT;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void PathCompactionCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	if (DispatchThreadId.x > View.ViewSizeAndInvSize.x || DispatchThreadId.y > View.ViewSizeAndInvSize.y)
+		return;
+
+	uint3 GridCoordinate = DispatchThreadId;
+#if 0
+	// TODO: Texture dimensions are inaccurate. Use the view dimensions instead.
+	uint2 Dimensions;
+	PixelPositionTexture.GetDimensions(Dimensions.x, Dimensions.y);
+	uint LinearIndex = PixelPositionTexture.Load(GridCoordinate);
+	uint2 Pixel = uint2(LinearIndex % Dimensions.x, LinearIndex / Dimensions.x);
+#elif 1
+	uint LinearIndex = PixelPositionTexture.Load(GridCoordinate);
+	uint2 BufferSize = View.BufferSizeAndInvSize.xy;
+	uint2 Pixel = uint2(LinearIndex % BufferSize.x, LinearIndex / BufferSize.x);
+#else
+	uint LinearIndex = PixelPositionTexture.Load(GridCoordinate);
+	uint2 ViewSize = View.ViewSizeAndInvSize.xy;
+	uint2 Pixel = uint2(LinearIndex % ViewSize.x, LinearIndex / ViewSize.x);
+#endif
+
+	// Pack in uint render targets to utilize atomic instructions.
+	float4 Radiance = RadianceTexture.Load(GridCoordinate);
+	InterlockedAdd(RadianceSortedRedRT[Pixel], FloatToFixedPoint(Radiance.r, 24));
+	InterlockedAdd(RadianceSortedGreenRT[Pixel], FloatToFixedPoint(Radiance.g, 24));
+	InterlockedAdd(RadianceSortedBlueRT[Pixel], FloatToFixedPoint(Radiance.b, 24));
+	InterlockedAdd(RadianceSortedAlphaRT[Pixel], FloatToFixedPoint(Radiance.a, 24));
+
+	InterlockedAdd(SampleCountSortedRT[Pixel], SampleCountTexture.Load(GridCoordinate));
+}

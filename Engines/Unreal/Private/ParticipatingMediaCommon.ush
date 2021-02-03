@@ -1,0 +1,38 @@
+/*=============================================================================
+	ParticipatingMediaCommon.ush
+=============================================================================*/
+
+#include "Common.ush"
+
+
+
+float IsotropicPhase()
+{
+	return 1.0f / (4.0f * PI);
+}
+
+float HenyeyGreensteinPhase(float g, float CosTheta)
+{
+	g = -g;
+	return (1.0f - g * g) / (4.0f * PI * pow(1.0f + g * g - 2.0f * g * CosTheta, 1.5f));
+}
+
+float RaleighPhase(float CosTheta)
+{
+	return 3.0f * (1.0f + CosTheta * CosTheta) / (16.0f * PI);
+}
+
+// Schlick phase function approximating henyey-greenstein
+float SchlickPhaseFromK(float k, float CosTheta)
+{
+	const float SchlickPhaseFactor = 1.0f + k * CosTheta;
+	const float PhaseValue = (1.0f - k * k) / (4.0f * PI * SchlickPhaseFactor * SchlickPhaseFactor);
+	return PhaseValue;
+}
+float SchlickPhase(float g, float CosTheta)
+{
+	const float k = 1.55f * g - 0.55f * g * g * g;
+	return SchlickPhaseFromK(k, CosTheta);
+}
+
+

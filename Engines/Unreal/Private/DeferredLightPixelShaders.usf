@@ -1,0 +1,324 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DeferredLightPixelShaders.usf: 
+=============================================================================*/
+
+#define SUPPORT_CONTACT_SHADOWS 1
+
+#include "Common.ush"
+
+#include "DeferredShadingCommon.ush"
+#include "DeferredLightingCommon.ush"
+
+#if USE_HAIR_LIGHTING == 1
+#include "HairStrands/HairStrandsVisibilityCommon.ush"
+#endif
+#include "HairStrands/HairStrandsCommon.ush"
+#include "HairStrands/HairStrandsDeepTransmittanceCommon.ush"
+#include "HairStrands/HairStrandsDeepTransmittanceDualScattering.ush" 
+
+#if USE_ATMOSPHERE_TRANSMITTANCE
+#include "/Engine/Private/SkyAtmosphereCommon.ush"
+#endif
+
+#if USE_CLOUD_TRANSMITTANCE
+#include "VolumetricCloudCommon.ush"
+Texture2D<float3> CloudShadowmapTexture;
+SamplerState CloudShadowmapSampler;
+float CloudShadowmapFarDepthKm;
+float4x4 CloudShadowmapWorldToLightClipMatrix;
+float CloudShadowmapStrength;
+#endif
+
+struct FInputParams
+{
+	float2 PixelPos;
+	float4 ScreenPosition;
+	float2 ScreenUV;
+	float3 ScreenVector;
+};
+
+struct FDerivedParams
+{
+	float3 CameraVector;
+	float3 WorldPosition;
+};
+
+FDerivedParams GetDerivedParams(in FInputParams Input, in float SceneDepth)
+{
+	FDerivedParams Out;
+#if LIGHT_SOURCE_SHAPE > 0
+	// With a perspective projection, the clip space position is NDC * Clip.w
+	// With an orthographic projection, clip space is the same as NDC
+	float2 ClipPosition = Input.ScreenPosition.xy / Input.ScreenPosition.w * (View.ViewToClip[3][3] < 1.0f ? SceneDepth : 1.0f);
+	Out.WorldPosition = mul(float4(ClipPosition, SceneDepth, 1), View.ScreenToWorld).xyz;
+	Out.CameraVector = normalize(Out.WorldPosition - View.WorldCameraOrigin);
+#else
+	Out.WorldPosition = Input.ScreenVector * SceneDepth + View.WorldCameraOrigin;
+	Out.CameraVector = normalize(Input.ScreenVector);
+#endif
+	return Out;
+}
+
+FDeferredLightData SetupLightDataForStandardDeferred()
+{
+	// Build the light data struct using the DeferredLightUniforms and light defines
+	// We are heavily relying on the shader compiler to optimize out constant subexpressions in GetDynamicLighting()
+	FDeferredLightData LightData;
+	LightData.Position = DeferredLightUniforms.Position;
+	LightData.InvRadius = DeferredLightUniforms.InvRadius;
+	LightData.Color = DeferredLightUniforms.Color;
+	LightData.FalloffExponent = DeferredLightUniforms.FalloffExponent;
+	LightData.Direction = DeferredLightUniforms.Direction;
+	LightData.Tangent = DeferredLightUniforms.Tangent;
+	LightData.SpotAngles = DeferredLightUniforms.SpotAngles;
+	LightData.SourceRadius = DeferredLightUniforms.SourceRadius;
+	LightData.SourceLength = DeferredLightUniforms.SourceLength;
+    LightData.SoftSourceRadius = DeferredLightUniforms.SoftSourceRadius;
+	LightData.SpecularScale = DeferredLightUniforms.SpecularScale;
+	LightData.ContactShadowLength = abs(DeferredLightUniforms.ContactShadowLength);
+	LightData.ContactShadowLengthInWS = DeferredLightUniforms.ContactShadowLength < 0.0f;
+	LightData.ContactShadowNonShadowCastingIntensity = DeferredLightUniforms.ContactShadowNonShadowCastingIntensity;
+	LightData.DistanceFadeMAD = DeferredLightUniforms.DistanceFadeMAD;
+	LightData.ShadowMapChannelMask = DeferredLightUniforms.ShadowMapChannelMask;
+	LightData.ShadowedBits = DeferredLightUniforms.ShadowedBits;
+
+	LightData.bInverseSquared = INVERSE_SQUARED_FALLOFF;
+	LightData.bRadialLight = LIGHT_SOURCE_SHAPE > 0;
+	//@todo - permutation opportunity
+	LightData.bSpotLight = LIGHT_SOURCE_SHAPE > 0;
+	LightData.bRectLight = LIGHT_SOURCE_SHAPE == 2;
+	
+	LightData.RectLightBarnCosAngle = DeferredLightUniforms.RectLightBarnCosAngle;
+	LightData.RectLightBarnLength = DeferredLightUniforms.RectLightBarnLength;
+
+	LightData.HairTransmittance = InitHairTransmittanceData();
+	return LightData;
+}
+
+Texture2D<uint> LightingChannelsTexture;
+
+uint GetLightingChannelMask(float2 UV)
+{
+	uint2 IntegerUV = UV * View.BufferSizeAndInvSize.xy;
+	return LightingChannelsTexture.Load(uint3(IntegerUV, 0)).x;
+}
+
+float GetExposure()
+{
+#if USE_PREEXPOSURE
+	return View.PreExposure;
+#else
+	return 1;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if USE_ATMOSPHERE_TRANSMITTANCE
+
+float3 GetAtmosphericLightTransmittance(in float3 StableLargeWorldPosition, in float2 ScreenUV, in float3 LightDirection)
+{
+	// The following is the only way to retrieve a world space position that is always stable under camera movement + long view distance. (DerivedParams.WorldPosition is not stable)
+	const float3 PlanetCenterToWorldPos = (StableLargeWorldPosition - View.SkyPlanetCenterAndViewHeight.xyz) * CM_TO_SKY_UNIT;
+
+	const float3 AtmosphereTransmittance = GetAtmosphereTransmittance(
+		PlanetCenterToWorldPos, LightDirection, View.SkyAtmosphereBottomRadiusKm, View.SkyAtmosphereTopRadiusKm,
+		View.TransmittanceLutTexture, View.TransmittanceLutTextureSampler);
+
+	return AtmosphereTransmittance;
+}
+
+#endif // USE_ATMOSPHERE_TRANSMITTANCE
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if USE_HAIR_LIGHTING == 0
+
+void DeferredLightPixelMain(
+#if LIGHT_SOURCE_SHAPE > 0
+	float4 InScreenPosition : TEXCOORD0,
+#else
+	float2 ScreenUV			: TEXCOORD0,
+	float3 ScreenVector		: TEXCOORD1,
+#endif
+	float4 SVPos			: SV_POSITION,
+	out float4 OutColor		: SV_Target0
+	)
+{
+	const float2 PixelPos = SVPos.xy;
+	OutColor = 0;
+
+	// Convert input data (directional/local light)
+	FInputParams InputParams = (FInputParams)0;
+	InputParams.PixelPos		= SVPos.xy;
+#if LIGHT_SOURCE_SHAPE > 0
+	InputParams.ScreenPosition	= InScreenPosition;
+	InputParams.ScreenUV		= InScreenPosition.xy / InScreenPosition.w * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+	InputParams.ScreenVector	= 0;
+#else
+	InputParams.ScreenPosition	= 0;
+	InputParams.ScreenUV		= ScreenUV;
+	InputParams.ScreenVector	= ScreenVector;
+#endif
+
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(InputParams.ScreenUV);
+
+	// Only light pixels marked as using deferred shading
+	BRANCH if( ScreenSpaceData.GBuffer.ShadingModelID > 0 
+#if USE_LIGHTING_CHANNELS
+		&& (GetLightingChannelMask(InputParams.ScreenUV) & DeferredLightUniforms.LightingChannelMask)
+#endif
+		)
+	{
+		const float SceneDepth = CalcSceneDepth(InputParams.ScreenUV);
+		const FDerivedParams DerivedParams = GetDerivedParams(InputParams, SceneDepth);
+
+		FDeferredLightData LightData = SetupLightDataForStandardDeferred();
+		if (ScreenSpaceData.GBuffer.ShadingModelID == SHADINGMODELID_HAIR && ShouldUseHairComplexTransmittance(ScreenSpaceData.GBuffer))
+		{
+			LightData.HairTransmittance = EvaluateDualScattering(ScreenSpaceData.GBuffer, DerivedParams.CameraVector, -DeferredLightUniforms.Direction);
+		}
+
+		float Dither = InterleavedGradientNoise(InputParams.PixelPos, View.StateFrameIndexMod8 );
+
+		FRectTexture RectTexture = InitRectTexture(DeferredLightUniforms.SourceTexture);
+		float SurfaceShadow = 1.0f;
+		const float4 Radiance = GetDynamicLighting(DerivedParams.WorldPosition, DerivedParams.CameraVector, ScreenSpaceData.GBuffer, ScreenSpaceData.AmbientOcclusion, ScreenSpaceData.GBuffer.ShadingModelID, LightData, GetPerPixelLightAttenuation(InputParams.ScreenUV), Dither, uint2(InputParams.PixelPos), RectTexture, SurfaceShadow);
+		const float  Attenuation = ComputeLightProfileMultiplier(DerivedParams.WorldPosition, DeferredLightUniforms.Position, -DeferredLightUniforms.Direction, DeferredLightUniforms.Tangent);
+
+		OutColor += (Radiance * Attenuation);
+
+
+	#if USE_ATMOSPHERE_TRANSMITTANCE || USE_CLOUD_TRANSMITTANCE
+		float DeviceZ = LookupDeviceZ(ScreenUV);
+		float3 StableLargeWorldPosition = SvPositionToWorld(float4(SVPos.xy, DeviceZ, 1.0));
+	#endif
+
+	#if USE_ATMOSPHERE_TRANSMITTANCE
+		OutColor.rgb *= GetAtmosphericLightTransmittance(StableLargeWorldPosition, InputParams.ScreenUV, DeferredLightUniforms.Direction.xyz);
+	#endif
+
+	#if USE_CLOUD_TRANSMITTANCE
+		float OutOpticalDepth = 0.0f;
+		OutColor.rgb *= lerp(1.0f, GetCloudVolumetricShadow(StableLargeWorldPosition, CloudShadowmapWorldToLightClipMatrix, CloudShadowmapFarDepthKm, CloudShadowmapTexture, CloudShadowmapSampler, OutOpticalDepth), CloudShadowmapStrength);
+	#endif
+	}
+
+	// RGB:SceneColor Specular and Diffuse
+	// A:Non Specular SceneColor Luminance
+	// So we need PreExposure for both color and alpha
+	OutColor.rgba *= GetExposure();
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if USE_HAIR_LIGHTING == 1
+
+Texture2D<uint> HairVisibilityNodeOffsetAndCount;
+StructuredBuffer<FPackedHairSample> HairVisibilityNodeData;
+StructuredBuffer<uint>	HairVisibilityNodeCoords;
+
+Texture2D<float4> ScreenShadowMaskSubPixelTexture;
+
+uint HairTransmittanceBufferMaxCount;
+StructuredBuffer<FPackedHairTransmittanceMask> HairTransmittanceBuffer;
+uint HairShadowMaskValid;
+uint HairComponents; // R, TT, TRT, LocalScattering, GlobalScattering, MultipleScattering
+float HairDualScatteringRoughnessOverride;
+
+void DeferredLightPixelMain(
+	float4 SVPos : SV_POSITION,
+	nointerpolation uint NodeCount  : DISPATCH_NODECOUNT,
+	nointerpolation uint2 Resolution : DISPATCH_RESOLUTION,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = 0;
+
+	const uint2 InCoord = uint2(SVPos.xy);
+	const uint SampleIndex = InCoord.x + InCoord.y * Resolution.x;
+	if (SampleIndex >= NodeCount)
+	{
+		return;
+	}
+
+	const uint PackedCoord = HairVisibilityNodeCoords[SampleIndex];
+	const uint2 PixelCoord = uint2((PackedCoord & 0xFFFF), ((PackedCoord >> 16) & 0xFFFF));
+	const float2 UV = (PixelCoord + float2(0.5f, 0.5f)) / float2(View.BufferSizeAndInvSize.xy);
+	const float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	
+	const FPackedHairSample PackedSample = HairVisibilityNodeData[SampleIndex];
+	const FHairSample Sample = UnpackHairSample(PackedSample);
+
+	#if USE_LIGHTING_CHANNELS
+	if (!(Sample.LightChannelMask & DeferredLightUniforms.LightingChannelMask))
+	{
+		return;
+	}
+	#endif
+
+	// Inject material data from the visibility/mini-gbuffer for hair
+	const float SceneDepth = ConvertFromDeviceZ(Sample.Depth);
+	FScreenSpaceData HairScreenSpaceData = (FScreenSpaceData)0;
+	HairScreenSpaceData.AmbientOcclusion = 1;
+	HairScreenSpaceData.GBuffer.WorldNormal = Sample.Tangent;
+	HairScreenSpaceData.GBuffer.BaseColor = Sample.BaseColor;
+	HairScreenSpaceData.GBuffer.Roughness = Sample.Roughness;
+	HairScreenSpaceData.GBuffer.ShadingModelID = SHADINGMODELID_HAIR;
+	HairScreenSpaceData.GBuffer.DiffuseColor = 0;
+	HairScreenSpaceData.GBuffer.SpecularColor = 0;
+	HairScreenSpaceData.GBuffer.Specular = Sample.Specular;
+	HairScreenSpaceData.GBuffer.Metallic = 0;
+	HairScreenSpaceData.GBuffer.Depth = SceneDepth;
+	HairScreenSpaceData.GBuffer.GBufferAO = 1;
+	HairScreenSpaceData.GBuffer.CustomData = float4(HairDualScatteringRoughnessOverride, 0, Sample.Backlit, 0);
+	HairScreenSpaceData.GBuffer.IndirectIrradiance = 0;
+	HairScreenSpaceData.GBuffer.PrecomputedShadowFactors = 1;
+	HairScreenSpaceData.GBuffer.PerObjectGBufferData = 0;
+
+	const float3 WorldPosition = mul(float4(ScreenPosition * HairScreenSpaceData.GBuffer.Depth, HairScreenSpaceData.GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+	const float3 CameraVector = normalize(WorldPosition - View.WorldCameraOrigin);
+
+	FDeferredLightData LightData = SetupLightDataForStandardDeferred();
+
+	// todo add light culling/early out
+
+	// Compute Hair transmittance
+	{
+		float3 L = float3(0, 0, 1);
+		if (LightData.bRadialLight)
+			L = normalize(LightData.Position - WorldPosition);
+		else
+			L = LightData.Direction;
+
+		const float3 V = normalize(-CameraVector);
+		LightData.HairTransmittance = GetHairTransmittance(
+			V,
+			L,
+			HairScreenSpaceData.GBuffer,
+			SampleIndex,
+			HairTransmittanceBufferMaxCount,
+			HairTransmittanceBuffer,
+			View.HairScatteringLUTTexture,
+			View.HairScatteringLUTSampler,
+			View.HairComponents);
+	}
+
+	const float Dither = InterleavedGradientNoise(PixelCoord, View.StateFrameIndexMod8);
+	float4 LightAttenuation = HairShadowMaskValid ? ScreenShadowMaskSubPixelTexture.Load(uint3(PixelCoord,0)) : 1;
+	LightAttenuation = min(LightAttenuation, LightData.HairTransmittance.OpaqueVisibility.xxxx);
+
+	FRectTexture RectTexture = InitRectTexture(DeferredLightUniforms.SourceTexture);
+	float SurfaceShadow = 1.0f;
+	const float4 Radiance = GetDynamicLighting(WorldPosition, CameraVector, HairScreenSpaceData.GBuffer, HairScreenSpaceData.AmbientOcclusion, HairScreenSpaceData.GBuffer.ShadingModelID, LightData, LightAttenuation, Dither, PixelCoord, RectTexture, SurfaceShadow);
+	const float  Attenuation = ComputeLightProfileMultiplier(WorldPosition, DeferredLightUniforms.Position, -DeferredLightUniforms.Direction, DeferredLightUniforms.Tangent);
+
+	const float LocalCoverage = From8bitCoverage(Sample.Coverage8bit);
+
+	// TODO: Add atomspheric contribution
+	OutColor.rgb = Radiance.xyz * Attenuation * LocalCoverage * GetExposure();
+	OutColor.a = LocalCoverage;
+}
+#endif

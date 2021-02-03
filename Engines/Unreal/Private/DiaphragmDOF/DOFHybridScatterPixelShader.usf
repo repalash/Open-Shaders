@@ -1,0 +1,132 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DiaphragmDOF/DOFHybridScatterPixelShader.usf: Scattering's pixel shader.
+=============================================================================*/
+
+#include "DOFHybridScatterCommon.ush"
+#include "../FastMath.ush"
+
+
+//------------------------------------------------------- COMPILE TIME CONFIG
+
+// Whether to point mirror the bokeh.
+#if DIM_LAYER_PROCESSING == LAYER_PROCESSING_FOREGROUND_ONLY
+	#define CONFIG_POINT_MIRROR_BOKEH -1
+#elif DIM_LAYER_PROCESSING == LAYER_PROCESSING_BACKGROUND_ONLY
+	#define CONFIG_POINT_MIRROR_BOKEH 1
+#endif
+
+
+//------------------------------------------------------- PARAMETERS
+
+float ScatteringScaling;
+
+Texture2D BokehLUT;
+
+float4 ScatterOcclusionSize;
+Texture2D ScatterOcclusion;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+void ScatterMainPS(
+	in nointerpolation float2 BokehCenter0 : TEXCOORD0,
+	in nointerpolation float4 ColorAndAbsCocRadius0 : TEXCOORD1,
+	in nointerpolation float4 ColorAndAbsCocRadius1 : TEXCOORD2,
+	in nointerpolation float4 ColorAndAbsCocRadius2 : TEXCOORD3,
+	in nointerpolation float4 ColorAndAbsCocRadius3 : TEXCOORD4,
+#if TAYLOR_EXPENDED_COC_INTERSECTION
+	in nointerpolation float4 TaylorExpensionMAD0   : TEXCOORD5,
+	in nointerpolation float4 TaylorExpensionMAD1   : TEXCOORD6,
+#endif
+	in float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0) 
+{
+	OutColor = 0;
+
+	float4 Color[PIXEL_COUNT_PER_SCATTER_GROUP] = {
+		float4(ColorAndAbsCocRadius0.rgb, 0),
+		float4(ColorAndAbsCocRadius1.rgb, 0),
+		float4(ColorAndAbsCocRadius2.rgb, 0),
+		float4(ColorAndAbsCocRadius3.rgb, 0),
+	};
+	
+	float AbsCocRadius[PIXEL_COUNT_PER_SCATTER_GROUP] = {
+		ColorAndAbsCocRadius0.w,
+		ColorAndAbsCocRadius1.w,
+		ColorAndAbsCocRadius2.w,
+		ColorAndAbsCocRadius3.w,
+	};
+	
+	#if TAYLOR_EXPENDED_COC_INTERSECTION
+		float2 TaylorExpension[4] = {
+			TaylorExpensionMAD0.xy,
+			TaylorExpensionMAD0.zw,
+			TaylorExpensionMAD1.xy,
+			TaylorExpensionMAD1.zw,
+		};
+	#endif
+
+	#if DIM_SCATTER_OCCLUSION
+		float4 ScatterOcclusionSample = ScatterOcclusion.SampleLevel(GlobalBilinearWrappedSampler, SvPosition.xy * ScatterOcclusionSize.zw, 0);
+
+		float CocRadiusAvg = ScatterOcclusionSample.x;
+		float CocRadiusVariance = ScatterOcclusionSample.y;
+	#endif
+	
+	float2 PixelOffset0 = SvPosition.xy - BokehCenter0;
+
+	// Evaluate all bokeh of the scattering group.
+	UNROLL
+	for (uint i = 0; i < PIXEL_COUNT_PER_SCATTER_GROUP; i++)
+	{
+		// Pixel coordinate of the center of the bokeh.
+		float2 PixelOffset = PixelOffset0 - ScatteringScaling * kSquare2x2[i];
+
+		float Intersection;
+		#if DIM_BOKEH_SIMULATION
+		{
+			float PixelDistance = sqrtFast(dot(PixelOffset, PixelOffset));
+			float2 LookUpUV = PixelOffset * (CONFIG_POINT_MIRROR_BOKEH * (0.5 - 1.0 / float(BOKEH_LUT_SIZE)) * SafeRcp(PixelDistance));
+
+			// TODO: might be faster without using view uniform buffer.
+			float4 LookupSample = BokehLUT.SampleLevel(GlobalBilinearWrappedSampler, LookUpUV, 0);
+			float CocRadiusToBokehEdgeFactor = LookupSample.x;
+
+			Intersection = saturate(AbsCocRadius[i] * CocRadiusToBokehEdgeFactor - PixelDistance + ANTI_ALIASING_FEATHER_OFFSET);
+		}
+		#elif TAYLOR_EXPENDED_COC_INTERSECTION
+		{
+			Intersection = saturate(dot(PixelOffset, PixelOffset) * TaylorExpension[i].x + TaylorExpension[i].y);
+		}
+		#else
+		{
+			// Pretty simple sphere intersection.
+			float PixelDistance = sqrtFast(dot(PixelOffset, PixelOffset));
+			Intersection = saturate(AbsCocRadius[i] - PixelDistance + ANTI_ALIASING_FEATHER_OFFSET);
+		}
+		#endif
+
+		float Visibility = 1;
+		#if DIM_SCATTER_OCCLUSION
+		{
+			float CocRadiusComparison = max(AbsCocRadius[i] * (1 - FAST_GATHERING_COC_ERROR) - CocRadiusAvg, 0);
+			Visibility = CocRadiusVariance / (CocRadiusVariance + CocRadiusComparison * CocRadiusComparison);
+		}
+		#endif
+
+		OutColor += Color[i] * (Intersection * Visibility);
+	}
+	
+	#if DEBUG_HYBRID_SCATTERING_SPRITE == 1
+		if (any(OutColor.rgb > 0))
+			OutColor = float4(0, 0.1, 0, 0);
+		else
+			OutColor = float4(0.1, 0, 0, 0);
+
+	#elif DEBUG_HYBRID_SCATTERING_SPRITE == 2
+		OutColor *= float4(1, 0, 0, 0);
+
+	#endif
+}

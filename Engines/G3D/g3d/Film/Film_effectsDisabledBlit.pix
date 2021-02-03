@@ -1,0 +1,58 @@
+#version 330 or 420 compatibility
+/**
+  \file data-files/shader/Film/Film_effectsDisabledBlit.pix
+
+  Simple guard-band- and invertY- aware blit
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <textureFilter.glsl>
+
+#expect SHARPEN "float: 0.0 = bicubic has no sharpening, 1.0 = maximum bicubic sharpening"
+#expect FILTER "int: 0 = nearest, 1 = bilinear, 2 = bicubic"
+
+uniform_Texture(sampler2D, sourceTexture_);
+uniform int2       guardBandSize;
+uniform bool       invertX;
+uniform bool       invertY;
+
+in vec2 g3d_TexCoord;
+
+out vec3 result;
+
+void main(void) {
+    // Because the host call used Draw::rect2D conventions, Y inversion is automatically
+    // handled and we don't need an explicit invertY for the texture. We do use an explicit
+    // invertY uniform for the display settings themselves.
+    vec2 texCoord = g3d_TexCoord.xy;
+    if (invertX) {
+        texCoord.x = 1.0 - texCoord.x;
+    }
+    if (invertY) {
+        texCoord.y = 1.0 - texCoord.y;
+    }
+
+    vec2 coord = texCoord.st * (sourceTexture_size.xy - float(guardBandSize) * 2.0) + float(guardBandSize);
+    
+#   if FILTER == 0
+        // Nearest
+        result = texelFetch(sourceTexture_buffer, int2(coord), 0).rgb;
+#   elif FILTER == 1
+        // Bilinear
+        result = texture(sourceTexture_buffer, coord * sourceTexture_invSize.xy, 0).rgb;
+#   else
+        // Bicubic
+        result = texture2DLod_bicubic(sourceTexture_buffer, coord * sourceTexture_invSize.xy, 0.0, sourceTexture_size.xy, sourceTexture_invSize.xy).rgb;
+
+        if (SHARPEN > 0.0) {
+            // Bicubic sharper
+            result = max(vec3(0.0), texture(sourceTexture_buffer, coord * sourceTexture_invSize.xy, 0).rgb * (1.0 + SHARPEN) - result * SHARPEN);
+        }
+#   endif
+}

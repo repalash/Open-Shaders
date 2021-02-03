@@ -1,0 +1,31 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "ScreenPass.ush"
+#include "PostProcessCommon.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+float4 SelectionColor;
+
+/** Main pixel shader function */
+void MainPS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float Alpha = 1;
+
+	int2 ViewportPixelPos = (int2)SvPosition.xy - Output_ViewportMin;
+
+	const int Border1 = 10;
+	const int Border2 = 8;
+	float BorderDistance = ComputeDistanceToRect(ViewportPixelPos, int2(0, 0) + Border1.xx, Output_ViewportSize - 2 * Border1.xx);
+	Alpha = (1 - saturate((BorderDistance - Border2.x) * 0.5f));
+
+	OutColor = float4(Texture2DSample(InputTexture, InputSampler, UVAndScreenPos.xy).rgb, Alpha);
+
+	// border around selected tile
+	OutColor.xyz = lerp(OutColor.xyz, SelectionColor.xyz, saturate(BorderDistance - Border2.x));
+	OutColor.w = lerp(OutColor.w, SelectionColor.w, saturate(BorderDistance - Border2.x));
+	OutColor.w = lerp(OutColor.w, 0.0f, saturate(BorderDistance - Border1.x));
+}

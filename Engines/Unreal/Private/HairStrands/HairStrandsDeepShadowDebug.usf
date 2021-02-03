@@ -1,0 +1,197 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../PostProcessCommon.ush"
+
+//////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_VISUALIZEDOM
+
+float DomScale = 1;
+float2 DomAtlasOffset;
+float2 DomAtlasScale;
+float2 OutputResolution;
+float2 InvOutputResolution;
+
+int4 HairViewRect;
+
+Texture2D<float> DeepShadowDepthTexture;
+Texture2D<float4> DeepShadowLayerTexture;
+
+SamplerState LinearSampler;
+
+bool IsInsideRect(float4 Rect, float2 PixelPos, inout float2 LocalUV)
+{
+	LocalUV = (PixelPos - Rect.xy) / Rect.zw;
+
+	return 	PixelPos.x > Rect.x && PixelPos.x < Rect.x + Rect.z &&
+			PixelPos.y > Rect.y && PixelPos.y < Rect.y + Rect.w;
+}
+
+bool IsOnBorder(float2 LocalUV, float4 Rect)
+{
+	float2 PixelPos = LocalUV * Rect.zw;
+	float BorderThickness = 1;
+
+	return
+		PixelPos.x < BorderThickness || PixelPos.x > Rect.z - 1 - BorderThickness ||
+		PixelPos.y < BorderThickness || PixelPos.y > Rect.w - 1 - BorderThickness;
+}
+
+float3 AddBorder(float2 LocalUV, float4 Rect)
+{
+	const bool bIsOnBorder = IsOnBorder(LocalUV, Rect);
+	return bIsOnBorder ? float3(1,1,0) : float3(0,0,0);
+}
+
+// Display the DOM textures into some insert rect
+#if PERMUTATION_OUTPUT_TYPE == 0
+void VisualizeDomPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0)
+{
+	const float TileSize = 48;
+	const float2 UV = Input.UV;
+	const float2 PixelPos = UV * OutputResolution;
+
+	float2 PixelPosAtTileCenter = PixelPos - (frac(PixelPos / TileSize) - 0.5f) * TileSize;
+	float2 UVAtTileCenter = PixelPosAtTileCenter * InvOutputResolution;
+
+	const float OffsetX = 50;
+	const float OffsetY = 220;
+	const float RectSize = 300;
+	const float4 DepthRect = float4(OffsetX, OffsetY, RectSize, RectSize);
+	const float4 DomRect = float4(OffsetX * 2 + RectSize, OffsetY, RectSize, RectSize);
+
+	float3 Color = 0;
+
+	float2 LocalUV = 0;
+	if (IsInsideRect(DepthRect, PixelPos, LocalUV))
+	{
+		const float2 AtlasUV = LocalUV * DomAtlasScale + DomAtlasOffset;
+		Color = DeepShadowDepthTexture.SampleLevel(LinearSampler, AtlasUV, 0).xxx;
+		Color += AddBorder(LocalUV, DepthRect);
+	}
+	else if (IsInsideRect(DomRect, PixelPos, LocalUV))
+	{
+		const float2 AtlasUV = LocalUV * DomAtlasScale + DomAtlasOffset;
+		Color = DeepShadowLayerTexture.SampleLevel(LinearSampler, AtlasUV, 0).xyz / DomScale;
+		Color += AddBorder(LocalUV, DomRect);
+#if 0 
+		float4 Weight = PostprocessInput2.SampleLevel(LinearSampler, LocalUV, 0);
+		if (Weight.w > 0) Color = float3(0, 0, 1);
+		if (Weight.z > 0) Color = float3(0, 1, 0);
+		if (Weight.y > 0) Color = float3(1, 1, 0);
+		if (Weight.x > 0) Color = float3(1, 0, 0);
+		Color *= 1000;
+#endif
+	}
+	else
+	{
+		discard;
+	}
+
+	OutColor = float4(Color, 1);
+}
+#endif // PERMUTATION_OUTPUT_TYPE == 0
+
+// Display screen space rect for vizualizing projected viewrect of each hair macro group
+#if PERMUTATION_OUTPUT_TYPE == 1
+void VisualizeDomPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0)
+{
+	const float2 UV = Input.UV;
+	const float2 PixelPos = UV * OutputResolution;
+
+	float3 Color = 0;
+	float2 LocalUV = 0;
+	if (IsInsideRect(HairViewRect, PixelPos, LocalUV) && IsOnBorder(LocalUV, HairViewRect))
+	{
+		Color += float3(0, 1, 0);
+	}
+	else
+	{
+		discard;
+	}
+
+	OutColor = float4(Color, 1);
+}
+#endif // PERMUTATION_OUTPUT_TYPE == 1
+
+#endif // SHADER_VISUALIZEDOM
+
+
+//////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_DOMINFO
+
+#include "../ShaderPrintCommon.ush"
+#include "../ShaderDrawDebug.ush"
+#include "../Matrices.ush"
+#include "HairStrandsDeepShadowCommonStruct.ush"
+#include "HairStrandsAABBCommon.ush"
+
+uint AllocatedSlotCount;
+uint MacroGroupCount;
+
+Buffer<int>	MacroGroupAABBBuffer;
+StructuredBuffer<FDeepShadowTransform> ShadowWorldToLightTransformBuffer;
+
+[numthreads(1, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x > 0)
+	{
+		return;
+	}
+
+	for (uint MacroGroupIt = 0; MacroGroupIt < MacroGroupCount; ++MacroGroupIt)
+	{
+		const FHairAABB Bound = ReadHairAABB(MacroGroupIt, MacroGroupAABBBuffer);
+		AddAABB(Bound.Min, Bound.Max, float4(1, 0.5f, 0, 1));
+	}
+
+	const float4 FrustumColor = float4(0.5f, 1, 0, 1);
+	for (uint SlotIt = 0; SlotIt < AllocatedSlotCount; ++SlotIt)
+	{
+		const float4x4 WorldToClip = ShadowWorldToLightTransformBuffer[SlotIt].WorldToClip;
+		const float4x4 ClipToWorld = Inverse(WorldToClip);
+
+		float4 P01 = float4(-1, -1, 0, 1);
+		float4 P11 = float4(-1,  1, 0, 1);
+		float4 P21 = float4( 1,  1, 0, 1);
+		float4 P31 = float4( 1, -1, 0, 1);
+
+		float4 P00 = float4(-1, -1, 1, 1);
+		float4 P10 = float4(-1,  1, 1, 1);
+		float4 P20 = float4( 1,  1, 1, 1);
+		float4 P30 = float4( 1, -1, 1, 1);
+
+		P00 = mul(P00, ClipToWorld); P00 /= P00.w; 
+		P10 = mul(P10, ClipToWorld); P10 /= P10.w; 
+		P20 = mul(P20, ClipToWorld); P20 /= P20.w; 
+		P30 = mul(P30, ClipToWorld); P30 /= P30.w; 
+
+		P01 = mul(P01, ClipToWorld); P01 /= P01.w;
+		P11 = mul(P11, ClipToWorld); P11 /= P11.w;
+		P21 = mul(P21, ClipToWorld); P21 /= P21.w;
+		P31 = mul(P31, ClipToWorld); P31 /= P31.w;
+
+		AddLine(P00, P10, FrustumColor, FrustumColor);
+		AddLine(P10, P20, FrustumColor, FrustumColor);
+		AddLine(P20, P30, FrustumColor, FrustumColor);
+		AddLine(P30, P00, FrustumColor, FrustumColor);
+
+		AddLine(P00, P01, FrustumColor, FrustumColor);
+		AddLine(P10, P11, FrustumColor, FrustumColor);
+		AddLine(P20, P21, FrustumColor, FrustumColor);
+		AddLine(P30, P31, FrustumColor, FrustumColor);
+
+		AddLine(P01, P11, FrustumColor, FrustumColor);
+		AddLine(P11, P21, FrustumColor, FrustumColor);
+		AddLine(P21, P31, FrustumColor, FrustumColor);
+		AddLine(P31, P01, FrustumColor, FrustumColor);
+	}
+}
+#endif // SHADER_DOMINFO

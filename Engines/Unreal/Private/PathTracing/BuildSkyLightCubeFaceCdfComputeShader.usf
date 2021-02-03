@@ -1,0 +1,51 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+BuildSkyLightCubeFaceCdfComputeShader.usf: Intermediate SkyLight CDF build.
+===============================================================================================*/
+
+#include "../Common.ush"
+
+uint2 ColumnCdfDimensions;
+Buffer<float> ColumnCdf;
+RWBuffer<float> RWCubeFaceCdf;
+
+uint LinearCoordinate(uint2 TextureCoordinate)
+{
+	return TextureCoordinate.y * ColumnCdfDimensions.x + TextureCoordinate.x;
+}
+
+void Initialize()
+{
+	for (uint CubeFace = 0; CubeFace < 6; ++CubeFace)
+	{
+		RWCubeFaceCdf[CubeFace] = ColumnCdf[LinearCoordinate(uint2(ColumnCdfDimensions.x - 1, CubeFace))];
+	}
+}
+
+void PrefixSum()
+{
+	for (uint CubeFace = 1; CubeFace < 6; ++CubeFace)
+	{
+		RWCubeFaceCdf[CubeFace] += RWCubeFaceCdf[CubeFace - 1];
+	}
+}
+
+void Normalize()
+{
+	for (uint CubeFace = 0; CubeFace < 5; ++CubeFace)
+	{
+		RWCubeFaceCdf[CubeFace] /= RWCubeFaceCdf[5];
+	}
+	RWCubeFaceCdf[5] = 1.0;
+}
+
+[numthreads(1, 1, 1)]
+void BuildSkyLightCubeFaceCdfCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	Initialize();
+	PrefixSum();
+	Normalize();
+}

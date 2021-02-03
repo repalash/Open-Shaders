@@ -1,0 +1,107 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+uint ComponentSize;
+
+struct FLandscapeLayerWeightmapExtractMaterialLayersComponentData
+{
+	int2 ComponentVertexPosition;		// Section Base of the component converted to vertex
+	uint DestinationPaintLayerIndex;	// correspond to which layer info object index the data should be stored in the texture 2d array
+	uint WeightmapChannelToProcess;		// correspond to which RGBA channel to process
+	int2 AtlasTexturePositionOutput;	// This represent the location we will write layer information
+};
+
+StructuredBuffer<FLandscapeLayerWeightmapExtractMaterialLayersComponentData> InExtractLayersComponentsData;
+Texture2D<float4> InComponentWeightMaps;
+RWTexture2DArray<UNORM float> OutAtlasPaintLayers;
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void ComputeWeightmapPerPaintLayer(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x < ComponentSize && DispatchThreadId.y < ComponentSize)
+	{
+		FLandscapeLayerWeightmapExtractMaterialLayersComponentData ComponentData = InExtractLayersComponentsData[DispatchThreadId.z];
+		int2 CurrentTexel = DispatchThreadId.xy + ComponentData.ComponentVertexPosition;
+
+		float4 LayerBlend = InComponentWeightMaps.Load(int3(CurrentTexel, 0));
+		OutAtlasPaintLayers[int3(DispatchThreadId.xy + ComponentData.AtlasTexturePositionOutput, ComponentData.DestinationPaintLayerIndex)] = LayerBlend[ComponentData.WeightmapChannelToProcess];
+	}
+}
+
+struct FLandscapeLayerWeightmapPackMaterialLayersComponentData
+{
+	int4 ComponenVertexPositionX;	// Section Base of the component converted to vertex for each rgba value (as a texture can contain data from different component)
+	int4 ComponenVertexPositionY;	// Section Base of the component converted to vertex for each rgba value (as a texture can contain data from different component)
+	int4 SourcePaintLayerIndex;		// correspond to which layer info object index the data should be stored in the texture 2d array
+	int4 WeightmapChannelToProcess;	// correspond to which RGBA channel to process
+};
+
+StructuredBuffer<FLandscapeLayerWeightmapPackMaterialLayersComponentData> InPackLayersComponentsData;
+Buffer<float> InWeightmapWeightBlendMode;
+Buffer<float2> InWeightmapTextureOutputOffset;
+Texture2DArray<float> InAtlasPaintLayers;
+RWTexture2D<UNORM float4> OutComponentWeightMaps;
+
+float ComputeWeightmapChannel(int ChannelIndexToProcess, uint2 TexelPosition, uint SourcePaintLayerIndex)
+{
+	float Channel = 0;
+
+	if (ChannelIndexToProcess != -1)
+	{
+		Channel = InAtlasPaintLayers.Load(int4(TexelPosition, SourcePaintLayerIndex, 0));
+		float AllLayerWeightSum = 0;
+
+		float Unused = 0.0;
+		float ArraySize = 0.0;
+		InAtlasPaintLayers.GetDimensions(Unused, Unused, ArraySize);
+
+		for (int i = 0; i < ArraySize; ++i)
+		{
+			if (InWeightmapWeightBlendMode[i] == 1.0) // Only include the one that are weight blended
+			{
+				AllLayerWeightSum += InAtlasPaintLayers.Load(int4(TexelPosition, i, 0));
+			}
+		}
+
+		Channel = AllLayerWeightSum == 0 ? Channel : clamp(Channel / AllLayerWeightSum, 0.0, 1.0);
+	}
+
+	return Channel;
+}
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void PackPaintLayerToWeightmap(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x < ComponentSize && DispatchThreadId.y < ComponentSize)
+	{
+		FLandscapeLayerWeightmapPackMaterialLayersComponentData ComponentData = InPackLayersComponentsData[DispatchThreadId.z];
+
+		float4 Channels = 0;
+
+		for (int i = 0; i < 4; ++i)
+		{
+			float ChannelResult = ComputeWeightmapChannel(ComponentData.WeightmapChannelToProcess[i], DispatchThreadId.xy + int2(ComponentData.ComponenVertexPositionX[i], ComponentData.ComponenVertexPositionY[i]), ComponentData.SourcePaintLayerIndex[i]);
+
+			if (ComponentData.WeightmapChannelToProcess[i] == 0)
+			{ 
+				Channels.x = ChannelResult;
+			}
+			else if (ComponentData.WeightmapChannelToProcess[i] == 1)
+			{
+				Channels.y = ChannelResult;
+			}
+			else if (ComponentData.WeightmapChannelToProcess[i] == 2)
+			{
+				Channels.z = ChannelResult;
+			}
+			else if (ComponentData.WeightmapChannelToProcess[i] == 3)
+			{
+				Channels.w = ChannelResult;
+			}
+		}
+
+		float2 TextureOutputOffset = InWeightmapTextureOutputOffset[DispatchThreadId.z];
+		OutComponentWeightMaps[DispatchThreadId.xy + TextureOutputOffset] = Channels;
+	}
+}

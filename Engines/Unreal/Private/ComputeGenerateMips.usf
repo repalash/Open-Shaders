@@ -1,0 +1,58 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*==================================================================================================
+	GenericGenerateMips.usf: Standard code for generating mips via the compute shader in realtime
+===================================================================================================*/
+
+#pragma once
+#include "Common.ush"
+#include "GammaCorrectionCommon.ush"
+
+Texture2D MipInSRV;
+SamplerState MipSampler;
+
+#if GENMIPS_COMPUTE
+
+float2 TexelSize;
+#if GENMIPS_SRGB
+RWTexture2D<half4> MipOutUAV;
+#else
+RWTexture2D<float4> MipOutUAV;
+#endif
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DT_ID : SV_DispatchThreadID)
+{
+    float2 UV = TexelSize * (DT_ID.xy + 0.5f);
+
+#if GENMIPS_SRGB
+    half4 outColor = MipInSRV.SampleLevel(MipSampler, UV, 0);
+    outColor = half4(LinearToSrgb(outColor.xyz), outColor.w);
+#else
+    float4 outColor = MipInSRV.SampleLevel(MipSampler, UV, 0);
+#endif
+
+#if GENMIPS_SWIZZLE
+    MipOutUAV[DT_ID.xy] = outColor.zyxw;
+#else
+    MipOutUAV[DT_ID.xy] = outColor;
+#endif
+}
+
+#else // !GENMIPS_COMPUTE
+
+float2 HalfTexelSize;
+float Level;
+
+void MainVS(in float4 InPosition : ATTRIBUTE0, in float2 InUV : ATTRIBUTE1,	out float4 OutPosition : SV_POSITION, out float2 OutUV : TEXCOORD0)
+{
+	OutPosition = InPosition;
+	OutUV = InUV;
+}
+
+void MainPS(float4 InPosition : SV_POSITION,	float2 InUV : TEXCOORD0, out float4 OutColor : SV_Target0)
+{
+    OutColor = MipInSRV.SampleLevel(MipSampler, InUV + HalfTexelSize, Level);
+}
+
+#endif // GENMIPS_COMPUTE

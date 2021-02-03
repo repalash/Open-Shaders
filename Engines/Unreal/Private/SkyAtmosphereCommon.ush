@@ -1,0 +1,232 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	SkyAtmosphereCommon.usf: Sky and atmosphere common functions, 
+	e.g. shared with mesh rendering or path tracing.
+=============================================================================*/
+
+#ifndef D_SKY_ATMOSPHERE_COMMON
+#define D_SKY_ATMOSPHERE_COMMON
+
+
+// The constants below should match the one in SceneRendering.cpp
+// Kilometers as unit for computations related to the sky and its atmosphere
+#define CM_TO_SKY_UNIT 0.00001f
+#define SKY_UNIT_TO_CM (1.0f/CM_TO_SKY_UNIT)
+// Float accuracy offset in Sky unit (km, so this is 1m). Should match the one in FAtmosphereSetup::ComputeViewData
+#define PLANET_RADIUS_OFFSET 0.001f
+// Planet radius safe edge to make sure ray does intersect with the atmosphere, for it to traverse the atmosphere. Must match the one in FSceneRenderer::RenderSkyAtmosphereInternal.
+#define PLANET_RADIUS_SAFE_TRACE_EDGE 0.01f
+
+
+// The number of killometer per slice in the aerial pespective camera volume texture. (assuming a uniform depth distribution)
+#define AP_KM_PER_SLICE 4.0f
+#define AP_KM_PER_SLICE_INV (1.0f / AP_KM_PER_SLICE)
+
+
+float2 FromUnitToSubUvs(float2 uv, float4 SizeAndInvSize) { return (uv + 0.5f * SizeAndInvSize.zw) * (SizeAndInvSize.xy / (SizeAndInvSize.xy + 1.0f)); }
+float2 FromSubUvsToUnit(float2 uv, float4 SizeAndInvSize) { return (uv - 0.5f * SizeAndInvSize.zw) * (SizeAndInvSize.xy / (SizeAndInvSize.xy - 1.0f)); }
+
+
+float4 GetAerialPerspectiveLuminanceTransmittance(
+	bool ViewIsRealTimeReflectionCapture, float4 CameraAerialPerspectiveVolumeSizeAndInvSize,
+	float4 NDC, float3 SampledWorldPos, float3 CameraWorldPos, 
+	Texture3D<float4> AerialPerspectiveVolumeTexture, SamplerState AerialPerspectiveVolumeTextureSampler,
+	float AerialPerspectiveVolumeDepthResolutionInv,
+	float AerialPerspectiveVolumeDepthResolution,
+	float AerialPerspectiveVolumeStartDepth,
+	float AerialPerspectiveVolumeDepthSliceLengthKm,
+	float AerialPerspectiveVolumeDepthSliceLengthKmInv,
+	float OneOverExposure)
+{
+	float2 ScreenUv = (NDC.xy / NDC.ww) * float2(0.5f, -0.5f) + 0.5f;
+
+	float tDepth = max(0.0f, length(SampledWorldPos - CameraWorldPos) - AerialPerspectiveVolumeStartDepth);
+
+	float LinearSlice = tDepth * AerialPerspectiveVolumeDepthSliceLengthKmInv;
+	float LinearW = LinearSlice * AerialPerspectiveVolumeDepthResolutionInv; // Depth slice coordinate in [0,1]
+	float NonLinW = sqrt(LinearW); // Squared distribution
+	float NonLinSlice = NonLinW * AerialPerspectiveVolumeDepthResolution;
+
+	const float HalfSliceDepth = 0.70710678118654752440084436210485f; // sqrt(0.5f)
+	float Weight = 1.0f;
+	if (NonLinSlice < HalfSliceDepth)
+	{
+		// We multiply by weight to fade to 0 at depth 0. It works for luminance and opacity.
+		Weight = saturate(NonLinSlice*NonLinSlice * 2.0f); // Square to have a linear falloff from the change of distribution above
+	}
+
+	if (ViewIsRealTimeReflectionCapture)
+	{
+		// We modify ScreenUv to sample the correct AP accordign to 360 reflection AP LUT.
+		// This is the inverse of what is in RenderCameraAerialPerspectiveVolumeCS.
+		float3 WorldDir = normalize(SampledWorldPos - CameraWorldPos);
+
+		float SinPhi = WorldDir.z;
+		float CosPhi = sqrt(1.0f - SinPhi * SinPhi);
+		ScreenUv.y = WorldDir.z * 0.5f + 0.5f;
+
+		float CosTheta = WorldDir.x / CosPhi;
+		float SinTheta = WorldDir.y / CosPhi;
+		float Theta = acos(CosTheta);
+		Theta = SinTheta < 0.0f ? (PI-Theta) + PI : Theta;
+		ScreenUv.x = Theta / (2.0 * PI);
+
+		ScreenUv = FromUnitToSubUvs(ScreenUv, CameraAerialPerspectiveVolumeSizeAndInvSize);
+	}
+
+	float4 AP = Texture3DSampleLevel(AerialPerspectiveVolumeTexture, AerialPerspectiveVolumeTextureSampler, float3(ScreenUv, NonLinW), 0.0f);
+
+	// Lerp to no contribution near the camera (careful as AP contains transmittance)
+	AP.rgb *= Weight;
+	AP.a = 1.0 - (Weight * (1.0f - AP.a));
+
+	// Debug Slices
+#if 0
+	AP.rgba *= frac(clamp(NonLinSlice, 0, AerialPerspectiveVolumeDepthResolution));
+	AP.r += LinearW <= 0.0f ? 0.5f : 0.0f;
+	AP.g += LinearW >= 1.0f ? 0.5f : 0.0f;
+	AP.b += Weight  <  1.0f ? 0.2f+0.2f*Weight : 0.0f;
+#endif
+
+#if USE_PREEXPOSURE 
+	AP.rgb *= OneOverExposure;
+#endif
+
+	return AP;
+}
+
+float4 GetAerialPerspectiveLuminanceTransmittanceWithFogOver(
+	bool ViewIsRealTimeReflectionCapture, float4 CameraAerialPerspectiveVolumeSizeAndInvSize,
+	float4 NDC, float3 SampledWorldPos, float3 CameraWorldPos,
+	Texture3D<float4> AerialPerspectiveVolumeTexture, SamplerState AerialPerspectiveVolumeTextureSampler,
+	float AerialPerspectiveVolumeDepthResolutionInv,
+	float AerialPerspectiveVolumeDepthResolution,
+	float AerialPerspectiveVolumeStartDepth,
+	float AerialPerspectiveVolumeDepthSliceLengthKm,
+	float AerialPerspectiveVolumeDepthSliceLengthKmInv,
+	float OneOverExposure, float4 FogToApplyOver)
+{
+	float4 AP = GetAerialPerspectiveLuminanceTransmittance(
+		ViewIsRealTimeReflectionCapture, CameraAerialPerspectiveVolumeSizeAndInvSize,
+		NDC, SampledWorldPos, CameraWorldPos,
+		AerialPerspectiveVolumeTexture, AerialPerspectiveVolumeTextureSampler,
+		AerialPerspectiveVolumeDepthResolutionInv,
+		AerialPerspectiveVolumeDepthResolution,
+		AerialPerspectiveVolumeStartDepth,
+		AerialPerspectiveVolumeDepthSliceLengthKm,
+		AerialPerspectiveVolumeDepthSliceLengthKmInv,
+		OneOverExposure);
+
+	float4 FinalFog;
+	// Apply any other fog OVER aerial perspective because AP is usually optically thiner.
+	FinalFog.rgb = FogToApplyOver.rgb + AP.rgb * FogToApplyOver.a;
+	// And combine both transmittance.
+	FinalFog.a   = FogToApplyOver.a * AP.a;
+
+	return FinalFog;
+}
+
+void getTransmittanceLutUvs(
+	in float viewHeight, in float viewZenithCosAngle, in float BottomRadius, in float TopRadius,
+	out float2 UV)
+{
+	float H = sqrt(max(0.0f, TopRadius * TopRadius - BottomRadius * BottomRadius));
+	float Rho = sqrt(max(0.0f, viewHeight * viewHeight - BottomRadius * BottomRadius));
+
+	float Discriminant = viewHeight * viewHeight * (viewZenithCosAngle * viewZenithCosAngle - 1.0f) + TopRadius * TopRadius;
+	float D = max(0.0f, (-viewHeight * viewZenithCosAngle + sqrt(Discriminant))); // Distance to atmosphere boundary
+
+	float Dmin = TopRadius - viewHeight;
+	float Dmax = Rho + H;
+	float Xmu = (D - Dmin) / (Dmax - Dmin);
+	float Xr = Rho / H;
+
+	UV = float2(Xmu, Xr);
+	//UV = float2(fromUnitToSubUvs(UV.x, TRANSMITTANCE_TEXTURE_WIDTH), fromUnitToSubUvs(UV.y, TRANSMITTANCE_TEXTURE_HEIGHT)); // No real impact so off
+}
+
+void SkyViewLutParamsToUv(
+	in bool IntersectGround, in float ViewZenithCosAngle, in float3 ViewDir, in float ViewHeight, in float BottomRadius, in float4 SkyViewLutSizeAndInvSize,
+	out float2 UV)
+{
+	float Vhorizon = sqrt(ViewHeight * ViewHeight - BottomRadius * BottomRadius);
+	float CosBeta = Vhorizon / ViewHeight;				// GroundToHorizonCos
+	float Beta = acosFast4(CosBeta);
+	float ZenithHorizonAngle = PI - Beta;
+	float ViewZenithAngle = acosFast4(ViewZenithCosAngle);
+
+	if (!IntersectGround)
+	{
+		float Coord = ViewZenithAngle / ZenithHorizonAngle;
+		Coord = 1.0f - Coord;
+		Coord = sqrt(Coord);
+		Coord = 1.0f - Coord;
+		UV.y = Coord * 0.5f;
+	}
+	else
+	{
+		float Coord = (ViewZenithAngle - ZenithHorizonAngle) / Beta;
+		Coord = sqrt(Coord);
+		UV.y = Coord * 0.5f + 0.5f;
+	}
+
+	{
+		UV.x = (atan2Fast(-ViewDir.y, -ViewDir.x) + PI) / (2.0f * PI);
+	}
+
+	// Constrain uvs to valid sub texel range (avoid zenith derivative issue making LUT usage visible)
+	UV = FromUnitToSubUvs(UV, SkyViewLutSizeAndInvSize);
+}
+
+float3x3 GetSkyViewLutReferential(in float4x4 ViewSkyViewLutReferential)
+{
+	float3x3 SkyViewLutReferential = (float3x3) ViewSkyViewLutReferential;
+	return SkyViewLutReferential;
+}
+
+float3 GetAtmosphereTransmittance(
+	float3 WorldPos, float3 WorldDir, float BottomRadius, float TopRadius,
+	Texture2D<float4> TransmittanceLutTexture, SamplerState TransmittanceLutTextureSampler)
+{
+	// For each view height entry, transmittance is only stored from zenith to horizon. Earth shadow is not accounted for.
+	// It does not contain earth shadow in order to avoid texel linear interpolation artefact when LUT is low resolution.
+	// As such, at the most shadowed point of the LUT when close to horizon, pure black with earth shadow is never hit.
+	// That is why we analytically compute the virtual planet shadow here.
+	const float2 Sol = RayIntersectSphere(WorldPos, WorldDir, float4(float3(0.0f, 0.0f, 0.0f), BottomRadius));
+	if (Sol.x > 0.0f || Sol.y > 0.0f)
+	{
+		return 0.0f;
+	}
+
+	const float PHeight = length(WorldPos);
+	const float3 UpVector = WorldPos / PHeight;
+	const float LightZenithCosAngle = dot(WorldDir, UpVector);
+	float2 TransmittanceLutUv;
+	getTransmittanceLutUvs(PHeight, LightZenithCosAngle, BottomRadius, TopRadius, TransmittanceLutUv);
+	const float3 TransmittanceToLight = Texture2DSampleLevel(TransmittanceLutTexture, TransmittanceLutTextureSampler, TransmittanceLutUv, 0.0f).rgb;
+	return TransmittanceToLight;
+}
+
+float3 GetLightDiskLuminance(
+	float3 WorldPos, float3 WorldDir, float BottomRadius, float TopRadius,
+	Texture2D<float4> TransmittanceLutTexture, SamplerState TransmittanceLutTextureSampler,
+	float3 AtmosphereLightDirection, float AtmosphereLightDiscCosHalfApexAngle, float3 AtmosphereLightDiscLuminance)
+{
+	const float ViewDotLight = dot(WorldDir, AtmosphereLightDirection);
+	const float CosHalfApex = AtmosphereLightDiscCosHalfApexAngle;
+	if (ViewDotLight > CosHalfApex)
+	{
+		const float3 TransmittanceToLight = GetAtmosphereTransmittance(
+			WorldPos, WorldDir, BottomRadius, TopRadius, TransmittanceLutTexture, TransmittanceLutTextureSampler);
+
+		return TransmittanceToLight * AtmosphereLightDiscLuminance;
+	}
+	return 0.0f;
+}
+
+
+
+#endif // D_SKY_ATMOSPHERE_COMMON
+
+

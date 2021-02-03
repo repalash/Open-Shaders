@@ -1,0 +1,28 @@
+#version 330
+/**
+  \file data-files/shader/GFont/GFont_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+uniform vec2 translation;
+uniform mat4 textureMatrix;
+
+in vec4 g3d_Vertex;
+in vec2 g3d_TexCoord0;
+in vec4 color;
+in vec4 borderColor;
+
+out vec2 texCoord;
+out vec4 fontColor;
+out vec4 bColor;
+
+void main() {
+    fontColor     = color;
+    bColor        = borderColor;
+    texCoord      = (vec4(g3d_TexCoord0.xy, 0, 1) * textureMatrix).xy; 
+    gl_Position   = vec4(g3d_Vertex.xy  + translation, 0, 1) * g3d_ObjectToScreenMatrixTranspose;
+}

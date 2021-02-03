@@ -1,0 +1,181 @@
+#version 410
+/**
+  \file data-files/shader/Film/Film_temporalAA.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+
+#expect DUAL_OUTPUT "1 to write to two output arguments, 0 for only one"
+#expect HAS_SOURCE_MOTION "Is the sourceMotionTexture defined?"
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render AO. used for VR. <= 0 to disable"
+
+/** May have nonzero trimBand around it relative to the output */
+uniform Texture2D sourceTexture;
+
+#if HAS_SOURCE_MOTION
+    uniform vec2      motionGuardBand;
+    uniform Texture2D sourceMotionTexture;
+    uniform vec2      jitterMotion;
+#endif
+
+/** Same dimensions as the output */
+uniform_Texture(sampler2D, historyTexture_);
+
+uniform float hysteresis;
+
+/** Pixels to crop from input */
+uniform ivec2 trimBand;
+
+/** Is the history texture upside down? */
+uniform bool invertY;
+
+in vec2 g3d_TexCoord;
+out vec4 result;
+#if DUAL_OUTPUT
+    out vec4 result2;
+#endif
+
+// on [0, 1]. Must be lower with lower hysteresis otherwise
+// the sharpen filter will dominate over time
+float sharpen = 0.01 * pow3(hysteresis);
+
+// de-ghosting 
+const bool  deghost = true;
+
+// Adapted from https://github.com/gokselgoktas/temporal-anti-aliasing/blob/master/Assets/Resources/Shaders/TemporalAntiAliasing.cginc
+// which is adapted from https://github.com/playdeadgames/temporal
+// Optimization by Stubbesaurus and epsilon adjustment to avoid division by zero.
+//
+// This can cause 3x3 blocks of color when there is a thin edge of a similar color that
+// is varying in intensity.
+float3 clipToAABB(in float3 color, in float3 minimum, in float3 maximum) {
+    // note: only clips towards aabb center (but fast!)
+    float3 center  = 0.5 * (maximum + minimum);
+    float3 extents = 0.5 * (maximum - minimum);
+
+    // This is actually `distance`, however the keyword is reserved
+    float3 offset = color - center;
+    
+    float3 ts = abs(extents) / max(abs(offset), float3(0.0001));
+    float t = saturate(minComponent(ts));
+    return center + offset * t;
+}
+
+float3 slideTowardsAABB(in float3 oldColor, in float3 newColor, in float3 minimum, in float3 maximum, in float maxVel) {
+    // How far out of the color-space expected bounding box is this value?
+    float overflow = max3(0.0, maxComponent(minimum - oldColor), maxComponent(oldColor - maximum));
+
+    if (overflow <= 0.0) {
+        // In the bounding box, ok to use the old color
+        return oldColor;
+    } else {
+        // Accelerate the history towards the new color.
+        // Making the lerp value too large leaves ghosting.
+        // Making it too small leaves aliasing. Two good tests
+        // are the thin ridges in Holodeck and the sky in Sponza.
+        //
+        // The maxVel isn't ideal as a discriminator because it is the velocity at this pixel,
+        // which doesn't tell us if something moved *away* from this pixel
+
+        float ghost = max(0.01, 0.6 - max(maxVel * 3.0, 5.0 * square(overflow)));
+        return lerp(newColor, oldColor, ghost);
+    }
+}
+
+float average(float3 c) {
+    return (c.r + c.g + c.b) / 3.0;
+}
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            discard;
+        }
+#   endif
+    
+    vec2 coord          = g3d_TexCoord.st;
+    ivec2 pixelCoord    = ivec2(g3d_FragCoordExtent * coord) + trimBand;
+    vec3 source         = sampleTextureFetch(sourceTexture, pixelCoord, 0).rgb;
+
+    vec2 sourceMotion   = 
+#       if HAS_SOURCE_MOTION
+            sampleTextureFetch(sourceMotionTexture, pixelCoord + ivec2(motionGuardBand), 0).xy - jitterMotion;
+#       else
+            vec2(0.0, 0.0);
+#       endif
+
+
+    // Compute source neighborhood statistics
+    vec3 localMin = source, localMax = source;
+    float maxVel = dot(sourceMotion, sourceMotion);
+    
+    for (int y = -1; y <= +1; ++y) {
+        for (int x = -1; x <= +1; ++x) {
+            if ((x != 0) || (y != 0)) {
+                vec3 c = sampleTextureFetch(sourceTexture, ivec2(clamp(pixelCoord + ivec2(x, y), ivec2(0, 0), ivec2(sourceTexture.size.xy - vec2(1)))), 0).rgb;
+                localMin = min(localMin, c);
+                localMax = max(localMax, c);
+
+#               if HAS_SOURCE_MOTION
+                    vec2 motion = sampleTextureFetch(sourceMotionTexture, clamp(pixelCoord + ivec2(motionGuardBand) + ivec2(x, y), ivec2(0, 0), ivec2(sourceMotionTexture.size.xy) - ivec2(1)), 0).xy - jitterMotion;
+                    maxVel = max(dot(motion, motion), maxVel);
+#               endif
+            }
+        } // x
+    } // y
+    
+    
+    // Reproject
+    coord -= sourceMotion * historyTexture_invSize.xy;
+    coord = invertY ? vec2(coord.x, 1.0 - coord.y) : coord;
+
+    vec3 history = textureLod(historyTexture_buffer, coord, 0).rgb;
+
+    if (sharpen > 0.0) {
+        vec2 offset = historyTexture_invSize.xy;
+        history        = max(vec3(0,0,0),
+            history * (1.0 + sharpen) -
+            (textureLod(historyTexture_buffer, coord +                offset, 0).rgb +
+             textureLod(historyTexture_buffer, coord + vec2(-1, +1) * offset, 0).rgb +
+             textureLod(historyTexture_buffer, coord + vec2(+1, -1) * offset, 0).rgb +
+             textureLod(historyTexture_buffer, coord -                offset, 0).rgb) *
+                (sharpen * 0.25));
+    }
+
+    // Remove NaNs that creep into history and will explode across the screen
+    {
+        bvec3 n = isnan(history);
+        history.r = n.r ? source.r : history.r;
+        history.g = n.g ? source.g : history.g;
+        history.b = n.b ? source.b : history.b;
+    }
+
+    if (deghost) {
+        // Better for subpixel features. New in G3D
+        history = slideTowardsAABB(history, source, localMin, localMax, maxVel);
+
+        // Reduces ghosting on moving objects, "Traditional" TAA:
+        //history = clipToAABB(history, localMin, localMax);
+    }
+
+    // Back off hysteresis when under significant motion
+    float motionScale = clamp(1.0 - length(sourceMotion) * 0.2, 0.85, 1.0);
+    result.rgb = mix(source, history, hysteresis * motionScale);
+    result.a = 1.0;
+
+    // For debugging, to see the raw frames
+//    result.rgb = source;
+//    result.rgb = vec3(maxVel/100);
+//    result.rgb = vec3(dot(sourceMotion,sourceMotion)/100);
+
+#   if DUAL_OUTPUT
+        result2 = result;
+#   endif
+}

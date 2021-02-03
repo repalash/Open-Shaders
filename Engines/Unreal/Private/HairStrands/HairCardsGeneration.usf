@@ -1,0 +1,208 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ShaderDrawDebug.ush"
+#include "../MonteCarlo.ush"
+
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairCardsTextureCommon.ush"
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_VERTEX_RECT
+
+int2 Atlas_Resolution;
+int2 Atlas_RectOffset;
+int2 Atlas_RectResolution;
+
+int2 Tile_Coord;
+int2 Tile_Count;
+int2 Tile_Resolution;
+
+float3 Rect_MinBound;
+float3 Rect_MaxBound;
+
+void MainVS(
+	uint VertexId : SV_VertexID,
+	out float4  OutPosition : SV_Position,
+	out float2  OutCardUV : CARD_UV,
+	out float2  OutAtlasUV : ATLAS_UV)
+
+{
+	float3 P = 0;
+	if (VertexId == 0) P = float3(0, 0, 0);
+	if (VertexId == 1) P = float3(1, 0, 0);
+	if (VertexId == 2) P = float3(1, 1, 0);
+
+	if (VertexId == 3) P = float3(0, 0, 0);
+	if (VertexId == 4) P = float3(1, 1, 0);
+	if (VertexId == 5) P = float3(0, 1, 0);
+
+	// Chart rendering is divided into tiles to avoid too long computation which would TDR the GPU
+	// * Compute the rect of the atlas chart
+	// * Clamp it into a rendering tile.
+	const uint2 TileOffset = Atlas_RectOffset + Tile_Coord * Tile_Resolution;
+	uint2 PInPixel		   = Atlas_RectOffset + P.xy * Atlas_RectResolution;
+	PInPixel = clamp(PInPixel, TileOffset, TileOffset + Tile_Resolution);
+
+	OutAtlasUV = PInPixel;
+	OutAtlasUV /= Atlas_Resolution;
+
+	OutCardUV = float2(PInPixel - Atlas_RectOffset) / float2(Atlas_RectResolution);
+	OutPosition = float4(OutAtlasUV * 2 - 1, 0.5f, 1);
+}
+
+#endif // VERTEXSHADER
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if SHADER_PIXEL_RECT
+
+#include "HairStrandsVertexFactoryCommon.ush"
+
+int2 Atlas_Resolution;
+int2 Atlas_RectOffset;
+int2 Atlas_RectResolution;
+
+float3 Raster_AxisX; // Not normalized, contains AABB (full) length
+float3 Raster_AxisY; // Not normalized, contains AABB (full) length
+float3 Raster_AxisZ; // Not normalized, contains AABB (full) length
+
+float3 Rect_MinBound;
+float3 Rect_MaxBound;
+
+// Offset to the first strands vertex
+// Count of all vertex belonging to this cluster
+uint Curve_VertexOffset;
+uint Curve_VertexCount;
+
+Buffer<float4> Curve_PositionBuffer;
+Buffer<float4> Curve_AttributeBuffer;
+
+#define DEBUG_ENABLE 0
+void MainPS(
+	in float4  SvPosition : SV_Position,
+	in float2  InCardUV : CARD_UV,
+	in float2  InAtlasUV : ATLAS_UV,
+	out float4 OutDepth : SV_Target0,
+	out float4 OutCoverage : SV_Target1,
+	out float4 OutTangent : SV_Target2,
+	out float4 OutAttribute : SV_Target3)
+{
+
+	OutDepth = 0;
+	OutCoverage = 0;
+	OutTangent = float4(InCardUV, 0, 0);
+	OutAttribute = 0;
+
+	const float3 Center = (Rect_MaxBound + Rect_MinBound) * 0.5f;
+	const float3 CardWorldPos =
+		(InCardUV.x * 2 - 1) * Raster_AxisX * 0.5f +
+		(InCardUV.y * 2 - 1) * Raster_AxisY * 0.5f +
+		-0.5f * Raster_AxisZ +
+		Center;
+
+	const int2 PixelCoord = int2(SvPosition.xy);
+
+	#if DEBUG_ENABLE
+	bool bDebugEnable = false;// all(PixelCoord == int2(1600, 10));
+	{
+		// This need to be similar to the debug shader
+		const int2 Debug_Offset = 50;
+		const int2 Debug_Resolution = 1500 * float2(Atlas_Resolution.xy) / max(Atlas_Resolution.x, Atlas_Resolution.y);
+	
+		const float2 CursorUV = float2(GetCursorPos() - Debug_Offset) / float2(Debug_Resolution);
+		if (all(CursorUV >= 0) && all(CursorUV < 1))
+		{
+			const float2 DistanceThreshold = 1.f / float2(Debug_Resolution);
+			if (distance(InAtlasUV, CursorUV) < max(DistanceThreshold.x, DistanceThreshold.y))
+			{
+				bDebugEnable = true;
+			}
+		}
+	}
+	if (bDebugEnable)
+	{
+		const float4 Color = float4(1, 1, 0, 1);
+		AddAABB(Rect_MinBound, Rect_MaxBound, Color);
+	}
+	#endif 
+
+	const float3 RayO = CardWorldPos;
+	const float3 RayD = normalize(Raster_AxisZ);
+
+	const uint SampleCount = 4;
+	const float FarDistance = 100000;
+	float ClosestDepth = FarDistance;
+	float3 ClosestTangent = 0;
+	float4 ClosestAttribute = 0;
+
+	for (uint VertexIt = 0; VertexIt < Curve_VertexCount-1; ++VertexIt)
+	{
+		const uint VertexIndex = VertexIt + Curve_VertexOffset;
+		const float4 Data0 = Curve_PositionBuffer[VertexIndex];
+		const float4 Data1 = Curve_PositionBuffer[VertexIndex+1];
+
+		const float4 Attributes0 = Curve_AttributeBuffer[VertexIndex];
+		const float4 Attributes1 = Curve_AttributeBuffer[VertexIndex+1];
+
+		const float3 CP0 = Data0.xyz;
+		const float3 CP1 = Data1.xyz;
+
+		const float R0 = Data0.w;
+		const float R1 = Data1.w;
+
+		// Invalid selction, i.e., a segment connecting the end of a strands to the beginning of another strands.
+		if (Data0.w == 0)
+			continue;
+
+		#if DEBUG_ENABLE
+		if (bDebugEnable)
+		{
+			const float4 Color = float4(0, 1, 0, 1);
+			AddLine(CP0, CP1, Color, Color);
+		}
+		#endif
+
+		const float PixelRadius = 0.5f * max(length(Raster_AxisX) / float(Atlas_RectResolution.x), length(Raster_AxisY) / float(Atlas_RectResolution.y));
+
+		const float3 WorldTangent = normalize(CP1 - CP0);
+		const float3 LocalTangent = float3(
+			dot(WorldTangent, Raster_AxisX),
+			dot(WorldTangent, Raster_AxisY),
+			dot(WorldTangent, -Raster_AxisZ));
+
+		for (uint SampleIt = 0; SampleIt < SampleCount; ++SampleIt)
+		{
+			const float2 U = Hammersley(SampleIt, SampleCount, 0) * 2 - 1;
+
+			const float3 Jitter = 
+				U.x * (0.5f * Raster_AxisX / float(Atlas_RectResolution.x)) +
+				U.y * (0.5f * Raster_AxisY / float(Atlas_RectResolution.y));
+
+			const float MaxDistance = 10;
+			const float3 RayP0 = RayO + Jitter;
+			const float3 RayP1 = RayO + Jitter + RayD * MaxDistance;
+
+			// Scale radius in order to avoid having 0 coverage when hair are too thin
+			float VertexU = 0;
+			const float RadiusScaleFactor = 1.5f;
+			const float Distance = Intersection(CP0, CP1, RayP0, RayP1, R0, VertexU) * MaxDistance;
+			if (Distance > 0 && Distance < ClosestDepth)
+			{
+				OutCoverage += saturate(R0* RadiusScaleFactor / PixelRadius);
+				ClosestTangent = LocalTangent;
+				ClosestDepth = Distance;
+				ClosestAttribute = lerp(Attributes0, Attributes1, VertexU);
+			}
+		}
+	}
+
+	OutCoverage /= SampleCount;
+	const float3 NColor = (ClosestTangent + 1) * 0.5f;
+	OutTangent = float4(NColor, 0);
+	OutDepth = ClosestDepth < FarDistance ? ClosestDepth : 0;
+	OutAttribute = ClosestAttribute;
+}
+
+#endif

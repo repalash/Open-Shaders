@@ -1,0 +1,139 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "RayTracingCommon.ush"
+#include "RayTracingReflectionsCommon.ush"
+#include "RayTracingDeferredReflections.ush"
+
+#define NUM_DIRECTION_BINS_X REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE
+#define NUM_DIRECTION_BINS_Y REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE
+#define NUM_DIRECTION_BINS (NUM_DIRECTION_BINS_X*NUM_DIRECTION_BINS_Y)
+
+#if THREADGROUP_SIZE != 1024
+#error This shader requires group size of exactly 1024 threads
+#endif
+
+#if THREADGROUP_SIZE != REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE*REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE
+#error Total number of rays peer tile must be equal to thread group size
+#endif
+
+#if THREADGROUP_SIZE < NUM_DIRECTION_BINS
+#error Total number of bins must be less or equal to thread group size
+#endif
+
+#ifndef DIM_WAVE_OPS
+	#define DIM_WAVE_OPS 0
+#endif
+
+#if DIM_WAVE_OPS
+#define MIN_SUPPORTED_WAVE_SIZE 32
+#define NUM_WAVE_SUMS ((NUM_DIRECTION_BINS+MIN_SUPPORTED_WAVE_SIZE-1) / MIN_SUPPORTED_WAVE_SIZE)
+groupshared uint WaveSums[NUM_WAVE_SUMS];
+#endif
+
+groupshared uint Bins[NUM_DIRECTION_BINS];
+
+// Inputs
+uint2 RayTracingResolution;
+uint2 TileAlignedResolution;
+float ReflectionMaxNormalBias;
+float ReflectionSmoothBias;
+float ReflectionMaxRoughness;
+int   UpscaleFactor;
+int   GlossyReflections;
+
+// Outputs
+RWStructuredBuffer<FSortedReflectionRay> RayBuffer;
+
+uint RayDirectionToBin(float3 Direction, uint2 NumBins)
+{
+	float2 OctDirection = UnitVectorToOctahedron(Direction);
+	uint2 Bin2D = min((uint2)floor(OctDirection * NumBins), NumBins-1);
+	return MortonEncode(Bin2D);
+}
+
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void GenerateReflectionRaysCS(
+	uint DispatchThreadId : SV_DispatchThreadID,
+	uint GroupThreadId : SV_GroupThreadID,
+	uint GroupId : SV_GroupID)
+{
+	if (GroupThreadId < NUM_DIRECTION_BINS)
+	{
+		Bins[GroupThreadId] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	const uint2 TileSize         = uint2(REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE, REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE);
+	const uint  TileIndex        = GroupId;
+	const uint  RayIndexInTile   = GroupThreadId;
+	const uint2 NumTiles         = TileAlignedResolution / TileSize;
+	const uint2 TileBasePixelPos = uint2(TileIndex % NumTiles.x, TileIndex / NumTiles.x) * TileSize;
+	const uint2 PixelPos         = TileBasePixelPos + uint2(RayIndexInTile % TileSize.x, RayIndexInTile / TileSize.x);
+
+	FSortedReflectionRay Ray = GenerateDeferredReflectionRay(PixelPos, (uint2)UpscaleFactor, ReflectionMaxNormalBias, ReflectionSmoothBias, GlossyReflections==1);
+
+	uint Bin = RayDirectionToBin(Ray.Direction, uint2(NUM_DIRECTION_BINS_X,NUM_DIRECTION_BINS_Y));
+	if (any(PixelPos >= RayTracingResolution))
+	{
+		Bin = NUM_DIRECTION_BINS - 1;
+	}
+
+	uint SlotForThisThread = 0;
+	InterlockedAdd(Bins[Bin], 1, SlotForThisThread);
+
+	GroupMemoryBarrierWithGroupSync();
+
+#if DIM_WAVE_OPS
+	{
+		const uint WaveIndex = GroupThreadId / WaveGetLaneCount();
+		const uint LaneIndex = WaveGetLaneIndex();
+		uint Value = 0;
+		if (GroupThreadId < NUM_DIRECTION_BINS)
+		{
+			Value = Bins[GroupThreadId];
+			uint ThisWaveSum = WaveActiveSum(Value);
+			if (LaneIndex == 0)
+			{
+				WaveSums[WaveIndex] = ThisWaveSum;
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (WaveIndex == 0 && LaneIndex < NUM_WAVE_SUMS)
+		{
+			WaveSums[LaneIndex] = WavePrefixSum(WaveSums[LaneIndex]);
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupThreadId < NUM_DIRECTION_BINS)
+		{
+			Bins[GroupThreadId] = WaveSums[WaveIndex] + WavePrefixSum(Value);
+		}
+	}
+#else // DIM_WAVE_OPS
+	if (GroupThreadId == 0)
+	{
+		uint Counter = 0;
+		for (uint i = 0; i < NUM_DIRECTION_BINS; i++)
+		{
+			uint NextCounter = Counter + Bins[i];
+			Bins[i] = Counter;
+			Counter = NextCounter;
+		}
+	}
+#endif // DIM_WAVE_OPS
+
+	GroupMemoryBarrierWithGroupSync();
+
+	uint StoreIndex = GroupId * (TileSize.x*TileSize.y) + Bins[Bin] + SlotForThisThread;
+
+	RayBuffer[StoreIndex] = Ray;
+}
+

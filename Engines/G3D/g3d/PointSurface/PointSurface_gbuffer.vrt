@@ -1,0 +1,54 @@
+#version 410
+/**
+  \file data-files/shader/PointSurface/PointSurface_gbuffer.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <UniversalSurface/UniversalSurface_vertex.glsl>
+#include "PointSurface_vertex.glsl"
+
+// Fix some problems on Intel and AMD GPUs
+#define layout(ignore)
+
+#if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+    uniform mat4x3  PreviousObjectToCameraMatrix;
+    out layout(location=7) vec3 csPrevPosition;
+#endif
+
+#if defined(SS_EXPRESSIVE_MOTION)
+    uniform mat4x3  ExpressivePreviousObjectToCameraMatrix;
+    out layout(location=8) vec3 csExpressivePrevPosition;
+#endif
+
+
+void main(void) {
+    PointSurface_transform();
+
+    // Temporary variables needed because some drivers do not allow modifying attribute variables directly
+    vec4 vertex = g3d_Vertex;
+
+#   if (defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE) || defined(SS_EXPRESSIVE_MOTION)) && (HAS_BONES > 0)
+        // For expressive motion, still use the same previous bone matrix texture to avoid
+        // additional computation (since it is expressive anyway!)
+        mat4 prevBoneTransform = UniversalSurface_getFullBoneTransform(g3d_BoneWeights, g3d_BoneIndices, prevBoneMatrixTexture);
+#   endif
+
+#   if defined(CS_POSITION_CHANGE) || defined(SS_POSITION_CHANGE)
+#       if HAS_BONES > 0
+            csPrevPosition = (PreviousObjectToCameraMatrix * (prevBoneTransform * vertex)).xyz;
+#       else
+            csPrevPosition = (PreviousObjectToCameraMatrix * vertex).xyz;
+#       endif
+#   endif
+
+#   if defined(SS_EXPRESSIVE_MOTION)
+#       if HAS_BONES > 0
+            csExpressivePrevPosition = (ExpressivePreviousObjectToCameraMatrix * (prevBoneTransform * vertex)).xyz;
+#       else
+            csExpressivePrevPosition = (ExpressivePreviousObjectToCameraMatrix * vertex).xyz;
+#       endif
+#   endif
+}

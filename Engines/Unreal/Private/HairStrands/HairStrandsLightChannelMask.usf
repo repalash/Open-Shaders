@@ -1,0 +1,45 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ReflectionEnvironmentComputeShaders - functionality to apply local cubemaps.
+=============================================================================*/
+
+#include "../Common.ush"
+#include "HairStrandsCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+uint2						OutputResolution;
+Texture2D<uint> 			NodeOffsetAndCount;
+StructuredBuffer<FPackedHairSample> NodeData;
+RWTexture2D<uint>			OutLightChannelMaskTexture;
+
+#if PERMUTATION_GROUP_SIZE == 0
+#define GROUP_SIZE_X 8
+#define GROUP_SIZE_Y 8
+#elif PERMUTATION_GROUP_SIZE == 1
+#define GROUP_SIZE_X 8
+#define GROUP_SIZE_Y 4
+#else
+#error Unknown group size	
+#endif
+
+[numthreads(GROUP_SIZE_X, GROUP_SIZE_Y, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint2 PixelCoord = DispatchThreadId.xy;
+	if (PixelCoord.x >= OutputResolution.x || PixelCoord.y >= OutputResolution.y)
+		return;
+
+	const FNodeDesc NodeDesc = DecodeNodeDesc(NodeOffsetAndCount.Load(uint3(PixelCoord,0)));
+
+	uint OutLightChannelMask = 0;
+	for (uint SampleIt = 0; SampleIt < NodeDesc.Count; SampleIt++)
+	{
+		const uint LocalOffset = NodeDesc.Offset + SampleIt;
+		const FPackedHairSample Data = NodeData[LocalOffset];
+		const FHairSample Sample = UnpackHairSample(Data);
+		OutLightChannelMask |= Sample.LightChannelMask;
+	}
+
+	OutLightChannelMaskTexture[PixelCoord] = OutLightChannelMask;
+}

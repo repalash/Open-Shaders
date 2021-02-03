@@ -1,0 +1,20 @@
+#version 330
+/**
+  \file data-files/shader/HeightfieldModel/HeightfieldModel_Tile_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <HeightfieldModel/HeightfieldModel_Tile_vertex.glsl>
+
+void main() {
+    vec4 osVertex;
+    vec3 osNormal;
+    vec2 texCoord0;
+
+    TerrainTile_computeOSInput(osVertex, osNormal, texCoord0);
+
+    UniversalSurface_transform(osVertex, osNormal, vec4(0), texCoord0, vec2(0), vec4(0));
+}

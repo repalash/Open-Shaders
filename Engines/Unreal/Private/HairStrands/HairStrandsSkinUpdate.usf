@@ -1,0 +1,173 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "/Engine/Public/Platform.ush"
+
+//----------------------------------------------------------------------------------
+
+uint IndexSize; // bone index size: 1 - 8bit or 2 - 16bit
+uint NumVertices;
+uint WeightStride;
+
+Buffer<uint> WeightLookup;
+StructuredBuffer<float4> BoneMatrices;
+StructuredBuffer<uint> MatrixOffsets;
+Buffer<uint> VertexWeights;
+Buffer<float> RestPositions;
+
+RWBuffer<float> DeformedPositions;
+
+//----------------------------------------------------------------------------------
+
+#define	GPUSKIN_VB_OFFSET_INFLUENCEBONES	0
+#define	GPUSKIN_VB_OFFSET_INFLUENCEWEIGHTS	((1 + GPUSKIN_USE_EXTRA_INFLUENCES) * (1 + GPUSKIN_BONE_INDEX_UINT16))
+
+//----------------------------------------------------------------------------------
+
+#define FBlendedMatrix float3x4
+
+struct FUnpackedWeight
+{
+#if !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	int4	BlendIndices;
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	int4	ExtraIndices;
+#endif
+	float4	BlendWeights;
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	float4	ExtraWeights;
+#endif
+#endif // GPUSKIN_UNLIMITED_BONE_INFLUENCE
+};
+
+//----------------------------------------------------------------------------------
+
+FBlendedMatrix BlendMatrix( FUnpackedWeight UnpackedWeight, uint VertexIndex )
+{
+	const uint MatrixOffset = MatrixOffsets[VertexIndex];
+#if GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	uint BlendOffsetCount = WeightLookup[VertexIndex];
+	int NumBoneInfluences = BlendOffsetCount & 0xff;
+	int StreamOffset = BlendOffsetCount >> 8;
+	int WeightsOffset = StreamOffset + (IndexSize * NumBoneInfluences);
+
+	FBlendedMatrix BoneMatrix = FBlendedMatrix(float4(0,0,0,0), float4(0,0,0,0), float4(0,0,0,0));
+	for (int InfluenceIdx = 0; InfluenceIdx < NumBoneInfluences; InfluenceIdx++)
+	{
+		int BoneIndexOffset = StreamOffset + (IndexSize * InfluenceIdx);
+		int BoneIndex = VertexWeights[BoneIndexOffset];
+		BoneIndex = (IndexSize > 1) ? VertexWeights[BoneIndexOffset + 1] << 8 | BoneIndex : BoneIndex;
+		
+		const uint IndexOffset = (MatrixOffset + BoneIndex) * 3;
+		//@todo-lh: Workaround to fix issue in SPIRVEmitter of DXC; this block must be inside the if branch
+		float BoneWeight = float(VertexWeights[WeightsOffset + InfluenceIdx]) / 255.0f;
+		BoneMatrix += BoneWeight * FBlendedMatrix(BoneMatrices[IndexOffset], BoneMatrices[IndexOffset+1], BoneMatrices[IndexOffset+2]);
+	}
+	
+#else // GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	uint IndexOffsetX = (MatrixOffset + UnpackedWeight.BlendIndices.x) * 3;
+	uint IndexOffsetY = (MatrixOffset + UnpackedWeight.BlendIndices.y) * 3;
+	uint IndexOffsetZ = (MatrixOffset + UnpackedWeight.BlendIndices.z) * 3;
+	uint IndexOffsetW = (MatrixOffset + UnpackedWeight.BlendIndices.w) * 3;
+
+	FBlendedMatrix BoneMatrix = UnpackedWeight.BlendWeights.x * FBlendedMatrix(BoneMatrices[IndexOffsetX], BoneMatrices[IndexOffsetX+1], BoneMatrices[IndexOffsetX+2]);
+	BoneMatrix += UnpackedWeight.BlendWeights.y * FBlendedMatrix(BoneMatrices[IndexOffsetY], BoneMatrices[IndexOffsetY+1], BoneMatrices[IndexOffsetY+2]);
+	BoneMatrix += UnpackedWeight.BlendWeights.z * FBlendedMatrix(BoneMatrices[IndexOffsetZ], BoneMatrices[IndexOffsetZ+1], BoneMatrices[IndexOffsetZ+2]);
+	BoneMatrix += UnpackedWeight.BlendWeights.w * FBlendedMatrix(BoneMatrices[IndexOffsetW], BoneMatrices[IndexOffsetW+1], BoneMatrices[IndexOffsetW+2]);
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	IndexOffsetX = (MatrixOffset + UnpackedWeight.ExtraIndices.x) * 3;
+	IndexOffsetY = (MatrixOffset + UnpackedWeight.ExtraIndices.y) * 3;
+	IndexOffsetZ = (MatrixOffset + UnpackedWeight.ExtraIndices.z) * 3;
+	IndexOffsetW = (MatrixOffset + UnpackedWeight.ExtraIndices.w) * 3;
+
+	BoneMatrix += UnpackedWeight.ExtraWeights.x * FBlendedMatrix(BoneMatrices[IndexOffsetX], BoneMatrices[IndexOffsetX+1], BoneMatrices[IndexOffsetX+2]);
+	BoneMatrix += UnpackedWeight.ExtraWeights.y * FBlendedMatrix(BoneMatrices[IndexOffsetY], BoneMatrices[IndexOffsetY+1], BoneMatrices[IndexOffsetY+2]);
+	BoneMatrix += UnpackedWeight.ExtraWeights.z * FBlendedMatrix(BoneMatrices[IndexOffsetZ], BoneMatrices[IndexOffsetZ+1], BoneMatrices[IndexOffsetZ+2]);
+	BoneMatrix += UnpackedWeight.ExtraWeights.w * FBlendedMatrix(BoneMatrices[IndexOffsetW], BoneMatrices[IndexOffsetW+1], BoneMatrices[IndexOffsetW+2]);
+#endif
+#endif // GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	return BoneMatrix;
+}
+
+//----------------------------------------------------------------------------------
+
+FUnpackedWeight UnpackWeight(uint WeightOffset)
+{
+	FUnpackedWeight Unpacked;
+
+#if !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	uint BlendIndices = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEBONES];
+#if GPUSKIN_BONE_INDEX_UINT16
+	Unpacked.BlendIndices.x = BlendIndices & 0xffff;
+	Unpacked.BlendIndices.y = BlendIndices >> 16 & 0xffff;
+	BlendIndices = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEBONES + 1];
+	Unpacked.BlendIndices.z = BlendIndices & 0xffff;
+	Unpacked.BlendIndices.w = BlendIndices >> 16 & 0xffff;
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	BlendIndices = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEBONES + 2];
+	Unpacked.ExtraIndices.x = BlendIndices & 0xffff;
+	Unpacked.ExtraIndices.y = BlendIndices >> 16 & 0xffff;
+	BlendIndices = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEBONES + 3];
+	Unpacked.ExtraIndices.z = BlendIndices & 0xffff;
+	Unpacked.ExtraIndices.w = BlendIndices >> 16 & 0xffff;
+#endif
+#else // GPUSKIN_BONE_INDEX_UINT16
+	Unpacked.BlendIndices.x = BlendIndices & 0xff;
+	Unpacked.BlendIndices.y = BlendIndices >> 8 & 0xff;
+	Unpacked.BlendIndices.z = BlendIndices >> 16 & 0xff;
+	Unpacked.BlendIndices.w = BlendIndices >> 24 & 0xff;
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	BlendIndices = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEBONES + 1];
+	Unpacked.ExtraIndices.x = BlendIndices & 0xff;
+	Unpacked.ExtraIndices.y = BlendIndices >> 8 & 0xff;
+	Unpacked.ExtraIndices.z = BlendIndices >> 16 & 0xff;
+	Unpacked.ExtraIndices.w = BlendIndices >> 24 & 0xff;
+#endif
+#endif // GPUSKIN_BONE_INDEX_UINT16
+	uint BlendWeights = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEWEIGHTS];
+	Unpacked.BlendWeights.x = float(BlendWeights & 0xff) / 255.0f;
+	Unpacked.BlendWeights.y = float(BlendWeights >> 8 & 0xff) / 255.0f;
+	Unpacked.BlendWeights.z = float(BlendWeights >> 16 & 0xff) / 255.0f;
+	Unpacked.BlendWeights.w = float(BlendWeights >> 24 & 0xff) / 255.0f;
+#if GPUSKIN_USE_EXTRA_INFLUENCES
+	BlendWeights = VertexWeights[WeightOffset + GPUSKIN_VB_OFFSET_INFLUENCEWEIGHTS + 1];
+	Unpacked.ExtraWeights.x = float(BlendWeights & 0xff) / 255.0f;
+	Unpacked.ExtraWeights.y = float(BlendWeights >> 8 & 0xff) / 255.0f;
+	Unpacked.ExtraWeights.z = float(BlendWeights >> 16 & 0xff) / 255.0f;
+	Unpacked.ExtraWeights.w = float(BlendWeights >> 24 & 0xff) / 255.0f;
+#endif
+#endif // GPUSKIN_UNLIMITED_BONE_INFLUENCE
+
+	return Unpacked;
+}
+
+//----------------------------------------------------------------------------------
+
+[numthreads(64,1,1)]
+void UpdateSkinPositionCS(uint3 GroupID : SV_GroupID,
+ uint3 DispatchThreadID : SV_DispatchThreadID,
+ uint3 GroupThreadID : SV_GroupThreadID)
+{
+	const uint VertexIndex = DispatchThreadID.x;
+	if (VertexIndex < NumVertices)
+	{
+		const uint PositionOffset = VertexIndex * 3;
+		const uint WeightOffset = VertexIndex * WeightStride / 4;
+
+		const FUnpackedWeight UnpackedWeight = UnpackWeight(WeightOffset);
+		const FBlendedMatrix BlendedMatrix = BlendMatrix(UnpackedWeight, VertexIndex);
+
+		float4 InputPosition;
+		InputPosition.x = RestPositions[PositionOffset];
+		InputPosition.y = RestPositions[PositionOffset + 1];
+		InputPosition.z = RestPositions[PositionOffset + 2];
+		InputPosition.w = 1.0;
+
+		const float3 OutputPosition =  mul( BlendedMatrix, InputPosition );
+		
+		DeformedPositions[PositionOffset] = OutputPosition.x;
+		DeformedPositions[PositionOffset + 1] = OutputPosition.y;
+		DeformedPositions[PositionOffset + 2] = OutputPosition.z;
+	}
+}

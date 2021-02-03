@@ -1,0 +1,35 @@
+#version 430 // -*- c++ -*-
+#ifdef GL_ARB_compute_variable_group_size
+#extension GL_ARB_compute_variable_group_size : enable
+#endif
+
+#extension GL_NV_shader_buffer_load : enable
+#extension GL_NV_shader_buffer_store : enable
+
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+
+layout(local_size_variable) in;
+
+layout(rgba32f) uniform image2D rayOriginsImage;
+layout(rgba32f) uniform image2D rayDirectionsImage;
+layout(rgba32f) uniform image2D normalsImage;
+
+layout(rgba32f) uniform image2D positionsImage;
+
+uniform int2    gridSize;
+
+void main() {
+    int2 tCoord = int2(gl_GlobalInvocationID.xy);
+	if (all(lessThan(tCoord, gridSize))) {
+
+        vec4 position = imageLoad(positionsImage, tCoord);
+        float distance = length(position.xyz - imageLoad(rayOriginsImage, tCoord).xyz);
+
+        distance *= (dot(imageLoad(normalsImage, tCoord).xyz, imageLoad(rayDirectionsImage, tCoord).xyz) > 0.0f) ? -1.0f : 1.0f;
+
+        position.w = distance;
+
+        imageStore(positionsImage, tCoord, position);
+	}
+}

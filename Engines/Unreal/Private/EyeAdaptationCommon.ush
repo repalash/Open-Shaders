@@ -1,0 +1,60 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "Common.ush"
+
+Texture2D EyeAdaptationTexture;
+Buffer<float4> EyeAdaptationBuffer;
+
+#if SHADING_PATH_DEFERRED
+float EyeAdaptationLookup(Texture2D InEyeAdaptation)
+{
+	return InEyeAdaptation.Load(int3(0, 0, 0)).x;
+}
+#elif SHADING_PATH_MOBILE
+float EyeAdaptationLookup(Buffer<float4> InEyeAdaptation)
+{
+	return InEyeAdaptation[0].x;
+}
+#else
+	#error Unknown shading path.
+#endif
+
+#if defined (EyeAdaptationStruct)
+	#if EYE_ADAPTATION_LOOSE_PARAMETERS
+		#error EyeAdaptationStruct and EYE_ADAPTATION_LOOSE_PARAMETERS cannot both be defined.
+	#endif
+#endif
+
+// This eye adaptation lookup function is used by the material template. However, post process materials also require
+// it, but are themselves global shaders which can utilize loose parameters instead. Rules for the implementation:
+//  - Defining EYE_ADAPTATION_DISABLED will cause it to always return 0.
+//  - Defining EyeAdaptationStruct will cause it to pull from that uniform buffer struct.
+//  - Defining EYE_ADAPTATION_LOOSE_PARAMETERS will cause it to pull from the loose texture / buffer.
+//  - Doing none of the above will fall back to disabled.
+
+float EyeAdaptationLookup()
+{
+#if EYE_ADAPTATION_DISABLED
+	return 0.0f;
+#elif defined (EyeAdaptationStruct)
+	#if SHADING_PATH_DEFERRED
+		return EyeAdaptationLookup(EyeAdaptationStruct.EyeAdaptationTexture);
+	#elif SHADING_PATH_MOBILE
+		return EyeAdaptationLookup(EyeAdaptationStruct.EyeAdaptationBuffer);
+	#else
+		#error Unknown shading path.
+	#endif
+#elif EYE_ADAPTATION_LOOSE_PARAMETERS
+	#if SHADING_PATH_DEFERRED
+		return EyeAdaptationLookup(EyeAdaptationTexture);
+	#elif SHADING_PATH_MOBILE
+		return EyeAdaptationLookup(EyeAdaptationBuffer);
+	#else
+		#error Unknown shading path.
+	#endif
+#else
+	return 0.0f;
+#endif
+}

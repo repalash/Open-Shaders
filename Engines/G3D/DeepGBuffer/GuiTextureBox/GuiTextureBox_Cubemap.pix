@@ -1,0 +1,36 @@
+/**
+  \file GuiTextureBox_Cubemap.pix
+  \author Morgan McGuire, http://graphics.cs.williams.edu, Michael Mara
+ */
+uniform samplerCube tex;
+uniform float     adjustGamma;
+uniform mat4      colorShift;
+uniform float     bias;
+uniform float     scale;
+uniform float     edgeThreshold;
+uniform bool      invertIntensity;
+    
+
+void main(void) {
+    const float PI    = 3.14159265;
+    vec2 sphericalCoord = gl_TexCoord[0].xy;
+    float theta = sphericalCoord.y * PI;
+    float phi   = sphericalCoord.x * 2 * PI;
+    float sinTheta = sin(theta);
+    vec3 cartesianCoord = vec3(cos(phi) * sinTheta, cos(theta), sin(phi) * sinTheta); 
+    vec4 c = textureCubeLod(tex, cartesianCoord, 0.0);
+    c = (c + bias) * scale;
+    c = invertIntensity ? vec4(1.0 - c) : c;
+    c = colorShift * c;
+    c = max(c, vec4(0.0));
+
+    vec3 cubeMapColor = pow(c.rgb, vec3(adjustGamma));
+    vec3 edgeColor = vec3( 0.196, 0.804, 0.196); // Lime Green
+
+                                 
+    vec3 v = abs(cartesianCoord);
+    v = v / max(v.x, max(v.y, v.z));
+    bool onEdge = (v.x + v.y + v.z - min(v.x,min(v.y,v.z))) > edgeThreshold;
+    gl_FragColor.rgb = onEdge ? edgeColor : cubeMapColor;
+    gl_FragColor.a = 1.0;
+}

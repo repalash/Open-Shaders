@@ -1,0 +1,100 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DownSampleDepthPixelShader.usf: Downsamples scene depth by a factor of 2.
+=============================================================================*/
+
+#include "Common.ush"
+#include "SceneTexturesCommon.ush"
+
+// This must match EDownsampleDepthFilter
+#define DOWNSAMPLE_DEPTH_FILTER_POINT		0
+#define DOWNSAMPLE_DEPTH_FILTER_MAX			1
+#define DOWNSAMPLE_DEPTH_FILTER_CBMINMAX	2
+
+Texture2D<float> DepthTexture;
+float4 SourceTexelOffsets01;
+float4 SourceTexelOffsets23;
+float2 SourceMaxUV;
+float2 DestinationResolution;
+uint DownsampleDepthFilter;
+
+float GetDeviceZ(float2 UV)
+{
+	return DepthTexture.Sample(GlobalPointClampedSampler, min(UV, SourceMaxUV));
+}
+
+void Main(
+	noperspective float4 UV : TEXCOORD0,
+	out float OutDepth : SV_DEPTH,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = 0;
+	float Depth = 0;
+
+	if (DownsampleDepthFilter < DOWNSAMPLE_DEPTH_FILTER_CBMINMAX)
+	{
+		// Lookup the four DeviceZ's of the full resolution pixels corresponding to this low resolution pixel
+		float DeviceZ0 = GetDeviceZ(UV.xy + SourceTexelOffsets01.xy);
+		float DeviceZ1 = GetDeviceZ(UV.xy + SourceTexelOffsets01.zw);
+		float DeviceZ2 = GetDeviceZ(UV.xy + SourceTexelOffsets23.xy);
+		float DeviceZ3 = GetDeviceZ(UV.xy + SourceTexelOffsets23.zw);
+
+#if HAS_INVERTED_Z_BUFFER
+		float FarDepth = min(min(DeviceZ0, DeviceZ1), min(DeviceZ2, DeviceZ3));
+#else
+		float FarDepth = max(max(DeviceZ0, DeviceZ1), max(DeviceZ2, DeviceZ3));
+#endif
+
+		// Max depth shrinks the silhouettes around foreground objects and is conservative for depth testing
+		// Sample 0 has consistent error, use whichever one is requested for this downsample
+		Depth = DownsampleDepthFilter == DOWNSAMPLE_DEPTH_FILTER_MAX ? FarDepth : DeviceZ0;
+	}
+	else // DownsampleDepthFilter == DOWNSAMPLE_DEPTH_FILTER_CBMINMAX
+	{
+		// Lookup the four DeviceZ's of the full resolution pixels corresponding to this low resolution pixel
+		const float OffsetScale = 0.25f;
+		// OffsetScale is 0.25 because:
+		//  - UV is centered on the low resolution render targetr in UV space
+		//  - SourceTexelOffsets23 in fact represent a texel size for the DESTINATION render target (TODO refactor that code once in main)
+		//  - So scale by 0.5 will get us to the edge of the half resolution texel. 
+		//  - And to sample the center of the high resolution source pixel in UV space we need to divide angain the offset by half ==> 0.25
+		float DeviceZ0 = GetDeviceZ(UV.xy + SourceTexelOffsets23.zw * OffsetScale * float2(-1,-1));
+		float DeviceZ1 = GetDeviceZ(UV.xy + SourceTexelOffsets23.zw * OffsetScale * float2(-1, 1));
+		float DeviceZ2 = GetDeviceZ(UV.xy + SourceTexelOffsets23.zw * OffsetScale * float2( 1,-1));
+		float DeviceZ3 = GetDeviceZ(UV.xy + SourceTexelOffsets23.zw * OffsetScale * float2( 1, 1));
+
+		const float MaxDeviceZ = max(max(DeviceZ0, DeviceZ1), max(DeviceZ2, DeviceZ3));
+		const float MinDeviceZ = min(min(DeviceZ0, DeviceZ1), min(DeviceZ2, DeviceZ3));
+
+		const float2 Resolution = uint2(DestinationResolution * View.BufferSizeAndInvSize.xy * View.ViewSizeAndInvSize.zw); // need to clamp to respect ratios
+		const uint2 PixelPos = uint2(UV.xy * Resolution);
+
+		const uint2 PixelPosStep = (PixelPos >> 1) * 2;
+		uint CheckerBoard = (PixelPos.x - PixelPosStep.x);									// horizontal alternance of black and white
+		CheckerBoard = (PixelPos.y - PixelPosStep.y) == 0 ? CheckerBoard : 1 - CheckerBoard;// vertical toggle of horizontal checker on odd lines
+
+		Depth = CheckerBoard > 0 ? MaxDeviceZ : MinDeviceZ;
+	}
+
+	OutDepth = Depth;
+}
+
+#ifndef STENCIL_LIGHTING_CHANNELS_SHIFT 
+#define STENCIL_LIGHTING_CHANNELS_SHIFT 0
+#endif
+
+Texture2D<uint2> SceneStencilTexture;
+
+void CopyStencilToLightingChannelsPS(  
+	noperspective float4 InUV : TEXCOORD0,
+	out uint4 OutValue : SV_Target0
+	)
+{
+	uint2 IntUV = (uint2)((float2)InUV.xy * (float2)View.BufferSizeAndInvSize.xy);
+	uint Stencil = SceneStencilTexture.Load(uint3(IntUV, 0)) STENCIL_COMPONENT_SWIZZLE;
+	uint ShiftedStencil = Stencil >> STENCIL_LIGHTING_CHANNELS_SHIFT;
+	// Flip the lowest channel bit, it was stored inverted so we can clear stencil to 0 as a default
+	uint LightingChannels = (ShiftedStencil & 0x6) | (~ShiftedStencil & 0x1);
+	OutValue = LightingChannels;
+}

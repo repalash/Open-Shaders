@@ -1,0 +1,136 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ShaderPrintCommon.ush"
+#include "HairStrandsVisibilityCommon.ush" 
+
+float PPLLMeanListElementCountPerPixel;
+float PPLLMaxTotalListElementCount;
+
+Texture2D<uint> PPLLCounter;
+Texture2D<uint> PPLLNodeIndex;
+StructuredBuffer<FPPLLNodeData> PPLLNodeData;
+
+RWTexture2D<float4> SceneColorTextureUAV;
+
+[numthreads(8, 8, 1)]
+void VisibilityDebugPPLLCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	int2 PixelPos = DispatchThreadId.xy;
+	float PPLLListElementcount = PPLLCounter[uint2(0, 0)];
+
+	uint NextNodeIndex = PPLLNodeIndex[PixelPos];
+	if (NextNodeIndex != 0xFFFFFFFF)
+	{
+		uint StrandCount = 0;
+		do
+		{
+			StrandCount++;
+			FPPLLNodeData Node = PPLLNodeData[NextNodeIndex];
+			NextNodeIndex = Node.NextNodeIndex;
+		} while (NextNodeIndex != 0xFFFFFFFF);
+
+		float l = saturate(StrandCount / PPLLMeanListElementCountPerPixel);
+
+		SceneColorTextureUAV[PixelPos] = float4(l, 1.0f - l, 0.0f, 0.0f);
+	}
+
+	const float2 BarOrigin = 100.0f;
+	const float2 BarSize = float2(200.0f, 20.0f);
+	if (all(PixelPos >= BarOrigin) && all(PixelPos <= (BarOrigin + BarSize)))
+	{
+		float2 LocalPos = PixelPos - BarOrigin;
+		float MemoryUsage = PPLLListElementcount / PPLLMaxTotalListElementCount;
+
+		if (MemoryUsage > LocalPos.x / BarSize.x)
+		{
+			SceneColorTextureUAV[PixelPos] = float4(MemoryUsage, 1.0f - MemoryUsage, 1.0f - MemoryUsage, 0.0f);
+		}
+		else
+		{
+			SceneColorTextureUAV[PixelPos] = float4(0.2f, 0.2f, 0.2f, 0.0f);
+		}
+
+		if (any(PixelPos == BarOrigin) || any(PixelPos == (BarOrigin + BarSize)))
+		{
+			SceneColorTextureUAV[PixelPos] = float4(1.0f, 1.0f, 1.0f, 0.0f);
+		}
+	}
+
+	if (DispatchThreadId.x == 0 && DispatchThreadId.y == 0)
+	{
+		ShaderPrintFilter(true);
+
+		float2 StartPos = (BarOrigin + BarSize*float2(0.0f, 2.0f)) * View.ViewSizeAndInvSize.zw;
+		float2 Pos = StartPos;
+
+		Pos = ShaderPrintSymbol(Pos, _M_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _D_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _R_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _I_);
+		Pos = ShaderPrintSymbol(Pos, _X_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, PPLLMeanListElementCountPerPixel);
+		Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _P_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _N_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _D_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _U_);
+		Pos = ShaderPrintSymbol(Pos, _S_);
+		Pos = ShaderPrintSymbol(Pos, _E_);
+		Pos = ShaderPrintSymbol(Pos, _D_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, PPLLListElementcount);
+		Pos = ShaderPrintNewline(Pos); Pos.x = StartPos.x;
+
+		
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _O_);
+		Pos = ShaderPrintSymbol(Pos, _T_);
+		Pos = ShaderPrintSymbol(Pos, _A_);
+		Pos = ShaderPrintSymbol(Pos, _L_);
+		Pos = ShaderPrintSymbol(Pos, _SPC_);
+		Pos = ShaderPrint(Pos, PPLLMaxTotalListElementCount);
+		Pos = ShaderPrintNewline(Pos);
+	}
+}

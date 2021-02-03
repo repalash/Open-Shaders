@@ -1,0 +1,31 @@
+#version 330
+/**
+  \file data-files/shader/ArticulatedModel/ArticulatedModel_blitShader.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+
+uniform sampler2D   blittedTexture;
+uniform int         xOffset;
+uniform int         yOffset;
+uniform int         texHeight;
+uniform int         texWidth;
+
+out vec4 g3d_FragColor;
+
+void main() {
+    ivec2 dest = ivec2(gl_FragCoord.xy);
+    
+    ivec2 source = dest - ivec2(xOffset, yOffset);
+    if ((source.x < 0) || (source.x >= texWidth) || (source.y < 0) || (source.y >= texHeight)) {
+        discard;
+    }
+
+    g3d_FragColor = texelFetch(blittedTexture, source, 0);
+}
+

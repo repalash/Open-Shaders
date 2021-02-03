@@ -1,0 +1,185 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessHistogramCommon.usf: PostProcessing histogram shared functions and structures.
+=============================================================================*/
+
+float EyeAdaptation_ExposureLowPercent;
+float EyeAdaptation_ExposureHighPercent;
+float EyeAdaptation_MinAverageLuminance;
+float EyeAdaptation_MaxAverageLuminance;
+float EyeAdaptation_ExposureCompensationSettings;
+float EyeAdaptation_ExposureCompensationCurve;
+float EyeAdaptation_DeltaWorldTime;
+float EyeAdaptation_ExposureSpeedUp;
+float EyeAdaptation_ExposureSpeedDown;
+float EyeAdaptation_HistogramScale;
+float EyeAdaptation_HistogramBias;
+float EyeAdaptation_LuminanceMin;
+float EyeAdaptation_BlackHistogramBucketInfluence;
+float EyeAdaptation_GreyMult;
+float EyeAdaptation_ExponentialUpM;
+float EyeAdaptation_ExponentialDownM;
+float EyeAdaptation_StartDistance;
+float EyeAdaptation_LuminanceMax;
+float EyeAdaptation_ForceTarget;
+int EyeAdaptation_VisualizeDebugType;
+Texture2D EyeAdaptation_MeterMaskTexture;
+SamplerState EyeAdaptation_MeterMaskSampler;
+
+// inverse of ComputeLuminanceFromHistogramPosition
+// is executed more often than ComputeLuminanceFromHistogramPosition()
+// @param Luminance
+// @return HistogramPosition 0..1
+float ComputeHistogramPositionFromLuminance(float Luminance)
+{
+	return log2(Luminance) * EyeAdaptation_HistogramScale + EyeAdaptation_HistogramBias;
+}
+
+// inverse of ComputeHistogramPositionFromLuminance()
+// is not as often executed as ComputeHistogramPositionFromLuminance()
+// @param HistogramPosition 0..1
+// @return Luminance
+float ComputeLuminanceFromHistogramPosition(float HistogramPosition)
+{
+	return exp2((HistogramPosition - EyeAdaptation_HistogramBias) / EyeAdaptation_HistogramScale);
+}
+
+
+float ComputeLogLuminanceFromHistogramPosition(float HistogramPosition)
+{
+	return ((HistogramPosition - EyeAdaptation_HistogramBias) / EyeAdaptation_HistogramScale);
+}
+
+
+#define HISTOGRAM_SIZE 64
+#define HISTOGRAM_TEXEL_SIZE (HISTOGRAM_SIZE / 4)
+
+float4 ComputeARGBStripeMaskInt(uint x)
+{
+	return float4(
+		(x % 4) == 0,
+		(x % 4) == 1,
+		(x % 4) == 2,
+		(x % 4) == 3);
+}
+
+float GetHistogramBucket(Texture2D HistogramTexture, uint BucketIndex)
+{
+	uint Texel = BucketIndex / 4;
+	
+	float4 HistogramColor = HistogramTexture.Load(int3(Texel, 0, 0));
+
+	uint channel = BucketIndex % 4;
+	float UnweightedValue = HistogramColor.r;
+	UnweightedValue = (channel == 1) ? HistogramColor.g : UnweightedValue;
+	UnweightedValue = (channel == 2) ? HistogramColor.b : UnweightedValue;
+	UnweightedValue = (channel == 3) ? HistogramColor.a : UnweightedValue;
+
+	return UnweightedValue;
+}
+
+float ComputeHistogramSum(Texture2D HistogramTexture)
+{
+	float Sum = 0;
+
+	for(uint i = 0; i < HISTOGRAM_SIZE; ++i)
+	{
+		Sum += GetHistogramBucket(HistogramTexture, i);
+	}
+
+	return Sum;
+}
+
+// @param MinFractionSum e.g. ComputeHistogramSum() * 0.5f for 50% percentil
+// @param MaxFractionSum e.g. ComputeHistogramSum() * 0.9f for 90% percentil
+float ComputeAverageLuminanceWithoutOutlier(Texture2D HistogramTexture, float MinFractionSum, float MaxFractionSum)
+{
+	float2 SumWithoutOutliers = 0;
+	
+	UNROLL for(uint i = 0; i < HISTOGRAM_SIZE; ++i)
+	{
+		float LocalValue = GetHistogramBucket(HistogramTexture, i);
+
+		// remove outlier at lower end
+		float Sub = min(LocalValue, MinFractionSum);
+		LocalValue = LocalValue - Sub;
+		MinFractionSum -= Sub;
+		MaxFractionSum -= Sub;
+		
+		// remove outlier at upper end
+		LocalValue = min(LocalValue, MaxFractionSum);
+		MaxFractionSum -= LocalValue;
+
+		float LogLuminanceAtBucket = ComputeLogLuminanceFromHistogramPosition(float(i) / (float)(HISTOGRAM_SIZE-1));
+
+		SumWithoutOutliers += float2(LogLuminanceAtBucket, 1) * LocalValue;
+	}
+
+	float AvgLogLuminance = SumWithoutOutliers.x / max(0.0001f, SumWithoutOutliers.y);
+
+	return exp2(AvgLogLuminance);
+}
+
+float ComputeEyeAdaptationExposure(Texture2D HistogramTexture)
+{
+	const float HistogramSum = ComputeHistogramSum(HistogramTexture);
+	const float AverageSceneLuminance = ComputeAverageLuminanceWithoutOutlier(HistogramTexture, HistogramSum * EyeAdaptation_ExposureLowPercent, HistogramSum * EyeAdaptation_ExposureHighPercent);
+	const float LumAve = AverageSceneLuminance;
+
+	const float ClampedLumAve = LumAve;
+		
+	// No longer clamping here. We are letting the target exposure be outside the min/max range, and then letting the exposure
+	// gradually transion.
+	return ClampedLumAve;
+}
+
+float AdaptationWeightTexture(float2 UV)
+{
+	return Texture2DSampleLevel(EyeAdaptation_MeterMaskTexture, EyeAdaptation_MeterMaskSampler, UV, 0).x;
+}
+
+float ExponentialAdaption(float Current, float Target, float FrameTime, float AdaptionSpeed, float M)
+{
+	const float Factor = 1.0f - exp2(-FrameTime * AdaptionSpeed);
+	const float Value = Current + (Target - Current) * Factor * M;
+	return Value;
+}
+
+float LinearAdaption(float Current, float Target, float FrameTime, float AdaptionSpeed)
+{
+	const float Offset = FrameTime * AdaptionSpeed;
+
+	const float Value = (Current < Target) ? min(Target, Current + Offset) : max(Target, Current - Offset);
+
+	return Value;
+}
+
+float ComputeEyeAdaptation(float OldExposure, float TargetExposure, float FrameTime)
+{
+	const float LogTargetExposure = log2(TargetExposure);
+	const float LogOldExposure = log2(OldExposure);
+
+	const float LogDiff = LogTargetExposure - LogOldExposure;
+
+	const float AdaptionSpeed = (LogDiff > 0) ? EyeAdaptation_ExposureSpeedUp : EyeAdaptation_ExposureSpeedDown;
+	const float M = (LogDiff > 0) ? EyeAdaptation_ExponentialUpM : EyeAdaptation_ExponentialDownM;
+
+	const float AbsLogDiff = abs(LogDiff);
+
+	// blended exposure
+	const float LogAdaptedExposure_Exponential = ExponentialAdaption(LogOldExposure, LogTargetExposure, FrameTime, AdaptionSpeed, M);
+	const float LogAdaptedExposure_Linear = LinearAdaption(LogOldExposure, LogTargetExposure, FrameTime, AdaptionSpeed);
+
+	const float LogAdaptedExposure = AbsLogDiff > EyeAdaptation_StartDistance ? LogAdaptedExposure_Linear : LogAdaptedExposure_Exponential;
+
+	// Note: no clamping here. The target exposure should always be clamped so if we are below the min or above the max,
+	// instead of clamping, we will gradually transition to the target exposure. If were to clamp, the then we would have a harsh transition
+	// when going from postFX volumes with different min/max luminance values.
+	const float AdaptedExposure = exp2(LogAdaptedExposure);
+
+	// for manual mode or camera cuts, just lerp to the target
+	const float AdjustedExposure = lerp(AdaptedExposure,TargetExposure,EyeAdaptation_ForceTarget);
+	
+	return AdjustedExposure;
+}

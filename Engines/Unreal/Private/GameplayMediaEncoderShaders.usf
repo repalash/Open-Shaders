@@ -1,0 +1,19 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=========================================================================================
+	GameplayMediaEncoderShaders.usf: utility shaders for the GameplayMediaEncoder module
+=========================================================================================*/
+
+#include "Common.ush"
+
+Texture2D InTexture;
+SamplerState InTextureSampler;
+
+// Swizzle color channels from RGBA to BGRA
+void ScreenSwizzlePS(
+	FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+    OutColor = Texture2DSample(InTexture, InTextureSampler, Input.UV).bgra;
+}

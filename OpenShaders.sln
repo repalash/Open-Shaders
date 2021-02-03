@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenShaders", "OpenShaders.csproj", "{B3F97908-48E5-406D-95D2-207720BB1FCE}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B3F97908-48E5-406D-95D2-207720BB1FCE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3F97908-48E5-406D-95D2-207720BB1FCE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3F97908-48E5-406D-95D2-207720BB1FCE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3F97908-48E5-406D-95D2-207720BB1FCE}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

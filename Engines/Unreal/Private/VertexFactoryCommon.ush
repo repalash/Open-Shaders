@@ -1,0 +1,114 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+float3 TransformLocalToWorld(float3 LocalPosition, uint PrimitiveId)
+{
+	//expand the matrix multiply to avoid a code-gen bug on PS4.
+	//float3 RotatedPosition = mul(LocalPosition.xyz, (float3x3)Primitive.LocalToWorld); 
+	//invariant code!
+	float4x4 LocalToWorld = GetPrimitiveData(PrimitiveId).LocalToWorld;
+	return INVARIANT((LocalToWorld[0].xyz * LocalPosition.xxx + LocalToWorld[1].xyz * LocalPosition.yyy + LocalToWorld[2].xyz * LocalPosition.zzz) + LocalToWorld[3].xyz);	
+}
+
+float4 TransformLocalToWorld(float3 LocalPosition)
+{
+	float3 RotatedPosition = Primitive.LocalToWorld[0].xyz * LocalPosition.xxx + Primitive.LocalToWorld[1].xyz * LocalPosition.yyy + Primitive.LocalToWorld[2].xyz * LocalPosition.zzz;
+	return float4(RotatedPosition + Primitive.LocalToWorld[3].xyz ,1);
+}
+
+float4 TransformLocalToTranslatedWorld(float3 LocalPosition, uint PrimitiveId)
+{
+	float4x4 LocalToWorld = GetPrimitiveData(PrimitiveId).LocalToWorld;
+	float3 RotatedPosition = LocalToWorld[0].xyz * LocalPosition.xxx + LocalToWorld[1].xyz * LocalPosition.yyy + LocalToWorld[2].xyz * LocalPosition.zzz;
+	return float4(RotatedPosition + (LocalToWorld[3].xyz + ResolvedView.PreViewTranslation.xyz),1);
+}
+
+float4 TransformLocalToTranslatedWorld(float3 LocalPosition)
+{
+	float3 RotatedPosition = Primitive.LocalToWorld[0].xyz * LocalPosition.xxx + Primitive.LocalToWorld[1].xyz * LocalPosition.yyy + Primitive.LocalToWorld[2].xyz * LocalPosition.zzz;
+	return float4(RotatedPosition + (Primitive.LocalToWorld[3].xyz + ResolvedView.PreViewTranslation.xyz),1);
+}
+
+float3 RotateLocalToWorld(float3 LocalDirection, uint PrimitiveId)
+{
+	const float4x4 LocalToWorld = GetPrimitiveData(PrimitiveId).LocalToWorld;
+	const float3 InvScale = GetPrimitiveData(PrimitiveId).InvNonUniformScaleAndDeterminantSign.xyz;
+	return 
+		InvScale.x * LocalToWorld[0].xyz * LocalDirection.xxx + 
+		InvScale.y * LocalToWorld[1].xyz * LocalDirection.yyy + 
+		InvScale.z * LocalToWorld[2].xyz * LocalDirection.zzz;	
+}
+
+float3 RotateLocalToWorld(float3 LocalDirection)
+{
+	const float3 InvScale = Primitive.InvNonUniformScaleAndDeterminantSign.xyz;
+	return 
+		InvScale.x * Primitive.LocalToWorld[0].xyz * LocalDirection.xxx + 
+		InvScale.y * Primitive.LocalToWorld[1].xyz * LocalDirection.yyy + 
+		InvScale.z * Primitive.LocalToWorld[2].xyz * LocalDirection.zzz;
+}
+
+float3 RotateWorldToLocal(float3 WorldDirection)
+{
+	const float3 InvScale = Primitive.InvNonUniformScaleAndDeterminantSign.xyz;
+	float3x3 InvRot = {
+		InvScale.x * Primitive.LocalToWorld[0].xyz,
+		InvScale.y * Primitive.LocalToWorld[1].xyz,
+		InvScale.z * Primitive.LocalToWorld[2].xyz
+	};
+	InvRot = transpose(InvRot);
+	return mul(WorldDirection, InvRot);
+}
+
+// Octahedron Normal Vectors
+// [Cigolle 2014, "A Survey of Efficient Representations for Independent Unit Vectors"]
+//						Mean	Max
+// oct		8:8			0.33709 0.94424
+// snorm	8:8:8		0.17015 0.38588
+// oct		10:10		0.08380 0.23467
+// snorm	10:10:10	0.04228 0.09598
+// oct		12:12		0.02091 0.05874
+
+float2 UnitToOct( float3 N )
+{
+	N.xy /= dot( 1, abs(N) );
+	if( N.z <= 0 )
+	{
+		N.xy = ( 1 - abs(N.yx) ) * ( N.xy >= 0 ? float2(1,1) : float2(-1,-1) );
+	}
+	return N.xy;
+}
+
+float3 OctToUnit( float2 Oct )
+{
+	float3 N = float3( Oct, 1 - dot( 1, abs(Oct) ) );
+	if( N.z < 0 )
+	{
+		N.xy = ( 1 - abs(N.yx) ) * ( N.xy >= 0 ? float2(1,1) : float2(-1,-1) );
+	}
+	return normalize(N);
+}
+
+#if ODS_CAPTURE
+/*
+	Apply omni-directional stereo displacement to a stereo cube map render.
+	This can later be reconstructed into a stereo lat-long by ODSCapture.usf
+	See: https://developers.google.com/vr/jump/rendering-ods-content.pdf
+*/
+float3 OffsetODS(float3 WorldPosition, float3 WorldCameraPosition, float IPD)
+{
+	float3 CamOffset = WorldPosition.xyz - WorldCameraPosition.xyz;
+	
+	float4 D = float4(CamOffset.xyz, dot(CamOffset.xyz, CamOffset.xyz));
+	D *= rsqrt(D.w);
+	
+	float3 WorldUp = float3(0.0, 0.0, 1.0);
+	float3 T = normalize(cross(D.xyz, WorldUp.xyz));
+
+	float A = IPD * IPD / D.w;
+	float B = IPD / D.w * sqrt(D.w * D.w - IPD * IPD);
+	
+	return -A * D + B * T;
+}
+#endif

@@ -1,0 +1,129 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingTestIntegrateHemispherePatch.usf: BRDF tests 
+===============================================================================================*/
+
+
+#include "../../Montecarlo.ush"
+#include "../PathTracingDefinitions.ush"
+#include "PathTracingMaterialSampling.ush"
+#include "../Utilities/PathTracingRandomSequence.ush"
+
+
+RWStructuredBuffer<float> PdfIntegralsBins;
+uint  BrdfType;
+float3 Wo;
+uint  NumThetaSteps;
+uint  NumPhiSteps;
+
+
+
+
+float IntegratePdfInSphericalPatch(float Theta0, float Phi0, float Theta1, float Phi1, float PatchArea, float3 wo, uint BrdfType)
+{
+	// Integrates the PDF function on a 2D sphere surface patch 
+	// So far it uses Montecarlo integration instead something faster (todo)
+	// To keep probabilities uniform (1/PatchArea), the patch is divided into regions with constant solid angle
+	// which means that Theta is not incremented in regular intervals but CosTheta is used instead
+
+	if (Theta0 > Theta1 || Phi0 > Phi1)
+		return -1.0; // Invalid integration domain
+
+	if (PatchArea < 0.0)
+		return -1.0; // Invalid input
+
+
+	FMaterialClosestHitPayload Payload = (FMaterialClosestHitPayload)0;
+	Payload.WorldNormal = float3(0.0, 0.0, 1.0);
+	Payload.DiffuseColor = float3(0.37, 0.37, 0.37);
+	Payload.SpecularColor = float3(0.37, 0.37, 0.37);
+	Payload.Roughness = 0.1;
+
+
+	// Note: if segments are too small float precision is not enough
+	uint ThetaSegments = 100;
+	uint PhiSegments = 100;
+
+	float ThetaLength = (cos(Theta0) - cos(Theta1)) / ThetaSegments; //Hemisphere only so far
+	float PhiLength = (Phi1 - Phi0) / PhiSegments;
+	float CosTheta0 = cos(Theta0);
+
+	uint N = 0;
+	float PdfAccum = 0.0f;
+	for (uint ThetaIndex = 0; ThetaIndex <= ThetaSegments; ThetaIndex++)
+	{
+		for (uint PhiIndex = 0; PhiIndex < PhiSegments; PhiIndex++)
+		{
+			++N;
+
+			float CosTheta = CosTheta0 - (float)ThetaIndex* ThetaLength;
+			float SinTheta = sqrt(1 - (CosTheta*CosTheta));
+			float Phi = Phi0 + ((float)PhiIndex* PhiLength);
+			float CosPhi = cos(Phi);
+			float SinPhi = sin(Phi);
+
+			float3 Wi = normalize(float3(SinTheta*CosPhi, SinTheta*SinPhi, CosTheta));
+
+			float PDF;
+
+			if (BrdfType == 0)
+			{
+				PDF = Lambert_Pdf(Wi, Payload);
+			}
+			else if (BrdfType == 1)
+			{
+				PDF = Glossy_Pdf(Wo, Wi, Payload);
+			}
+			else
+			{
+				// Should never be here, generate invalid outgoing to trigger an error
+				return -1.0;
+			}
+
+			float P = 1.0 / PatchArea;
+			PdfAccum += PDF / P;
+		}
+	}
+
+	return PdfAccum / N;
+}
+
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+
+void TestIntegrateHemispherePatchCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint2 GridCoordinate = DispatchThreadId.xy;
+
+	if (GridCoordinate.x >= NumPhiSteps || GridCoordinate.y >= NumThetaSteps)
+	{
+		return;
+	}
+
+	uint ThetaIndex = GridCoordinate.x;
+	uint PhiIndex = GridCoordinate.y;
+
+	// Sample with constant CosTheta instead constant Theta
+	// to divide the hemisphere in patches of equal area
+	float ThetaLength = 1.0 / NumThetaSteps; //Hemisphere only so far
+	float PhiLength = 2 * PI / NumPhiSteps;
+	
+	float PatchArea = 2 * PI / (NumThetaSteps * NumPhiSteps);
+
+	// Do (1-CosX) so theta goes from 0 to PI/2 to make it consistent with the integration functions
+	float CosTheta0 = 1.0 - (ThetaIndex * ThetaLength);
+	float CosTheta1 = 1.0 - ((ThetaIndex + 1) * ThetaLength);
+
+	float Theta0 = acos(CosTheta0);
+	float Theta1 = acos(CosTheta1);
+	float Phi0 = PhiIndex * PhiLength;
+	float Phi1 = (PhiIndex + 1) * PhiLength;
+
+	float PatchIntegral = IntegratePdfInSphericalPatch(Theta0, Phi0, Theta1, Phi1, PatchArea, Wo, BrdfType);
+	PdfIntegralsBins[ThetaIndex * NumPhiSteps + PhiIndex] = PatchIntegral;
+}
+

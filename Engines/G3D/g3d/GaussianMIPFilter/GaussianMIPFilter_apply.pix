@@ -1,0 +1,98 @@
+#version 460
+
+#include <g3dmath.glsl>
+
+uniform sampler2D srcColor;
+
+// the w component is zero if we should ignore the sample
+// uniform sampler2D srcNormalZ;
+
+uniform int bias;
+uniform int dstMIP;
+uniform int srcWidth;
+uniform int srcHeight;
+
+out Color3 dstColor;
+//out Vector4 dstNormalZ;
+
+float gaussian(ivec2 v) {
+    vec2 x = vec2(v);
+    return exp(-dot(x, x) * 0.1);
+}
+
+void main() {
+    // Note that source coordinates are at 2x the scale of the dst coordinates.
+    // When gl_FragCoord.xy = (0.5, 0.5), it overlaps the source pixels(0,0), (1,1), (1,0), and (0,1).
+    // This means that there is no "center" pixel. We alternate biasing towards the upper left and lower right
+
+    ivec2 dstCoord = ivec2(gl_FragCoord.xy);
+
+    int srcMIP = dstMIP - 1;
+    ivec2 centerCoord = dstCoord * 2 + bias;
+
+    /*
+    float4 centerNormalZ = texelFetch(srcNormalZ, centerCoord, srcMIP);
+
+    vec3 centerNormal = normalize(centerNormalZ.xyz);
+    float centerZ = centerNormalZ.w;
+
+    bool centerIsValid = centerZ != 0;
+    float posWeight = centerIsValid ? 1 : 0;
+
+    dstNormalZ = centerIsValid ? centerNormalZ : vec4(0);
+    */
+
+    float weightSum = 0;
+    dstColor = vec3(0);
+
+    const int radius = 3;
+    // texelFetch a 5x5 grid from the source and apply gaussian weights
+    for (ivec2 offset = ivec2(-radius, -radius); offset.y <= +radius; ++offset.y) { 
+        for (offset.x = -radius; offset.x <= +radius; ++offset.x) { 
+            ivec2 srcCoord = dstCoord * 2 + offset + bias;
+            float weight = gaussian(offset);
+
+            /*
+            if ((offset.x != 0) || (offset.y != 0)) {
+                float4 normalZ = texelFetch(srcNormalZ, srcCoord, srcMIP);
+                float z = normalZ.w;
+                if ((z != 0) && (srcCoord.x >= 0) && (srcCoord.y >= 0) && (srcCoord.x < srcWidth) && (srcCoord.y <= srcHeight)) {
+                    Vector3 normal = normalZ.xyz;
+
+                    if (centerIsValid) {
+                        // Bilateral weights
+                        // z weight
+                        weight *= max(0.0, 1.0 - abs(z - centerZ));
+
+                        // Normal weight
+                        float normalCloseness = square(square(dot(normal, centerNormal)));
+                        float normalError = (1.0 - normalCloseness);
+                        weight *= max(1.0 - normalError, 0.0);
+
+                    } else {
+                        // No bilateral weights, and compute a useful output position
+                        dstNormalZ += normalZ;
+                        ++posWeight;
+                    }
+                }
+            } else if (! centerIsValid) {
+                weight = 0;
+            }
+            */
+
+            // reduce flicker in MIPs by radiance clamping
+            vec3 color = min(texelFetch(srcColor, srcCoord, srcMIP).rgb, 1.0);
+
+            // Ignore zeros, which are alomst always from non-reflective objects.
+            if (color.r + color.g + color.b == 0) {
+                weight = 0.0001;
+            }
+            dstColor += weight * color;
+            weightSum += weight;
+        }
+    }
+
+    dstColor *= (1.0 / max(0.0001, weightSum));
+    //dstNormalZ *= (1.0 / max(0.0001, posWeight));
+
+}

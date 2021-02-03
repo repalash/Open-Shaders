@@ -1,0 +1,15 @@
+#version 120 // -*- c++ -*-
+/**
+  \file GuiTheme_render.vrt
+
+  Apply texture.
+ */
+attribute vec4 g3d_Vertex;
+attribute vec2 g3d_TexCoord0;
+
+varying vec2 texCoord;
+
+void main() {
+    texCoord = g3d_TexCoord0.xy;
+    gl_Position = g3d_Vertex * gl_ModelViewProjectionMatrixTranspose;
+}

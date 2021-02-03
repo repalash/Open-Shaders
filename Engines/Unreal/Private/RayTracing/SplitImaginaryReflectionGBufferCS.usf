@@ -1,0 +1,63 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	SplitImaginaryReflectionGBufferCS.usf: Splits the non-normalized or averaged structured
+	buffer representing the imaginary reflection g-buffer into its respective textures while
+	also properly transforming them to a normalized or averaged texture encoded format.
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingReflectionsCommon.ush"
+
+uint UpscaleFactor;
+uint2 RayTracingResolution;
+
+StructuredBuffer<FImaginaryReflectionGBufferData> ImaginaryReflectionGBuffer;
+
+RWTexture2D<float4> ImaginaryReflectionGBufferA;
+RWTexture2D<float> ImaginaryReflectionDepthZ;
+RWTexture2D<float4> ImaginaryReflectionVelocity;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MainCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	// Note: This should match the same logic for getting the linear index as the reflection RGS
+	const uint2 PixelCoord = GetPixelCoord(DispatchThreadId + (uint2)View.ViewRectMin, UpscaleFactor);
+	const uint LinearIndex = PixelCoord.y * View.BufferSizeAndInvSize.x + PixelCoord.x;
+
+	if (DispatchThreadId.x >= RayTracingResolution.x || DispatchThreadId.y >= RayTracingResolution.y)
+	{
+		return;
+	}
+
+	// Get the original imaginary reflection g-buffer data
+	const FImaginaryReflectionGBufferData ImaginaryReflectionGBufferData = ImaginaryReflectionGBuffer[LinearIndex];
+
+	// Check if the resulting accumulation is valid or not
+	if (ImaginaryReflectionGBufferData.ValidSamples != 0)
+	{
+		// Check if the accumulated world normal is valid as it still can potentially be a zero vector from opposing sampled normals
+		const bool WorldNormalValid = !all(ImaginaryReflectionGBufferData.WorldNormal == float3(0.0f, 0.0f, 0.0f));
+
+		// Average and normalize the accumulated split components based on the number of valid samples
+		const float3 NormalizedWorldNormal = WorldNormalValid ? normalize(ImaginaryReflectionGBufferData.WorldNormal) : float3(0.0f, 0.0f, 0.0f);
+		const float AveragedSceneDepth = ImaginaryReflectionGBufferData.SceneDepth / (float)ImaginaryReflectionGBufferData.ValidSamples;
+		const float2 AveragedVelocity = ImaginaryReflectionGBufferData.Velocity / (float)ImaginaryReflectionGBufferData.ValidSamples;
+
+		// Encode split components to output formats and output
+		ImaginaryReflectionGBufferA[PixelCoord] = float4(EncodeNormal(NormalizedWorldNormal), 0.0f);
+		ImaginaryReflectionDepthZ[PixelCoord] = ConvertToDeviceZ(AveragedSceneDepth); // Output format expecting DeviceZ similar to a proper depth buffer
+		ImaginaryReflectionVelocity[PixelCoord] = EncodeVelocityToTexture(float4(AveragedVelocity, 0.0, 0.0));
+	}
+	else
+	{
+		// Output special invalid sample values
+		ImaginaryReflectionGBufferA[PixelCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		ImaginaryReflectionDepthZ[PixelCoord] = 0.0f;
+		ImaginaryReflectionVelocity[PixelCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	}
+}

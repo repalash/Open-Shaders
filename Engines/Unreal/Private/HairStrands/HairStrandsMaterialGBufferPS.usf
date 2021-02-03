@@ -1,0 +1,79 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsMaterialCommon.ush"
+#include "HairStrandsGBufferCommon.ush"
+
+#define INPUT_RASTER_MSAA 0
+#define INPUT_RASTER_COMPUTE 1
+
+void Main(
+	in float2 UV : TEXCOORD
+	, in float4 SvPosition: SV_Position
+	, out float4 OutGBufferA : SV_Target0
+	, out float4 OutGBufferB : SV_Target1
+	, out float4 OutGBufferC : SV_Target2
+	, out float4 OutGBufferD : SV_Target3
+	, out float4 OutGBufferE : SV_Target4
+	, out float4 OutVelocity : SV_Target5
+	, out float4 OutColor    : SV_Target6
+	, out float  OutDepth    : SV_DEPTH)
+{
+	ResolvedView = ResolveView();
+
+	const uint3 PixelCoord = uint3(floor(SvPosition.xy), 0);
+
+	FHairVisSample VisSample = (FHairVisSample)0;
+	float SampleDepth = 0;
+	bool bIsValid = false;
+	if (MaterialGBufferPassParameters.InputType == INPUT_RASTER_COMPUTE)
+	{
+		const uint2 PackedData = MaterialGBufferPassParameters.InRasterOutputVisibilityTexture.Load(PixelCoord);		
+		bIsValid = PackedData.x != GetInvalidHairPrimitiveId();
+		VisSample = UnpackHairVisSample(PackedData.x);
+		const float2 VisDepthAndCoverage = UnpackHairVisSampleDepth(PackedData.y);
+		SampleDepth = VisDepthAndCoverage.x;
+	}
+	else // if (MaterialGBufferPassParameters.InputType == INPUT_RASTER_MSAA)
+	{
+		const uint PackedData = MaterialGBufferPassParameters.InMSAAIDTexture.Load(PixelCoord);
+		bIsValid = PackedData != GetInvalidHairPrimitiveId();
+		VisSample = UnpackHairVisSample(PackedData);
+		SampleDepth = MaterialGBufferPassParameters.InMSAADepthTexture.Load(PixelCoord);
+	}
+
+	if (!bIsValid || VisSample.MaterialId != MaterialPass_MaterialId)
+	{
+		discard;
+	}
+	
+	const float PixelCoverage = TransmittanceToCoverage(MaterialGBufferPassParameters.InTransmittanceTexture.Load(PixelCoord), MaterialGBufferPassParameters.CoverageThreshold);
+	const float Dither = InterleavedGradientNoise(PixelCoord.xy, View.StateFrameIndexMod8);
+	if (Dither > PixelCoverage)
+	{
+		discard;
+	}
+
+	const float2 SamplePixelCoord = PixelCoord.xy + float2(0.5f, 0.5f);
+
+	const float SampleCoverage8bit = 1; // TODO?
+	FEvaluateOutput Out = Evaluate(SamplePixelCoord, SampleDepth, VisSample.PrimitiveId, SampleCoverage8bit, MaterialPass_PrimitiveId, false);
+	WriteGBuffer(
+		Out.NodeData.Tangent,
+		Out.NodeData.Specular,
+		Out.NodeData.BaseColor,
+		Out.NodeData.Roughness,
+		Out.NodeData.LightChannelMask,
+		Out.NodeData.Backlit,
+		SampleDepth,
+		Out.NodeVelocity,
+		OutGBufferA,
+		OutGBufferB,
+		OutGBufferC,
+		OutGBufferD,
+		OutGBufferE,
+		OutDepth,
+		OutVelocity);
+	OutColor = float4(0, 0, 0, 0);
+}
+
+

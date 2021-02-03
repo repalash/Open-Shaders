@@ -1,0 +1,382 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+Glossy.usf: Microfacet GGX BRDF sampling functions 
+===============================================================================================*/
+
+#pragma once
+
+
+bool IsNanOrNotFinite(float p)
+{
+	//return (!isfinite(p) || isnan(p));
+	// Work around lack of support fo isnan and isfinite in current compiler
+	return (asuint(p) & (0xFF << 23)) == (0xFF << 23);
+}
+
+float ClampIfInvalid(float p)
+{
+	return IsNanOrNotFinite(p) ? 10000000 : p;
+}
+
+float GetSpecularEventProbability(float3 SpecularColor, float NoV)
+{
+	float3 F = F_Schlick(SpecularColor, NoV);
+	return (F.x + F.y + F.z) / 3.f;
+}
+
+// G_SmithV predivided by 4*NoV*NoL. #dxr-todo: move to BRDF.ush?
+float PredividedG_SmithV(float a2, float NoV, const float NoL)
+{
+	const float G_SmithV = NoV + sqrt((NoV - NoV * a2) * NoV + a2);
+	return 0.5f / (G_SmithV * NoL);
+}
+
+float4 ImportanceSampleVisibleGGX_Aniso(float2 DiskE, float2 a2, float3 V)
+{
+	// TODO float2 alpha for anisotropic
+	float ax = sqrt(a2.x);
+	float ay = sqrt(a2.y);
+
+	// stretch
+	float3 Vh = normalize(float3(ax * V.x, ax * V.x, V.z));
+
+	// Orthonormal basis
+	// Tangent0 is orthogonal to N.
+	float3 Tangent0 = (Vh.z < 0.9999) ? normalize(cross(float3(0, 0, 1), Vh)) : float3(1, 0, 0);
+	float3 Tangent1 = cross(Vh, Tangent0);
+
+	float2 p = DiskE;
+	float s = 0.5 + 0.5 * Vh.z;
+	p.y = (1 - s) * sqrt(1 - p.x * p.x) + s * p.y;
+
+	float3 H;
+	H = p.x * Tangent0;
+	H += p.y * Tangent1;
+	H += sqrt(saturate(1 - dot(p, p))) * Vh;
+
+	// unstretch
+	H = normalize(float3(ax * H.x, ay * H.y, max(0.0, H.z)));
+
+	float NoV = V.z;
+	float NoH = H.z;
+	float VoH = dot(V, H);
+
+	float d = (NoH * a2 - NoH) * NoH + 1;
+	float D = a2 / (PI*d*d);
+
+	float G_SmithV = 2 * NoV / (NoV + sqrt(NoV * (NoV - NoV * a2) + a2));
+
+	float PDF = G_SmithV * VoH * D / NoV;
+
+	return float4(H, PDF);
+}
+
+float Glossy_Pdf(float3 IncomingDirection, float3 OutgoingDirection, FMaterialClosestHitPayload Payload)
+{
+	float3 SpecularColor = GetSpecularColor(Payload);
+
+	//-------
+	SpecularColor = float3(0, 1, 0);
+	//-------
+
+
+	float3 N_World = GetWorldNormal(Payload);
+	float Roughness = max(GetRoughness(Payload), GLOSSY_MIN_ROUGHNESS);
+
+	float3 V_World = normalize(-IncomingDirection);
+	float3 V = WorldToTangent(V_World, N_World);
+	float3 L = WorldToTangent(normalize(OutgoingDirection), N_World);
+
+	float NoV = V.z;
+	float NoL = L.z;
+
+	const float ProbSpecular = GetSpecularEventProbability(SpecularColor, NoV);
+
+	// Specular
+	float SpecularPdf = 0.0f;
+	float3 H = normalize(V + L);
+	float VoH = saturate(dot(V, H));
+	float NoH = saturate(H.z);
+
+	if (NoL * NoV > 0.0f && NoH > 0.0f)
+	{
+		if (Payload.HasAnisotropy())
+		{
+			float ax = 0;
+			float ay = 0;
+			GetAnisotropicRoughness(Roughness*Roughness, Payload.Anisotropy, ax, ay);
+
+			//#todo check energy normalization factor
+			float3 X = Payload.WorldTangent;
+			float3 Y = normalize(cross(N_World, X));
+			float3 H_World = TangentToWorld(H, N_World);
+
+			float XoH = saturate(dot(X, H_World));
+			float YoH = saturate(dot(Y, H_World));
+
+			float D = D_GGXaniso(ax, ay, NoH, XoH, YoH);
+
+			if (VoH > 0.0)
+			{
+				SpecularPdf = D * NoH / (4.0 * VoH);
+			}
+		}
+		else
+		{
+			float a2 = Pow4(Roughness);
+			float D = D_GGX(a2, NoH);
+			float G1 = PredividedG_SmithV(a2, abs(NoV), abs(NoL));
+
+			SpecularPdf = ClampIfInvalid(G1 * D);
+			SpecularPdf *= NoL;
+		}
+	}
+
+	// Diffuse 
+	float DiffusePdf = NoL / PI;
+
+	float OutPdf = ProbSpecular * SpecularPdf + (1.0f - ProbSpecular) * DiffusePdf;
+	return (OutPdf);
+}
+
+void Glossy_SampleMaterial(
+	float3 RayDirection,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	out float3 OutDirection,
+	out float3 OutThroughput,
+	out float OutPdf)
+{
+	OutDirection = float3(0, 0, 0);
+	OutThroughput = float3(0, 0, 0);
+	OutPdf = 0.0f;
+
+	float3 N_World = GetWorldNormal(Payload);
+
+	// Diffuse and Specular color are calculated in the payload unpacking, both depend on BaseColor and Metallic attributes
+	float3 DiffuseColor = GetDiffuseColor(Payload);
+	float3 SpecularColor = GetSpecularColor(Payload);
+	float Roughness = max(GetRoughness(Payload), GLOSSY_MIN_ROUGHNESS);
+
+	//-------
+	DiffuseColor = float3(0, 1, 0);
+	SpecularColor = float3(0, 1, 0);
+	//-------
+
+
+	float3 V_World = normalize(-RayDirection);
+	float3 V = WorldToTangent(V_World, N_World);
+	float3 L;
+
+	const float NoV = V.z;
+	const float ProbSpecular = GetSpecularEventProbability(SpecularColor, NoV); 
+
+	if ((RandSample.z <= ProbSpecular)) 
+	{	
+		bool Flip = V.z < 0.0f;
+
+		float4 ResGGX = 0;
+		float ax = 0;
+		float ay = 0;
+
+		if (Payload.HasAnisotropy())
+		{
+			GetAnisotropicRoughness(Roughness*Roughness, Payload.Anisotropy, ax, ay);
+
+			float2 a2 = float2(ax, ay);
+			ResGGX = ImportanceSampleVisibleGGX_Aniso(UniformSampleDisk(RandSample.xy), Pow4(Roughness), Flip ? -V : V);
+		}
+		else
+		{
+			ResGGX = ImportanceSampleVisibleGGX(UniformSampleDisk(RandSample.xy), Pow4(Roughness), Flip ? -V : V);
+		}
+
+		float3 H = ResGGX.xyz;
+		if (Flip)
+		{
+			H = -H; //Use ResGGX.w for the PDF?
+		}
+
+		L = 2 * dot(V, H) * H - V;
+
+		float NoL = L.z;
+		float NoV = V.z;
+		float NoH = H.z;
+
+		if (L.z < 0.0f || NoL * NoV <= 0.0f || NoH == 0.0f)
+		{
+			return;
+		}
+
+		float D = 0;
+		float G2 = 0;
+		float G1 = 0;
+
+		if (Payload.HasAnisotropy())
+		{
+			//#todo check energy normalization factor
+			
+			float3 X = Payload.WorldTangent;
+			float3 Y = normalize(cross(N_World, X));
+			float3 H_World = TangentToWorld(H, N_World);
+
+			float XoH = saturate(dot(X, H_World));
+			float YoH = saturate(dot(Y, H_World));
+			float XoV = saturate(dot(X, V_World));
+			float YoV = saturate(dot(Y, V_World));
+
+			//#todo: optimize, we are doing it twice. Work in world coords all the time
+			float3 L_World = TangentToWorld(L, N_World);
+
+			float XoL = saturate(dot(X, L_World));
+			float YoL = saturate(dot(Y, L_World));
+
+			D = D_GGXaniso(ax, ay, NoH, XoH, YoH);
+			G2 = Vis_SmithJointAniso(ax, ay, abs(NoV), abs(NoL), XoV, XoL, YoV, YoL);
+
+			float a2_NoAniso = Pow4(Roughness); //todo
+			G1 = PredividedG_SmithV(a2_NoAniso, abs(NoV), abs(NoL));
+		}
+		else
+		{
+			float a2 = Pow4(Roughness);
+			D = D_GGX(a2, NoH);
+			G2 = Vis_SmithJointApprox(a2, abs(NoV), abs(NoL));
+			G1 = PredividedG_SmithV(a2, abs(NoV), abs(NoL));
+		}
+
+		float3 F = F_Schlick(SpecularColor, dot(V, H));
+
+		OutPdf = ClampIfInvalid(G1 * D) * abs(NoL);
+		OutThroughput = F * ClampIfInvalid(G2 / G1);
+
+		OutThroughput /= ProbSpecular;
+		OutPdf *= ProbSpecular;
+	}
+	else 
+	{
+		float4 DiffuseSampledValue = CosineSampleHemisphere(RandSample.xy);
+		L = DiffuseSampledValue.xyz;
+		L.z = abs(L.z);
+
+		OutThroughput = DiffuseColor; // Compensated below 
+		OutPdf = DiffuseSampledValue.w;
+
+		OutThroughput /= 1.0f - ProbSpecular;
+		OutPdf *= 1.0f - ProbSpecular;
+	}
+
+	// Througput is already previdided by the PDF so it has to be compensated
+	OutThroughput *= OutPdf;
+
+	OutDirection = TangentToWorld(L, N_World);
+}
+
+
+void Glossy_EvalMaterial(
+	float3 IncomingDirection,
+	float3 OutgoingDirection,
+	FMaterialClosestHitPayload Payload,
+	out float3 OutThroughput,
+	out float OutPdf
+)
+{
+	float3 DiffuseColor = GetDiffuseColor(Payload);
+	float3 SpecularColor = GetSpecularColor(Payload);
+	float Roughness = max(GetRoughness(Payload), 0.001);
+
+	//-------
+	DiffuseColor = float3(0, 1, 0);
+	SpecularColor = float3(0, 1, 0);
+	//-------
+
+	float3 N_World = GetWorldNormal(Payload);
+	float3 V_World = normalize(-IncomingDirection);
+	float3 L_World = normalize(OutgoingDirection);
+
+	float3 V = WorldToTangent(V_World, N_World);
+	float3 L = WorldToTangent(L_World, N_World);
+
+	float NoV = V.z;
+	float NoL = L.z;
+
+	// Specular eval
+	float3 SpecularThroughput = float3(0, 0, 0);
+	float SpecularPdf = 0.0;
+	
+	float3 H = normalize(V + L);
+	float VoH = saturate(dot(V, H));
+	float NoH = saturate(H.z);
+
+	if (NoL * NoV > 0.0f && NoH > 0.0f)
+	{
+		float D = 0;
+		float G2 = 0;
+		float G1 = 0;
+
+		if (Payload.HasAnisotropy())
+		{
+			float ax = 0;
+			float ay = 0;
+			GetAnisotropicRoughness(Roughness*Roughness, Payload.Anisotropy, ax, ay);
+
+			//#todo check energy normalization factor
+
+			float3 X = Payload.WorldTangent;
+			float3 Y = normalize(cross(N_World, X));
+
+			float3 H_World = TangentToWorld(H, N_World);
+
+			float XoH = saturate(dot(X, H_World));
+			float YoH = saturate(dot(Y, H_World));
+			float XoV = saturate(dot(X, V_World));
+			float YoV = saturate(dot(Y, V_World));
+			//#todo check world vs local
+			float XoL = saturate(dot(X, L_World));
+			float YoL = saturate(dot(Y, L_World));
+
+			float D = D_GGXaniso(ax, ay, NoH, XoH, YoH);
+			float G2 = Vis_SmithJointAniso(ax, ay, abs(NoV), abs(NoL), XoV, XoL, YoV, YoL);
+
+			float a2 = Pow4(Roughness);
+			float G1 = PredividedG_SmithV(a2, abs(NoV), abs(NoL));
+		}
+		else
+		{
+			float a2 = Pow4(Roughness);
+			float D = D_GGX(a2, NoH);
+			float G2 = Vis_SmithJointApprox(a2, abs(NoV), abs(NoL));
+			float G1 = PredividedG_SmithV(a2, abs(NoV), abs(NoL));
+		}
+
+		SpecularThroughput = ClampIfInvalid(G2 * D);
+		SpecularPdf = ClampIfInvalid(G1 * D);
+		SpecularPdf *= NoL;
+
+		if (SpecularPdf != 0)
+		{
+			float3 F = F_Schlick(SpecularColor, VoH);
+			SpecularThroughput *= F;
+		}	
+	}
+	   
+	// Diffuse eval
+	float3 DiffuseThroughput = DiffuseColor / PI;
+	float DiffusePdf = NoL / PI;
+
+	// Add contributions
+	OutThroughput = (DiffuseThroughput + SpecularThroughput);
+
+	float ProbSpecular = GetSpecularEventProbability(SpecularColor, NoV);
+	OutPdf = ProbSpecular * SpecularPdf + (1.0f - ProbSpecular) * DiffusePdf;
+}
+
+
+
+
+
+
+
+
+

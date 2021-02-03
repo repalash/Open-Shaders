@@ -1,0 +1,208 @@
+#version 330
+/**
+  \file data-files/shader/BilateralFilter/BilateralFilter_apply.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include <GBuffer/GBuffer.glsl>
+#include <reconstructFromDepth.glsl>
+
+uniform_GBuffer(gbuffer_);
+
+#expect DEPTH_WEIGHT
+#expect NORMAL_WEIGHT
+#expect PLANE_WEIGHT
+#expect GLOSSY_WEIGHT
+#expect COMPUTE_PERCENT "integer screen fraction percent within which to render. Used for VR. <= 0 to disable"
+#expect R "integer between 1 and 6"
+
+uniform sampler2D source;
+uniform vec2 axis;
+
+out vec4 result;
+
+struct TapKey {
+#   if 1//(DEPTH_WEIGHT != 0.0) || (PLANE_WEIGHT != 0.0)
+        float csZ;
+#   endif
+
+#   if 1//PLANE_WEIGHT != 0.0
+        vec3 csPosition;
+#   endif
+
+#   if 1//NORMAL_WEIGHT != 0.0 || PLANE_WEIGHT != 0.0
+        vec3 normal;
+#   endif
+
+#   if 1//GLOSSY_WEIGHT != 0.0
+        float glossy;
+#   endif
+};
+
+TapKey getTapKey(ivec2 C, vec2 fragCoord) {
+    TapKey key;
+    if ((DEPTH_WEIGHT != 0.0) || (PLANE_WEIGHT != 0.0)) {
+        key.csZ = reconstructCSZ(texelFetch(gbuffer_DEPTH_buffer, C, 0).r, gbuffer_camera_clipInfo);
+    }
+
+    if (PLANE_WEIGHT != 0.0) {
+        key.csPosition = reconstructCSPosition(fragCoord.xy, key.csZ, gbuffer_camera_projInfo);
+    }
+
+    if ((NORMAL_WEIGHT != 0.0) || (PLANE_WEIGHT != 0.0)) {
+        key.normal = texelFetch(gbuffer_CS_NORMAL_buffer, C, 0).xyz * gbuffer_CS_NORMAL_readMultiplyFirst.xyz + gbuffer_CS_NORMAL_readAddSecond.xyz;
+    }
+
+    if (GLOSSY_WEIGHT != 0.0) {
+        key.glossy = texelFetch(gbuffer_GLOSSY_buffer, C, 0).a * gbuffer_GLOSSY_readMultiplyFirst.a + gbuffer_GLOSSY_readAddSecond.a;
+    }
+
+    return key;
+}
+
+float calculateBilateralWeight(TapKey center, TapKey tap) {
+
+    float depthWeight   = 1.0;
+    float normalWeight  = 1.0;
+    float planeWeight   = 1.0;
+    float glossyWeight  = 1.0;
+
+    if (DEPTH_WEIGHT != 0.0) {
+        depthWeight = max(0.0, 1.0 - abs(tap.csZ - center.csZ) * DEPTH_WEIGHT);
+    }
+
+    if (NORMAL_WEIGHT != 0.0) {
+        float normalCloseness = dot(tap.normal, center.normal);
+        normalCloseness = normalCloseness*normalCloseness;
+        normalCloseness = normalCloseness*normalCloseness;
+
+        float normalError = (1.0 - normalCloseness);
+        normalWeight = max((1.0 - normalError * NORMAL_WEIGHT), 0.00);
+    }
+
+
+    if (PLANE_WEIGHT != 0.0) {
+        float lowDistanceThreshold2 = 0.001;
+
+        // Change in position in camera space
+        vec3 dq = center.csPosition - tap.csPosition;
+
+        // How far away is this point from the original sample
+        // in camera space? (Max value is unbounded)
+        float distance2 = dot(dq, dq);
+
+        // How far off the expected plane (on the perpendicular) is this point?  Max value is unbounded.
+        float planeError = max(abs(dot(dq, tap.normal)), abs(dot(dq, center.normal)));
+
+        planeWeight = (distance2 < lowDistanceThreshold2) ? 1.0 :
+            pow(max(0.0, 1.0 - 2.0 * PLANE_WEIGHT * planeError / sqrt(distance2)), 2.0);
+    }
+
+    if (GLOSSY_WEIGHT != 0.0) {
+        float gDiff = abs(tap.glossy - center.glossy) * 10.0;
+        glossyWeight = max(0.0, 1.0 - (gDiff * GLOSSY_WEIGHT));
+    }
+
+    return depthWeight * normalWeight * planeWeight * glossyWeight;
+}
+
+
+void main() {
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            discard;
+            return;
+        }
+#   endif
+
+    float gaussian[R + 1];
+    //      if R == 0, we never call this shader
+#   if R == 1 // TODO: Actually calculate gaussian weights... this is just Mike winging it here
+        gaussian[0] = 0.5; gaussian[1] = 0.25;
+#   elif R == 2 // TODO: Actually calculate gaussian weights... this is just Mike winging it here
+        gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649;
+#   elif R == 3 // TODO: We are losing some base weight here...
+        gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649; gaussian[3] = 0.092902;  // stddev = 2.0
+#   elif R == 4 
+        gaussian[0] = 0.153170; gaussian[1] = 0.144893; gaussian[2] = 0.122649; gaussian[3] = 0.092902; gaussian[4] = 0.062970;  // stddev = 2.0
+#   elif R == 5 // TODO: We are losing some base weight here...
+        gaussian[0] = 0.111220; gaussian[1] = 0.107798; gaussian[2] = 0.098151; gaussian[3] = 0.083953; gaussian[4] = 0.067458; gaussian[5] = 0.050920;
+#   elif R == 6
+        gaussian[0] = 0.111220; gaussian[1] = 0.107798; gaussian[2] = 0.098151; gaussian[3] = 0.083953; gaussian[4] = 0.067458; gaussian[5] = 0.050920; gaussian[6] = 0.036108;
+#   else
+   // TODO
+#   endif
+
+    ivec2 ssC = ivec2(gl_FragCoord.xy);
+
+    vec4 value = texelFetch(source, ssC, 0);
+
+    // 0.0 = gaussian, 0.4 = more boxy
+    float weightOffset = 0.0;
+
+    float BASE = weightOffset + gaussian[0];
+    float totalWeight = BASE;
+
+    vec4 sum = value;
+    sum *= totalWeight;
+
+    TapKey key = getTapKey(ssC, gl_FragCoord.xy);
+
+    // Monotonic
+# if MDB_WEIGHTS == 0
+    for (int r = -R; r <= R; ++r) {
+        // We already handled the zero case above.  This loop should be unrolled and the static branch optimized out,
+        // so the IF statement has no runtime cost
+        if (r != 0) {
+            ivec2 tapOffset = ivec2(axis * r);
+            ivec2 tapLoc    = ssC + tapOffset;
+
+            TapKey tapKey = getTapKey(tapLoc, gl_FragCoord.xy + tapOffset);
+            float bilateralWeight = calculateBilateralWeight(key, tapKey);
+            float weight = (weightOffset + gaussian[abs(r)]) * bilateralWeight;
+            sum += texelFetch(source, tapLoc, 0) * weight;
+            totalWeight += weight;
+        }
+    }
+#   else 
+    float lastBilateralWeight = 999999.0;
+    for (int r = -1; r >= -R; --r) {
+        ivec2 tapOffset = ivec2(axis * r);
+        ivec2 tapLoc = ssC + tapOffset;
+
+        TapKey tapKey = getTapKey(tapLoc, gl_FragCoord.xy + tapOffset);
+        float bilateralWeight = calculateBilateralWeight(key, tapKey);
+        bilateralWeight = min(lastBilateralWeight, bilateralWeight);
+        lastBilateralWeight = bilateralWeight;
+
+        float weight = (weightOffset + gaussian[abs(r)]) * bilateralWeight;
+        sum += texelFetch(source, tapLoc, 0) * weight;
+        totalWeight += weight;
+    }
+
+    lastBilateralWeight = 9999.0;
+    for (int r = 1; r <= R; ++r) {
+        ivec2 tapOffset = ivec2(axis * r);
+        ivec2 tapLoc = ssC + tapOffset;
+
+        TapKey tapKey = getTapKey(tapLoc, gl_FragCoord.xy + tapOffset);
+        float bilateralWeight = calculateBilateralWeight(key, tapKey);
+        bilateralWeight = min(lastBilateralWeight, bilateralWeight);
+        lastBilateralWeight = bilateralWeight;
+
+        float weight = (weightOffset + gaussian[abs(r)]) * bilateralWeight;
+        sum += texelFetch(source, tapLoc, 0) * weight;
+        totalWeight += weight;
+    }
+#endif
+    // totalWeight >= gaussian[0], so no division by zero here
+    result = sum / totalWeight;
+}

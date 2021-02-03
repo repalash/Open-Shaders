@@ -1,0 +1,220 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayTracingSkyLightCommon.ush: Common functions for MipTree-based SkyLight visibility ray sampling
+===============================================================================================*/
+
+#pragma once
+
+#include "../MonteCarlo.ush"
+#include "SkyLightMipTreeCommon.ush"
+
+#define USE_MIP_PDF_TEXTURE 1
+#define USE_SOLID_ANGLE_TEXTURE 1
+
+float PdfSkyLightOcclusionRay(
+	float FaceCdf[7],
+	float3 WorldDirection
+)
+{
+	// Determine primary direction
+	uint MipCount = log2(SkyLight.MipDimensions.x);
+	uint3 TextureCoord = GetTextureCubeCoordinate(WorldDirection, SkyLight.TextureDimensions.xy);
+	float2 TextureUV = TextureCoord.xy / (float2)SkyLight.TextureDimensions.xy;
+	uint2 MipCoord = TextureUV * SkyLight.MipDimensions.xy;
+	float FacePdf = PdfFace(FaceCdf, TextureCoord.z);
+
+	uint StopLevel = min(SkyLight.SamplingStopLevel, MipCount);
+#if USE_MIP_PDF_TEXTURE
+	float MipPdf = PdfMipTree(uint3(MipCoord, TextureCoord.z), StopLevel);
+
+#if USE_SOLID_ANGLE_TEXTURE
+	uint LinearIndex = BufferOffsetAtPixel(MipCoord, StopLevel, SkyLight.MipDimensions.xy);
+	float AreaPdf = SkyLight.SolidAnglePdf[LinearIndex];
+#else
+	float AreaPdf = 1.0 / TexelCoordSolidAngle(MipCoord, DimensionsAtLevel(SkyLight.MipDimensions, StopLevel));
+#endif
+	return FacePdf * MipPdf * AreaPdf;
+#else
+	uint2 MipPixel = 0;
+	float MipPdf = 1.0;
+	for (uint Index = 0; Index < MipCount - StopLevel; ++Index)
+	{
+		// Build Cdf
+		uint MipIndex = MipCount - Index - 1;
+#if USE_MORTON_CODE
+		uint BufferOffset = BufferOffsetAtPixel(MipPixel, MipIndex, SkyLight.MipDimensions.xy);
+		uint4 BufferOffsets = uint4(BufferOffset, BufferOffset + 1, BufferOffset + 2, BufferOffset + 3);
+#else
+		uint4 BufferOffsets;
+		BufferOffsets.x = BufferOffsetAtPixel(MipPixel, MipIndex, SkyLight.MipDimensions.xy);
+		BufferOffsets.y = BufferOffsetAtPixel(MipPixel + uint2(1, 0), MipIndex, SkyLight.MipDimensions.xy);
+		BufferOffsets.z = BufferOffsetAtPixel(MipPixel + uint2(0, 1), MipIndex, SkyLight.MipDimensions.xy);
+		BufferOffsets.w = BufferOffsetAtPixel(MipPixel + uint2(1, 1), MipIndex, SkyLight.MipDimensions.xy);
+#endif
+		float4 Cdf = SampleMipTree(TextureCoord.z, BufferOffsets);
+		Cdf.y += Cdf.x;
+		Cdf.z += Cdf.y;
+		Cdf.w += Cdf.z;
+		Cdf /= Cdf.w;
+
+		// Determine texel choice
+		uint2 MipOffset = (MipCoord.xy >> MipIndex) - MipPixel;
+		uint LinearIndex = MipOffset.y << 1 | MipOffset.x;
+		
+		if (LinearIndex > 0)
+		{
+			MipPdf *= Cdf[LinearIndex] - Cdf[LinearIndex - 1] 
+		}
+		else
+		{
+			MipPdf *= Cdf[LinearIndex];
+		}
+
+		MipPixel += MipOffset;
+
+		MipPixel = MipPixel << 1;
+	}
+	MipPdf = max(MipPdf, 0.0);
+	// DEBUG: assert that PdfMipTree is equivalent for evaluating the decision tree..
+	//MipPdf = PdfMipTree(uint3(MipCoord, TextureCoord.z), StopLevel);
+
+#if USE_SOLID_ANGLE_TEXTURE
+	uint LinearIndex = BufferOffsetAtPixel(MipCoord, StopLevel, SkyLight.MipDimensions.xy);
+	float AreaPdf = SkyLight.SolidAnglePdf[LinearIndex];
+#else
+	float AreaPdf = 1.0 / TexelCoordSolidAngle(MipCoord, DimensionsAtLevel(SkyLight.MipDimensions.xy, StopLevel));
+#endif
+	return FacePdf * MipPdf * AreaPdf;
+#endif
+}
+
+bool GenerateSkyLightOcclusionRay(
+	float FaceCdf[7],
+	float3 RandSample,
+	out float3 RayDirection,
+	out float RayPdf
+)
+{
+	// Determine the appropriate face to use
+	uint MipCount = log2(SkyLight.MipDimensions.x);
+	float FacePdf = 0.0;
+	uint FaceIndex = SampleFace(FaceCdf, RandSample.x, FacePdf);
+
+	uint2 MipPixel = 0;
+	float MipPdf = 1.0;
+	uint StopLevel = min(SkyLight.SamplingStopLevel, MipCount);
+	for (uint Index = 0; Index < MipCount - StopLevel; ++Index)
+	{
+		uint MipIndex = MipCount - Index - 1;
+#if USE_MORTON_CODE
+		uint BufferOffset = BufferOffsetAtPixel(MipPixel, MipIndex, SkyLight.MipDimensions.xy);
+		uint4 BufferOffsets = uint4(BufferOffset, BufferOffset + 1, BufferOffset + 2, BufferOffset + 3);
+#else
+		uint4 BufferOffsets;
+		BufferOffsets.x = BufferOffsetAtPixel(MipPixel, MipIndex, SkyLight.MipDimensions);
+		BufferOffsets.y = BufferOffsetAtPixel(MipPixel + uint2(1, 0), MipIndex, SkyLight.MipDimensions.xy);
+		BufferOffsets.z = BufferOffsetAtPixel(MipPixel + uint2(0, 1), MipIndex, SkyLight.MipDimensions.xy);
+		BufferOffsets.w = BufferOffsetAtPixel(MipPixel + uint2(1, 1), MipIndex, SkyLight.MipDimensions.xy);
+#endif
+		float4 Cdf = SampleMipTree(FaceIndex, BufferOffsets);
+		Cdf.y += Cdf.x;
+		Cdf.z += Cdf.y;
+		Cdf.w += Cdf.z;
+		Cdf /= Cdf.w;
+
+		if (RandSample.y < Cdf.x)
+		{
+			MipPdf *= Cdf.x;
+			RandSample.y /= Cdf.x;
+		}
+		else if (RandSample.y < Cdf.y)
+		{
+			MipPdf *= Cdf.y - Cdf.x;
+			MipPixel.x += 1;
+			RandSample.y = (RandSample.y - Cdf.x) / (Cdf.y - Cdf.x);
+		}
+		else if (RandSample.y < Cdf.z)
+		{
+			MipPdf *= Cdf.z - Cdf.y;
+			MipPixel.y += 1;
+			RandSample.y = (RandSample.y - Cdf.y) / (Cdf.z - Cdf.y);
+		}
+		else // if (RandSample.y < Cdf.w)
+		{
+			MipPdf *= Cdf.w - Cdf.z;
+			MipPixel += 1;
+			RandSample.y = (RandSample.y - Cdf.z) / (Cdf.w - Cdf.z);
+		}
+
+		MipPixel = uint2(MipPixel.x << 1, MipPixel.y << 1);
+	}
+	MipPixel = uint2(MipPixel.x >> 1, MipPixel.y >> 1);
+
+	float2 PixelOffset = RandSample.yz;
+	float2 MipPixelUV = (MipPixel + PixelOffset) / float2(DimensionsAtLevel(SkyLight.MipDimensions.xy, StopLevel));
+
+	// Construct Cubemap coordinate
+	float3 TexelCoord = float3(MipPixelUV * SkyLight.TextureDimensions.xy, FaceIndex);
+
+	// Determine area pdf
+#if USE_SOLID_ANGLE_TEXTURE
+	uint LinearIndex = BufferOffsetAtPixel(MipPixel, StopLevel, SkyLight.MipDimensions.xy);
+	float AreaPdf = SkyLight.SolidAnglePdf[LinearIndex];
+#else
+	float AreaPdf = 1.0 / TexelCoordSolidAngle(MipPixel, DimensionsAtLevel(SkyLight.MipDimensions.xy, StopLevel));
+#endif
+
+	RayDirection = normalize(GetTextureCubeVector(TexelCoord, SkyLight.TextureDimensions.xy));
+	RayPdf = FacePdf * MipPdf * AreaPdf;
+
+	return true;
+}
+
+float PdfSphericalOcclusionRay(
+	float3 WorldDirection
+)
+{
+	float Pdf = 1.0 / (4.0 * PI);
+	return Pdf;
+}
+
+bool GenerateSphericalOcclusionRay(
+	float2 RandSample,
+	out float3 RayDirection,
+	out float RayPdf
+)
+{
+	// Perform uniform spherical sampling and convert to world-space
+	float4 Direction_World = UniformSampleSphere(RandSample);
+
+	RayDirection = Direction_World.xyz;
+	RayPdf = Direction_World.w;
+
+	return true;
+}
+
+float PdfCosineHemisphericalOcclusionRay(
+	float3 WorldNormal,
+	float3 WorldDirection
+)
+{
+	float Pdf = max(dot(WorldDirection, WorldNormal), 0.0) / PI;
+	return Pdf;
+}
+
+bool GenerateCosineHemisphericalOcclusionRay(
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayDirection,
+	out float RayPdf
+)
+{
+	// Perform cosine-hemispherical sampling
+	float4 Direction_World = CosineSampleHemisphere(RandSample, WorldNormal);
+
+	RayDirection = Direction_World.xyz;
+	RayPdf = Direction_World.w;
+
+	return true;
+}

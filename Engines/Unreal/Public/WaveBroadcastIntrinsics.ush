@@ -1,0 +1,196 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	WaveBroadcastIntrinsics.ush: Exposes intrisics to perform broadcasting
+	within lanes of a same wave.
+=============================================================================*/
+  
+#pragma once
+
+#include "Platform.ush"
+
+
+#define PLATFORM_SUPPORTS_WAVE_BROADCAST (COMPILER_SUPPORTS_WAVE_SWIZZLE_GCN)
+
+
+/** Different instruction available for WaveBroadcast() */
+	#define WAVE_BROADCAST_NOP 0
+	#if PLATFORM_SUPPORTS_WAVE_BROADCAST
+		#define WAVE_BROADCAST_SWAP_WITHIN_LANE_GROUP 1
+		#define WAVE_BROADCAST_LANE_GROUP 2
+	#endif
+
+/** Compile time structure to choose which broadcasting should be done. */
+struct FWaveBroadcastSettings
+{
+	// Broadcast operations.
+	uint Operation;
+
+	// Informations about the broadcast.
+	uint LaneGroupSize;
+	uint InnerLaneGroupSize;
+	uint InnerLaneGroupId;
+};
+
+/** Generic broadcast instruction. */
+uint WaveBroadcast(const FWaveBroadcastSettings Settings, uint x)
+{
+	if (0)
+	{
+		 return x;
+	}
+	#if PLATFORM_SUPPORTS_WAVE_BROADCAST
+	else if (Settings.Operation == WAVE_BROADCAST_SWAP_WITHIN_LANE_GROUP)
+	{
+		const uint and_mask = 0x1F;
+		const uint or_mask  = 0x00;
+		const uint xor_mask = Settings.LaneGroupSize >> 1;
+		return WaveLaneSwizzleGCN(x, and_mask, or_mask, xor_mask);
+	}
+	else if (Settings.Operation == WAVE_BROADCAST_LANE_GROUP)
+	{
+		const uint InnerGroupCount = Settings.LaneGroupSize / Settings.InnerLaneGroupSize;
+
+		const uint and_mask = ~((InnerGroupCount - 1) * Settings.InnerLaneGroupSize);
+		const uint or_mask  = Settings.InnerLaneGroupId * Settings.InnerLaneGroupSize;
+		const uint xor_mask = 0x00;
+		return WaveLaneSwizzleGCN(x, and_mask, or_mask, xor_mask);
+	}
+	#endif
+
+	return x;
+}
+
+int WaveBroadcast(const FWaveBroadcastSettings Settings, int x)
+{
+	return asint(WaveBroadcast(Settings, asuint(x)));
+} 
+
+float WaveBroadcast(const FWaveBroadcastSettings Settings, float x)
+{
+	return asfloat(WaveBroadcast(Settings, asuint(x)));
+}
+
+uint2 WaveBroadcast(const FWaveBroadcastSettings Settings, uint2 v)
+{
+	return uint2(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y));
+} 
+
+uint3 WaveBroadcast(const FWaveBroadcastSettings Settings, uint3 v)
+{
+	return uint3(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z));
+} 
+
+uint4 WaveBroadcast(const FWaveBroadcastSettings Settings, uint4 v)
+{
+	return uint4(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z),
+		WaveBroadcast(Settings, v.w));
+} 
+
+int2 WaveBroadcast(const FWaveBroadcastSettings Settings, int2 v)
+{
+	return int2(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y));
+} 
+
+int3 WaveBroadcast(const FWaveBroadcastSettings Settings, int3 v)
+{
+	return int3(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z));
+} 
+
+int4 WaveBroadcast(const FWaveBroadcastSettings Settings, int4 v)
+{
+	return int4(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z),
+		WaveBroadcast(Settings, v.w));
+} 
+
+float2 WaveBroadcast(const FWaveBroadcastSettings Settings, float2 v)
+{
+	return float2(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y));
+} 
+
+float3 WaveBroadcast(const FWaveBroadcastSettings Settings, float3 v)
+{
+	return float3(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z));
+} 
+
+float4 WaveBroadcast(const FWaveBroadcastSettings Settings, float4 v)
+{
+	return float4(
+		WaveBroadcast(Settings, v.x),
+		WaveBroadcast(Settings, v.y),
+		WaveBroadcast(Settings, v.z),
+		WaveBroadcast(Settings, v.w));
+} 
+
+
+
+
+#if PLATFORM_SUPPORTS_WAVE_BROADCAST
+
+/** Swap left lane with righ lanes within lane group (size is power of two in [2; 64]). 
+ *
+ *  If a lane is not active, the VGPR value returned is 0.
+ *
+ *  LaneGroupSize = 8
+ *  LaneId = 1
+ *
+ *         |  lane group (size=8)  |
+ *     x = | 0  1  2  3| 4  5  6  7| 8  9 ...
+ *
+ *  return | 4  5  6  7| 0  1  2  3|12 13 ...
+ */
+FWaveBroadcastSettings InitWaveSwapWithinLaneGroup(const uint LaneGroupSize)
+{
+	FWaveBroadcastSettings Settings;
+	Settings.Operation = WAVE_BROADCAST_SWAP_WITHIN_LANE_GROUP;
+	Settings.LaneGroupSize = LaneGroupSize;
+	Settings.InnerLaneGroupSize = 0;
+	Settings.InnerLaneGroupId = 0;
+	return Settings;
+}
+
+/**  Broadcast inner lane group over a lane group (size is power of two in [2; 64]).
+ *
+ *  If a lane is not active, the VGPR value returned is 0.
+ *
+ *  LaneGroupSize = 8
+ *  InnerLaneGroupSize = 2
+ *  InnerLaneGroupId = 1
+ *
+ *         |  lane group (size=8)  |
+ *     x = | 0  1  2  3  4  5  6  7| 8  9 ...
+ *
+ *  return | 2  3  2  3  2  3  2  3|10 11 ...
+ */
+FWaveBroadcastSettings InitWaveBroadcastLaneGroup(const uint LaneGroupSize, const uint InnerLaneGroupSize, const uint InnerLaneGroupId)
+{
+	FWaveBroadcastSettings Settings;
+	Settings.Operation = WAVE_BROADCAST_LANE_GROUP;
+	Settings.LaneGroupSize = LaneGroupSize;
+	Settings.InnerLaneGroupSize = InnerLaneGroupSize;
+	Settings.InnerLaneGroupId = InnerLaneGroupId;
+	return Settings;
+}
+
+#endif // PLATFORM_SUPPORTS_WAVE_BROADCAST

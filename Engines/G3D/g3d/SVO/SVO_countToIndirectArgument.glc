@@ -1,0 +1,67 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_countToIndirectArgument.glc
+
+  Computes (countBuffer[endIndex] - countBuffer[startIndex]) and then uses that
+  to produce the indirect buffer for dispatch/draw indirect calls.  If startIndex < 0,
+  considers countBuffer[startIndex] to be zero.
+
+  Requires BUFFER_WIDTH to be set to choose grid dimensions.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+
+//layout(r32ui) uniform uimageBuffer       countBuffer;
+
+layout(r32ui) uniform uimageBuffer       startIndexBuffer;
+layout(r32ui) uniform uimageBuffer       endIndexBuffer;
+
+uniform int                              startIndex;
+uniform int                              endIndex;
+
+#ifdef COMPUTE_DRAW_INDIRECT_BUFFER
+    uniform writeonly uimageBuffer       drawIndirectBuffer;
+#endif
+
+#   ifdef COMPUTE_DISPATCH_INDIRECT_BUFFER
+    /** How large are the work groups?  Assumes that workGroups are always 1 in the z dimension*/
+    uniform ivec2                        dispatchWorkGroupSize;
+    uniform int                          dispatchMaxWidth;
+     uniform writeonly uimageBuffer       dispatchIndirectBuffer;
+#endif
+
+void main() {
+    uint c = imageLoad(endIndexBuffer, endIndex).x;
+	uint offset = 0;
+    if (startIndex >= 0) {
+		offset = imageLoad(startIndexBuffer, startIndex).x;
+        c -= offset;
+    }
+   
+#   ifdef COMPUTE_DRAW_INDIRECT_BUFFER
+        // vertices, instances, vertex offset, 0
+        imageStore(drawIndirectBuffer, 0, uvec4(c));
+        imageStore(drawIndirectBuffer, 1, uvec4(1));
+        imageStore(drawIndirectBuffer, 2, uvec4(offset));
+        imageStore(drawIndirectBuffer, 3, uvec4(0));
+#   endif
+
+#   ifdef COMPUTE_DISPATCH_INDIRECT_BUFFER
+        // grid x, y, z
+        uint t = uint(ceil(c / float(dispatchWorkGroupSize.x)));
+        uint x = min(t, dispatchMaxWidth);
+        uint y = max(uint(ceil(float(t) / (x * dispatchWorkGroupSize.y))), 1);
+        uint z = 1;
+
+        imageStore(dispatchIndirectBuffer, 0, uvec4(x));
+        imageStore(dispatchIndirectBuffer, 1, uvec4(y));
+        imageStore(dispatchIndirectBuffer, 2, uvec4(z));
+		imageStore(dispatchIndirectBuffer, 3, uvec4( c ));	//4th element is count
+#   endif
+}

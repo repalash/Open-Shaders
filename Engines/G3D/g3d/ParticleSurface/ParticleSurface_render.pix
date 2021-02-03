@@ -1,0 +1,102 @@
+#version 410 or 460
+/**
+  \file data-files/shader/ParticleSurface/ParticleSurface_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#include <reconstructFromDepth.glsl>
+#include <UniversalMaterial/UniversalMaterial.glsl>
+#include <UniversalMaterial/UniversalMaterial_sample.glsl>
+
+#expect ALPHA_HINT "int"
+#expect TRANSPARENT_AS_OPAQUE "1 or 0; is this RenderPass::TRANSPARENT_AS_OPAQUE"
+
+uniform UniversalMaterial2DArray material;
+
+const float SOFT_PARTICLE_FADE_DISTANCE = 0.6;
+
+#if ! TRANSPARENT_AS_OPAQUE
+uniform sampler2D depthBuffer;
+uniform float3    clipInfo;
+#endif
+
+#include "ParticleSurface_helpers.glsl"
+in RenderGeometryOutputs geoOutputs;
+
+uniform float backgroundZ;
+uniform vec2 backSizeMeters;
+
+#ifdef WRITE_PIXEL_FILENAME
+#   include WRITE_PIXEL_FILENAME
+#else
+    out Color4 _result; void writePixel(Radiance3 premultipliedReflectionAndEmission, float coverage, Color3 transmissionCoefficient, float collimation, float etaRatio, Point3 csPosition, Vector3 csNormal) { _result = vec4(premultipliedReflectionAndEmission, coverage); }
+#endif
+
+float random(Point3 p) {
+    return frac(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3 + p.z * 1e2) * 1e3);
+}
+
+void main() {
+
+#   if ! TRANSPARENT_AS_OPAQUE
+    float depth = texelFetch(depthBuffer, int2(gl_FragCoord.xy), 0).r;
+    float opaqueCSZ = reconstructCSZ(depth, clipInfo);
+#   endif
+
+    Point3 offsetTexCoord = geoOutputs.texCoord;
+    Color3 lambertianColor;
+    float coverage = 1.0;
+    {
+        vec4 temp = sampleTexture(material.lambertian, offsetTexCoord);
+        lambertianColor = temp.rgb * invPi;
+        coverage = temp.a;
+    }
+
+    // Fade out by the missing precision in an 8-bit value, moving towards zero. 
+    float rnd = 0.5 / 256.0;// random(geoOutputs.csPosition) / 256.0;
+
+    // Screen door effect, but less temporal flicker:
+    // float rnd = random(gl_FragCoord.xyy) / 256.0;
+    coverage = clamp(coverage * geoOutputs.color.a * 257.0 / 256.0 - rnd, 0.0, 1.0);
+
+    // Switch to premultiplied alpha
+    Color4 finalColor = Color4(lambertianColor * geoOutputs.color.rgb * coverage, coverage); 
+
+    // Soft particle fade (must apply to color as well as alpha because everything is premultiplied)
+#   if ! TRANSPARENT_AS_OPAQUE
+        finalColor *= min(abs(opaqueCSZ - geoOutputs.csPosition.z) * (1.0 / SOFT_PARTICLE_FADE_DISTANCE), 1.0);
+#   endif
+    
+    Vector3 csNormal = Vector3(0, 0, 1);
+
+    Color3 transmissionColor = Color3(0.0);
+    float smoothness = 1.0;
+    
+    if (material.transmissive.notNull) {
+        // G3D BRDF rules: glossy overrides lambertian overrides reflectance along each channel.
+        // We use F instead of glossyColor because glossyColor incorporates the BRDF normalizing
+        // constant for the individual lobes.
+        transmissionColor = sampleTexture(material.transmissive, offsetTexCoord).rgb * (Color3(1.0)) * (Color3(1.0) - lambertianColor);
+    }
+
+    if (material.emissive.notNull) {
+        vec4 emissive = sampleTexture(material.emissive, offsetTexCoord);
+        finalColor.rgb += emissive.rgb * emissive.a;
+    }
+    
+    float etaRatio =
+#       ifdef REFRACTION
+            material.etaRatio;
+#       else
+            1.0;
+#       endif
+    writePixel(finalColor.rgb, finalColor.a, transmissionColor, smoothness, etaRatio, geoOutputs.csPosition, csNormal);
+    
+}
+    

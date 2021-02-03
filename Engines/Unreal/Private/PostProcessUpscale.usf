@@ -1,0 +1,282 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+#include "ScreenPass.ush"
+#include "PostProcessCommon.ush"
+#include "PaniniProjection.ush"
+#include "TextureSampling.ush"
+
+#define UPSCALE_METHOD_NEAREST 0
+#define UPSCALE_METHOD_BILINEAR 1
+#define UPSCALE_METHOD_DIRECTIONAL 2
+#define UPSCALE_METHOD_CATMULL_ROM 3
+#define UPSCALE_METHOD_LANCZOS 4
+#define UPSCALE_METHOD_GAUSSIAN 5
+#define UPSCALE_METHOD_SMOOTHSTEP 6
+
+// only for MainPS
+float UpscaleSoftness;
+
+// only for MainVS()
+// .x:HalfFOV .y:tan(HalfFov) .z:CylinderDistortion(0=none, 1:full) .w:Correction to scale Y the same as X is scaled in the center
+float Panini_D;
+float Panini_S;
+float Panini_ScreenPosScale;
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+
+// Point-sampled version (used on mobile). Needs to be a separate texture because of OpenGL fused samplers.
+Texture2D PointSceneColorTexture;
+SamplerState PointSceneColorSampler;
+
+//in a multiview case, PointSceneColorTexture is an array texture
+Texture2DArray PointSceneColorTextureArray;
+
+// to avoid compiler errors on the PS
+#ifndef TESS_RECT_X
+	#define TESS_RECT_X 1
+#endif
+#ifndef TESS_RECT_Y
+	#define TESS_RECT_Y 1
+#endif
+
+// Do a smoothstep(x) = 3 x^2 - 2 x^3
+float2 GetSmoothstepUV(float2 LinearUV, float2 TextureSize, float2 TextureInvSize)
+{
+	// Top left cornered pixel coordinate to sample.
+	float2 PixelCoord = LinearUV * TextureSize - 0.5;
+
+	// Index of the top left pixel used in the bilinear interpolation.
+	float2 TopLeftPixelCoord = floor(PixelCoord);
+
+	// Interpolation factors in the 2x2 quad.
+	float2 PixelInterp = PixelCoord - TopLeftPixelCoord;
+	
+	// New interpolation factors in the 2x2 quad with smoothstep.
+	float2 SmoothPixelInterp = PixelInterp * PixelInterp * (3 - 2 * PixelInterp);
+
+	// Returns new UV coordinate.
+	return TextureInvSize * (TopLeftPixelCoord + SmoothPixelInterp + 0.5);
+}
+
+float Luma(float3 Color) 
+{
+	// Rec 709 function for luma.
+	return dot(Color, float3(0.2126, 0.7152, 0.0722));
+}
+
+float Gaussian(float Scale, float2 Offset) 
+{
+	return exp2(Scale * dot(Offset, Offset));
+}
+
+// Panini projection in the screen pos
+// @param InScreenPos: the position to project in the screen space
+// @return the panini projected postion in screen space
+float2 PaniniProjectionScreenPos(float2 InScreenPos)
+{
+	const float2 ScreenSpaceToPaniniFactor = GetTanHalfFieldOfView();
+	const float2 PaniniToScreenSpaceFactor = GetCotanHalfFieldOfView();
+	const float2 PaniniDirection = InScreenPos * ScreenSpaceToPaniniFactor;
+	const float2 PaniniPosition = PaniniProjection(PaniniDirection, Panini_D, Panini_S);
+
+	// Return the new position back in the screen space frame
+	return PaniniPosition * PaniniToScreenSpaceFactor * Panini_ScreenPosScale;
+}
+
+// vertex shader entry point
+void MainVS(
+	in uint VertexId : SV_VertexID,
+	out noperspective float4 OutTexCoord : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION)
+{
+	// amount of Quads in X and Y, from GTesselatedScreenRectangleIndexBuffer
+	uint2 RectangleTessellation = uint2(TESS_RECT_X, TESS_RECT_Y);
+
+	float2 TexCoord = float2((uint)fmod(VertexId, (RectangleTessellation.x + 1)), VertexId / (RectangleTessellation.x + 1)) / float2(RectangleTessellation);
+
+	// still in 0..1 range
+	float4 Position = float4(TexCoord.x, TexCoord.y, 0, 1);
+
+	float2 PlanarScreenPos = TexCoord * 2 - 1;
+
+	// distort pos
+	Position.xy = PaniniProjectionScreenPos(PlanarScreenPos) * 0.5f + 0.5f;
+
+	DrawRectangle(Position, TexCoord, OutPosition, OutTexCoord.xy);
+	OutTexCoord.zw =  OutPosition.xy;
+}
+
+float3 SampleSceneColorRGB(float2 BufferUV)
+{
+	BufferUV = clamp(BufferUV, Input_UVViewportBilinearMin, Input_UVViewportBilinearMax);
+
+	return SceneColorTexture.SampleLevel(SceneColorSampler, BufferUV, 0).rgb;
+}
+
+void MainPS(noperspective float4 UVAndScreenPos : TEXCOORD0, float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	OutColor = 0;
+
+#if METHOD == UPSCALE_METHOD_NEAREST
+	// Nearest sampling (not blurry but blocky, more for testing)
+	#if ES3_1_PROFILE
+		#if MOBILE_MULTI_VIEW
+			OutColor = Texture2DArraySample(PointSceneColorTextureArray, PointSceneColorSampler, float3(UVAndScreenPos.xy,0));
+		#else
+			OutColor = Texture2DSample(PointSceneColorTexture, PointSceneColorSampler, UVAndScreenPos.xy);
+		#endif
+	#else
+		#if MOBILE_MULTI_VIEW
+			OutColor = PointSceneColorTextureArray.SampleLevel(PointSceneColorSampler, vec3(UVAndScreenPos.xy,0), 0, int2(0, 0));
+		#else
+			OutColor = PointSceneColorTexture.SampleLevel(PointSceneColorSampler, UVAndScreenPos.xy, 0, int2(0, 0));
+		#endif
+	#endif
+
+#elif METHOD == UPSCALE_METHOD_BILINEAR
+	// Bilinear (fast, aliasing)
+	OutColor.rgb = SampleSceneColorRGB(UVAndScreenPos.xy);
+
+#elif METHOD == UPSCALE_METHOD_DIRECTIONAL
+	// Directional blur with unsharp mask upsample.
+	float2 UV = UVAndScreenPos.xy;
+	float X = 0.5;
+	float3 ColorNW = SampleSceneColorRGB(UV + float2(-X, -X) * Input_ExtentInverse);
+	float3 ColorNE = SampleSceneColorRGB(UV + float2( X, -X) * Input_ExtentInverse);
+	float3 ColorSW = SampleSceneColorRGB(UV + float2(-X,  X) * Input_ExtentInverse);
+	float3 ColorSE = SampleSceneColorRGB(UV + float2( X,  X) * Input_ExtentInverse);
+	OutColor.rgb = (ColorNW * 0.25) + (ColorNE * 0.25) + (ColorSW * 0.25) + (ColorSE * 0.25);
+	
+	float LumaNW = Luma(ColorNW);
+	float LumaNE = Luma(ColorNE);
+	float LumaSW = Luma(ColorSW);
+	float LumaSE = Luma(ColorSE);
+
+	float2 IsoBrightnessDir;
+	float DirSWMinusNE = LumaSW - LumaNE;
+	float DirSEMinusNW = LumaSE - LumaNW;
+	IsoBrightnessDir.x = DirSWMinusNE + DirSEMinusNW;
+	IsoBrightnessDir.y = DirSWMinusNE - DirSEMinusNW;
+
+	// avoid NaN on zero vectors by adding 2^-24 (float ulp when length==1, and also minimum representable half)
+	IsoBrightnessDir = IsoBrightnessDir * (0.125 * rsqrt(dot(IsoBrightnessDir, IsoBrightnessDir) + 6e-8));
+
+	float3 ColorN = SampleSceneColorRGB(UV - IsoBrightnessDir * Input_ExtentInverse);
+	float3 ColorP = SampleSceneColorRGB(UV + IsoBrightnessDir * Input_ExtentInverse);
+
+	float UnsharpMask = 0.25;
+	OutColor.rgb = (ColorN + ColorP) * ((UnsharpMask + 1.0) * 0.5) - (OutColor.rgb * UnsharpMask);
+
+#elif METHOD == UPSCALE_METHOD_CATMULL_ROM
+	// Bicubic Catmull-Rom in five samples
+	FCatmullRomSamples Samples = GetBicubic2DCatmullRomSamples(UVAndScreenPos.xy, Input_Extent, Input_ExtentInverse);
+	for (uint i = 0; i < Samples.Count; i++)
+	{
+		OutColor.rgb += SampleSceneColorRGB(Samples.UV[i]) * Samples.Weight[i];
+	}
+	OutColor *= Samples.FinalMultiplier;
+
+#elif METHOD == UPSCALE_METHOD_LANCZOS
+	{
+		// Lanczos 3
+		float2 UV = UVAndScreenPos.xy * Input_Extent;
+		float2 tc = floor(UV - 0.5) + 0.5;
+		float2 f = UV - tc + 2;
+
+		// compute at f, f-1, f-2, f-3, f-4, and f-5 using trig angle addition
+		float2 fpi = f*PI, fpi3 = f * (PI / 3.0);
+		float2 sinfpi = sin(fpi), sinfpi3 = sin(fpi3), cosfpi3 = cos(fpi3);
+		const float r3 = sqrt(3.0);
+		float2 w0 = ( sinfpi *       sinfpi3              ) / ( f       * f       );
+		float2 w1 = (-sinfpi * (     sinfpi3 - r3*cosfpi3)) / ((f - 1.0)*(f - 1.0));
+		float2 w2 = ( sinfpi * (    -sinfpi3 - r3*cosfpi3)) / ((f - 2.0)*(f - 2.0));
+		float2 w3 = (-sinfpi * (-2.0*sinfpi3             )) / ((f - 3.0)*(f - 3.0));
+		float2 w4 = ( sinfpi * (    -sinfpi3 + r3*cosfpi3)) / ((f - 4.0)*(f - 4.0));
+		float2 w5 = (-sinfpi * (     sinfpi3 + r3*cosfpi3)) / ((f - 5.0)*(f - 5.0));
+
+		// use bilinear texture weights to merge center two samples in each dimension
+		float2 Weight[5];
+		Weight[0] = w0;
+		Weight[1] = w1;
+		Weight[2] = w2 + w3;
+		Weight[3] = w4;
+		Weight[4] = w5;
+
+		float2 Sample[5];
+		Sample[0] = Input_ExtentInverse * (tc - 2);
+		Sample[1] = Input_ExtentInverse * (tc - 1);
+		Sample[2] = Input_ExtentInverse * (tc + w3 / Weight[2]);
+		Sample[3] = Input_ExtentInverse * (tc + 2);
+		Sample[4] = Input_ExtentInverse * (tc + 3);
+
+		OutColor = 0;
+
+		// 5x5 footprint with corners dropped to give 13 texture taps
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[0].x, Sample[2].y)), 1) * Weight[0].x * Weight[2].y;
+
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[1].x, Sample[1].y)), 1) * Weight[1].x * Weight[1].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[1].x, Sample[2].y)), 1) * Weight[1].x * Weight[2].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[1].x, Sample[3].y)), 1) * Weight[1].x * Weight[3].y;
+
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[2].x, Sample[0].y)), 1) * Weight[2].x * Weight[0].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[2].x, Sample[1].y)), 1) * Weight[2].x * Weight[1].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[2].x, Sample[2].y)), 1) * Weight[2].x * Weight[2].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[2].x, Sample[3].y)), 1) * Weight[2].x * Weight[3].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[2].x, Sample[4].y)), 1) * Weight[2].x * Weight[4].y;
+
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[3].x, Sample[1].y)), 1) * Weight[3].x * Weight[1].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[3].x, Sample[2].y)), 1) * Weight[3].x * Weight[2].y;
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[3].x, Sample[3].y)), 1) * Weight[3].x * Weight[3].y;
+
+		OutColor += float4(SampleSceneColorRGB(float2(Sample[4].x, Sample[2].y)), 1) * Weight[4].x * Weight[2].y;
+
+		OutColor /= OutColor.w;
+	}
+
+#elif METHOD == UPSCALE_METHOD_GAUSSIAN
+	{
+		// Gaussian filtered unsharp mask
+		float2 UV = UVAndScreenPos.xy * Input_Extent;
+		float2 tc = floor(UV) + 0.5;
+
+		// estimate pixel value and derivatives
+		OutColor = 0;
+		float3 Laplacian = 0;
+		UNROLL for (int i = -3; i <= 2; ++i)
+		{
+			UNROLL for (int j = -3; j <= 2; ++j)
+			{
+				float2 TexelOffset = float2(i, j) + 0.5;
+
+				// skip corners: eliminated entirely by UNROLL
+				if (dot(TexelOffset, TexelOffset) > 9) continue;
+
+				float2 Texel = tc + TexelOffset;
+				float2 Offset = UV - Texel;
+				float OffsetSq = 2 * dot(Offset, Offset);	// texel loop is optimized for variance = 0.5
+				float Weight = exp(-0.5 * OffsetSq);
+				float4 Sample = Weight * float4(SampleSceneColorRGB(Texel * Input_ExtentInverse), 1);
+
+				OutColor += Sample;
+				Laplacian += Sample.rgb * (OffsetSq - 2);
+			}
+		}
+		OutColor /= OutColor.a;
+		Laplacian /= OutColor.a;
+
+		float UnsharpScale = UpscaleSoftness * (1 - Input_Extent.x * Input_Extent.y * Output_ViewportSizeInverse.x * Output_ViewportSizeInverse.y);
+		OutColor.rgb -= UnsharpScale * Laplacian;
+	}
+
+#elif METHOD == UPSCALE_METHOD_SMOOTHSTEP
+	// smooth step.
+	{
+		OutColor.rgb = SampleSceneColorRGB(GetSmoothstepUV(UVAndScreenPos.xy, Input_Extent, Input_ExtentInverse));
+	}
+#endif
+}

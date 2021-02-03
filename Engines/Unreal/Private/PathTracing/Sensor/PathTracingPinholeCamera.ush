@@ -1,0 +1,34 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingPinholeCamera.ush: Reference path tracing camera functions
+===============================================================================================*/
+
+#pragma once
+
+void PinholeCamera_SampleEmitter(
+	uint2 LaunchIndex,
+	inout RandomSequence RandSequence,
+	inout uint SampleIndex,
+	uint SourceEmitterId,
+	uint SensorId,
+	out RayDesc OutRay,
+	out uint2 OutPixel,
+	out float OutPdf
+)
+{
+	float2 RandSample = RandomSequence_GenerateSample2D(RandSequence, SampleIndex);
+	float2 ViewportUV = (LaunchIndex.xy + RandSample.xy) * View.BufferSizeAndInvSize.zw;
+
+	OutRay = CreatePrimaryRay(ViewportUV);
+	OutPixel = LaunchIndex.xy;
+	OutPdf = 1.0;
+}
+
+void PinholeCamera_PdfEmitter(
+	RayDesc Ray,
+	out float OutPdf
+)
+{
+	OutPdf = 1.0;
+}

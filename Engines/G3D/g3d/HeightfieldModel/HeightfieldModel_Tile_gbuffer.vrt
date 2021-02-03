@@ -1,0 +1,29 @@
+#version 330
+/**
+  \file data-files/shader/HeightfieldModel/HeightfieldModel_Tile_gbuffer.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <HeightfieldModel/HeightfieldModel_Tile_vertex.glsl>
+
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    uniform mat4x3      PreviousObjectToCameraMatrix;
+    out vec3			csPrevPosition;
+#endif
+
+void main() {
+    vec4 osVertex;
+    vec3 osNormal;
+    vec2 texCoord0;
+
+    TerrainTile_computeOSInput(osVertex, osNormal, texCoord0);
+
+#   if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+        csPrevPosition = (PreviousObjectToCameraMatrix * osVertex).xyz;
+#   endif
+
+    UniversalSurface_transform(osVertex, osNormal, vec4(0), texCoord0, vec2(0), vec4(0));
+}

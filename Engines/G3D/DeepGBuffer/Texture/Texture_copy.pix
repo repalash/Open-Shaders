@@ -1,0 +1,25 @@
+#version 120 // -*- c++ -*-
+
+/** 
+\file Texture_copy.pix 
+*/
+#include <compatibility.glsl>
+#expect DEPTH "1 if a depth buffer, 0 for a non-depth buffer"
+
+uniform sampler2D   src;
+uniform float       scale;
+uniform vec2        shift;
+
+#if (DEPTH == 0)
+    uniform int         mipLevel;
+#endif
+
+
+void main() {
+#   if (DEPTH == 1)
+        gl_FragDepth = texelFetch(src, ivec2(gl_FragCoord.xy * scale + shift), 0).r;
+#   else
+        gl_FragColor = texelFetch(src, ivec2(gl_FragCoord.xy * scale + shift), mipLevel);
+#   endif
+}
+

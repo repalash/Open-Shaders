@@ -1,0 +1,93 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+ReferencePathTracinPixelShader.ush: Reference path tracing  compositing pixel shader for progressive update.
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "Utilities/PathTracingFixedPointArithmetic.ush"
+
+Texture2D<uint> RadianceRedTexture;
+Texture2D<uint> RadianceGreenTexture;
+Texture2D<uint> RadianceBlueTexture;
+Texture2D<uint> RadianceAlphaTexture;
+Texture2D<uint> SampleCountTexture;
+
+Texture2D<float4> CumulativeIrradianceTexture;
+Texture2D<uint> CumulativeSampleCountTexture;
+
+// TODO: Make C1 continuous
+float TonemapGammaAndHDR(float Value)
+{
+	if (Value > 1.0)
+	{
+		Value = log(Value);
+	}
+	else
+	{
+		Value = pow(Value, 2.2);
+	}
+	return Value;
+}
+
+float NoTonemap(float Value)
+{
+	return Value;
+}
+
+float Tonemap(float Value)
+{
+	return TonemapGammaAndHDR(Value);
+}
+
+void CompositeMain(
+	in noperspective float2 UV : TEXCOORD0,
+	out float4 OutColor : SV_Target0,
+	out float4 OutCumulativeIrradiance : SV_Target1,
+	out uint OutCumulativeSampleCount : SV_Target2
+)
+{
+	float2 BufferSize = View.BufferSizeAndInvSize.xy;
+	int3 TexCoord = int3(UV * BufferSize, 0);
+
+	float RadianceRed = FixedPointToFloat(RadianceRedTexture.Load(TexCoord), 24);
+	float RadianceGreen = FixedPointToFloat(RadianceGreenTexture.Load(TexCoord), 24);
+	float RadianceBlue = FixedPointToFloat(RadianceBlueTexture.Load(TexCoord), 24);
+	float RadianceAlpha = FixedPointToFloat(RadianceAlphaTexture.Load(TexCoord), 24);
+	float4 Radiance = float4(RadianceRed, RadianceGreen, RadianceBlue, RadianceAlpha);
+	float SampleCount = SampleCountTexture.Load(TexCoord);
+
+	float4 CumulativeIrradiance = CumulativeIrradianceTexture.Load(TexCoord);
+	float CumulativeSampleCount = CumulativeSampleCountTexture.Load(TexCoord);
+
+	float CumulativeVariance = CumulativeIrradiance.a;
+
+	OutCumulativeSampleCount = CumulativeSampleCount + SampleCount;
+	OutCumulativeIrradiance.rgb = (CumulativeIrradiance.rgb * CumulativeSampleCount + Radiance.rgb) / OutCumulativeSampleCount;
+
+	float OutVariance = 0;
+	if (OutCumulativeSampleCount > 1 && OutCumulativeSampleCount < 4096)
+	{
+#if 0
+		// Per-sample variance
+		float IrradianceY = Tonemap(Luminance(Radiance));
+		float DeviationSquared = IrradianceY - Tonemap(Luminance(OutCumulativeIrradiance));
+#else
+		// Variance of the mean
+		float IrradianceY = Luminance(CumulativeIrradiance);
+		float DeviationSquared = IrradianceY - Luminance(OutCumulativeIrradiance);
+#endif
+		DeviationSquared *= DeviationSquared;
+		OutVariance = DeviationSquared;
+		if (CumulativeSampleCount > 0)
+		{
+			OutVariance += CumulativeVariance * (CumulativeSampleCount - 1);
+		}
+		OutVariance /= OutCumulativeSampleCount - 1;
+	}
+	OutCumulativeIrradiance.a = OutVariance;
+	OutColor = float4(OutCumulativeIrradiance.rgb * View.PreExposure, 1.0);
+
+	// To visualize the current frame:
+	// OutColor = float4(Irradiance.rgb / SampleCount, 1.0);
+}

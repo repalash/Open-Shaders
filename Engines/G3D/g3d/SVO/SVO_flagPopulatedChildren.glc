@@ -1,0 +1,167 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_flagPopulatedChildren.glc
+
+  Requires BUFFER_WIDTH = width, BUFFER_WIDTH_MASK = width - 1 and BUFFER_WIDTH_SHIFT = log_2(width) to be
+  passed, where width is a power of 2.
+
+  Requires WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+#extension GL_NV_shader_buffer_load : enable
+#extension GL_NV_gpu_shader5 : enable
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+
+#include <SVO/SVO.glsl>
+
+
+
+layout(r32ui) uniform uimageBuffer   fragmentCounter_buffer;
+
+
+/** RGBA32F world-space positions */
+uniform sampler2D                    SVO_POSITION_buffer;
+
+/** Pointers *to* this level are being written. */
+uniform int                          level;
+
+
+void main() {
+    // Coordinate in the buffer to read properties of this fragment
+    ivec2 coord = ivec2(WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y) * ivec2(gl_WorkGroupID.xy) + ivec2(gl_LocalInvocationID.xy);
+
+	int buffOffset = coord.x + coord.y * BUFFER_WIDTH;
+
+    if ( buffOffset<1 || buffOffset >= (imageLoad(fragmentCounter_buffer, 0).r) ) {
+        // Off the end of the fragment list
+        return;
+    }
+
+
+    // Normalized oct tree-space position on [0, 1]
+    vec3 S = texelFetch(SVO_POSITION_buffer, coord, 0).xyz;
+
+
+	if(	!(S.x>0.0f && S.x<1.0f &&
+		S.y>0.0f && S.y<1.0f &&
+		S.z>0.0f && S.z<1.0f) )
+		return;
+
+
+    int resolutionAtLevel = 1 << level;
+
+#if 0 //SVO_USE_BRICKS	//Should be default
+	vec3 posoffset = vec3(0.0);
+	//const float offsetval=1.0f/float(SVO_BRICK_RES);
+	float offsetval=1.0f/float(SVO_BRICK_RES);
+	if(level<(SVO_MAX_LEVEL-2))
+		offsetval=1.0f;
+	else if(level<(SVO_MAX_LEVEL-1))
+		offsetval=0.75;
+
+	/*float maxLevelRes=float(1<<SVO_MAX_LEVEL);
+	float levelRes=float(1<<level);
+	offsetval=(1.0f/levelRes)*maxLevelRes*0.25f;*/
+
+	const float maxOffset=0.0f;
+	for(posoffset.z=-offsetval; posoffset.z<=maxOffset; posoffset.z+=offsetval)
+	for(posoffset.y=-offsetval; posoffset.y<=maxOffset; posoffset.y+=offsetval)
+	for(posoffset.x=-offsetval; posoffset.x<=maxOffset; posoffset.x+=offsetval)
+	{
+
+		ivec3 voxelPosAtLevel = ivec3( S * float(resolutionAtLevel) + posoffset);
+#endif
+
+#if 1  ///New test OK 
+	ivec3 posoffset = ivec3(0);
+	float voxSizeAtMaxRes=1.0f/float(1<<SVO_MAX_LEVEL);
+
+	const int offsetval=1;
+	const int maxOffset=0;
+	for(posoffset.z=-offsetval; posoffset.z<=maxOffset; posoffset.z+=1)
+	for(posoffset.y=-offsetval; posoffset.y<=maxOffset; posoffset.y+=1)
+	for(posoffset.x=-offsetval; posoffset.x<=maxOffset; posoffset.x+=1)
+	{
+
+		ivec3 voxelPosAtLevel = ivec3( (S+vec3(posoffset)*voxSizeAtMaxRes) * float(resolutionAtLevel) ) ;
+#endif
+
+#if 0//Equalize each level
+	ivec3 posoffset = ivec3(0);
+	float voxSizeAtMaxRes=1.0f/float(1<<SVO_MAX_LEVEL);
+
+	const int offsetval=1;
+	const int maxOffset=0;
+	for(posoffset.z=-offsetval; posoffset.z<=maxOffset; posoffset.z+=1)
+	for(posoffset.y=-offsetval; posoffset.y<=maxOffset; posoffset.y+=1)
+	for(posoffset.x=-offsetval; posoffset.x<=maxOffset; posoffset.x+=1)
+	{
+
+		ivec3 voxelPosAtLevel = ivec3( (S) * float(resolutionAtLevel) ) + posoffset;
+#endif
+
+#if 0 //Simple no offset
+	{
+
+		ivec3 voxelPosAtLevel = ivec3( S * float(resolutionAtLevel) ) ;
+#endif
+
+
+		voxelPosAtLevel = clamp(voxelPosAtLevel, ivec3(0), ivec3(resolutionAtLevel));
+
+		// Traverse the tree to level - 1
+		int nodeIndex = (int)svoGetRootLocation(SVO_CUR_SVO_ID);
+		
+
+	#if 0
+		int offset = 0;
+
+		for (int curLevel = 1; curLevel <= level; ++curLevel) {
+			// Find the scalar offset within the node of the appropriate child 
+			// Wind through child pointers from (-x, -y, -z) to (+x, +y, +z)
+			ivec3 offsetInNode = (voxelPosAtLevel >> (level - curLevel)) & 1;
+			offset = (offsetInNode.z << 2) + (offsetInNode.y << 1) + offsetInNode.x;
+ 
+			if (curLevel < level ) {
+				// Advance into the child
+				nodeIndex = int(imageLoad(childIndexBuffer, offset + nodeIndex).r);
+
+				if(nodeIndex==0 || nodeIndex==0xFFFFFFFFU)
+					return;
+			}
+		}
+
+		nodeIndex += offset;
+	#else
+		SVO_LEVEL_VAR_TYPE outLevel;
+
+
+		//nodeIndex = svoTraverseOctreeDown(nodeIndex, 1, voxelPosAtLevel, level, outLevel);
+		nodeIndex = svoGetNodeIndex(level, voxelPosAtLevel, outLevel);
+		if(nodeIndex==0 || nodeIndex==0xFFFFFFFFU || outLevel!=level)
+			return;
+	#endif
+
+# ifndef DUMMY_PASS
+		// Flag the final node
+		imageStore(childIndexBuffer, nodeIndex, ivec4(POPULATED));
+# else
+		//In dummy pass, flag only if sub-nodes not already allocated
+		uint prevVal = imageLoad(childIndexBuffer, nodeIndex).x;
+		if(prevVal == 0){
+			imageStore(childIndexBuffer, nodeIndex, ivec4(POPULATED));
+		}
+# endif
+
+	}
+}

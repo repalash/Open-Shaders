@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+BuildMipTreeCS.usf: Build MipTree PDF structure
+===============================================================================================*/
+
+#include "../Common.ush"
+#include "SkyLightMipTreeCommon.ush"
+
+uint MipLevel;
+uint2 Dimensions;
+RWBuffer<float> RWSolidAnglePdf;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildSolidAnglePdfCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID
+)
+{
+	uint2 Pixel = DispatchThreadId.xy;
+	if (Pixel.x >= Dimensions.x || Pixel.y >= Dimensions.y)
+	{
+		return;
+	}
+
+	uint LinearIndex = BufferOffsetAtPixel(Pixel, MipLevel, Dimensions);
+	RWSolidAnglePdf[LinearIndex] = 1.0 / TexelCoordSolidAngle(Pixel, Dimensions);
+}

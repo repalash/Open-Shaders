@@ -1,0 +1,172 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=========================================================================
+	BurleyNormalizedSSSCommon.ush: Burley common functions.
+=========================================================================*/
+#pragma once
+
+#include "SubsurfaceProfileCommon.ush"
+
+#define BURLEY_MM_2_CM		0.1f
+#define BURLEY_CM_2_MM      10.0f
+
+//------------------------------------------------------------------------------------------
+// Consistent in BurleyNormalizedSSSCommon.ush and SubsurfaceProfile.cpp
+
+#define SSS_TYPE_BURLEY	    0
+#define SSS_TYPE_SSSS		1
+
+// Make sure UIMax|ClampMax of WorldUNitScale * ENC_WORLDUNITSCALE_IN_CM_TO_UNIT <= 1
+#define ENC_WORLDUNITSCALE_IN_CM_TO_UNIT 0.02f
+#define DEC_UNIT_TO_WORLDUNITSCALE_IN_CM 1/ENC_WORLDUNITSCALE_IN_CM_TO_UNIT
+
+// Make sure UIMax|ClampMax of DiffuseMeanFreePath * ENC_DIFFUSEMEANFREEPATH_IN_MM_TO_UNIT <= 1
+#define ENC_DIFFUSEMEANFREEPATH_IN_MM_TO_UNIT (0.01f*0.2f)
+#define DEC_UNIT_TO_DIFFUSEMEANFREEPATH_IN_MM 1/ENC_DIFFUSEMEANFREEPATH_IN_MM_TO_UNIT
+//------------------------------------------------------------------------------------------
+
+float DecodeWorldUnitScale(float EncodedWorldUnitScale)
+{
+	return EncodedWorldUnitScale * DEC_UNIT_TO_WORLDUNITSCALE_IN_CM;
+}
+
+float4 DecodeDiffuseMeanFreePath(float4 EncodedDiffuseMeanFreePath)
+{
+	return EncodedDiffuseMeanFreePath * DEC_UNIT_TO_DIFFUSEMEANFREEPATH_IN_MM;
+}
+
+bool GetSubsurfaceTransmittanceProfileUseBurley(uint SubsurfaceProfileInt)
+{
+	// 0..255, which SubSurface profile to pick
+	float Type = ActualSSProfilesTexture.Load(int3(SSSS_BOUNDARY_COLOR_BLEED_OFFSET, SubsurfaceProfileInt, 0)).a;
+
+	return abs(Type - SSS_TYPE_BURLEY) < 0.01f;
+}
+
+bool GetSubsurfaceProfileUseBurley(uint SubsurfaceProfileInt)
+{
+	// 0..255, which SubSurface profile to pick
+	float Type = ActualSSProfilesTexture.Load(int3(SSSS_BOUNDARY_COLOR_BLEED_OFFSET, SubsurfaceProfileInt, 0)).a;
+
+	return abs(Type - SSS_TYPE_BURLEY) < 0.01f;
+}
+
+bool GetSubsurfaceProfileUseBurley(float2 BufferUV)
+{
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(BufferUV);
+	uint SubsurfaceProfileInt = ExtractSubsurfaceProfileInt(ScreenSpaceData.GBuffer);
+	return GetSubsurfaceProfileUseBurley(SubsurfaceProfileInt);
+}
+
+bool GetSubsurfaceProfileUseSeparable(uint SubsurfaceProfileInt)
+{
+	// 0..255, which SubSurface profile to pick
+	float Type = ActualSSProfilesTexture.Load(int3(SSSS_BOUNDARY_COLOR_BLEED_OFFSET, SubsurfaceProfileInt, 0)).a;
+
+	return abs(Type - SSS_TYPE_SSSS) < 0.01f;
+}
+
+bool GetSubsurfaceProfileUseSeparable(float2 BufferUV)
+{
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(BufferUV);
+	uint SubsurfaceProfileInt = ExtractSubsurfaceProfileInt(ScreenSpaceData.GBuffer);
+	return GetSubsurfaceProfileUseSeparable(SubsurfaceProfileInt);
+}
+
+inline float3 Burley_Profile(float Radius, float3 Albedo, float3 S3D, float L)
+{   //R(r)r
+	float3 D = 1 / S3D;
+	float R = Radius / L;
+	const float Inv8Pi = 1.0 / (8 * PI);
+	float3 NegRbyD = -R / D;
+	return Albedo * max((exp(NegRbyD) + exp(NegRbyD / 3.0)) / (D*L)*Inv8Pi, 0);
+}
+
+//Diffuse profile basic formula
+//    D : shapes the height and width of the profile curve.
+//	  Radius : the distance between the entering surface point and the exit surface point.
+//Assume: r and d >0
+float GetDiffuseReflectProfile(float D, float Radius)
+{
+	//The diffuse reflectance profile:
+	//R(d,r) = \frac{e^{-r/d}+e^{-r/(3d)}}{8*pi*d*r}
+	const float Inv8Pi = 1.0 / (8 * PI);
+	float NegRbyD = -Radius / D;
+	return (exp(NegRbyD) + exp(NegRbyD / 3.0)) / (D*Radius)*Inv8Pi;
+}
+
+float3 GetDiffuseReflectProfileWithDiffuseMeanFreePath(float3 L, float3 S3D, float Radius)
+{
+	//rR(r)
+	float3 D = 1 / S3D;
+	float3 R = Radius / L;
+	const float Inv8Pi = 1.0 / (8 * PI);
+	float3 NegRbyD = -R / D;
+	return max((exp(NegRbyD) + exp(NegRbyD / 3.0)) / (D*L)*Inv8Pi, 0);
+}
+
+float GetComponentForScalingFactorEstimation(float4 SurfaceAlbedo)
+{
+	return SurfaceAlbedo.a;
+}
+
+float GetDiffuseMeanFreePathForSampling(float4 DiffuseMeanFreePath)
+{
+	return DiffuseMeanFreePath.a;
+}
+
+//-------------------------------------------------------------------------
+// Three scaling factor function
+// Method 1: The light directly goes into the volume in a direction perpendicular to the surface.
+// Average relative error: 5.5% (reference to MC)
+float GetPerpendicularScalingFactor(float SurfaceAlbedo)
+{
+	return 1.85 - SurfaceAlbedo + 7 * UnClampedPow(SurfaceAlbedo - 0.8, 3);
+}
+
+float3 GetPerpendicularScalingFactor3D(float3 SurfaceAlbedo)
+{
+	return 1.85 - SurfaceAlbedo + 7 * UnClampedPow(SurfaceAlbedo - 0.8, 3);
+}
+
+// Method 2: Ideal diffuse transmission at the surface. More appropriate for rough surface.
+// Average relative error: 3.9% (reference to MC)
+float GetDiffuseSurfaceScalingFactor(float SurfaceAlbedo)
+{
+	return 1.9 - SurfaceAlbedo + 3.5*(SurfaceAlbedo - 0.8)*(SurfaceAlbedo - 0.8);
+}
+
+float3 GetDiffuseSurfaceScalingFactor3D(float3 SurfaceAlbedo)
+{
+	return 1.9 - SurfaceAlbedo + 3.5*(SurfaceAlbedo - 0.8)*(SurfaceAlbedo - 0.8);
+}
+
+// Method 3: The spectral of diffuse mean free path on the surface.
+// Avergate relative error: 7.7% (reference to MC)
+float GetSearchLightDiffuseScalingFactor(float SurfaceAlbedo)
+{
+	return 3.5 + 100 * UnClampedPow(SurfaceAlbedo - 0.33, 4);
+}
+
+float3 GetSearchLightDiffuseScalingFactor3D(float3 SurfaceAlbedo)
+{
+	return 3.5 + 100.0 * UnClampedPow(max(SurfaceAlbedo - 0.33,0.0), 4.0);
+}
+
+//@TODO Revisit here after offline comparison.
+//call this function in TransmissionCommon.ush for Debug. No transmission tint is applied.
+float4 GetBurleyTransmissionProfile(FGBufferData GBufferData, float Thickness)
+{
+	// 0..255, which SubSurface profile to pick
+
+	uint SubsurfaceProfileInt = ExtractSubsurfaceProfileInt(GBufferData);
+	float WorldUnitScale = DecodeWorldUnitScale(ActualSSProfilesTexture.Load(int3(SSSS_SUBSURFACE_COLOR_OFFSET, SubsurfaceProfileInt,0)).a)*10.0f; //in cm. we do not multiply by 100.0f as we did in the subsurface shader.
+	float4 MeanFreePath = DecodeDiffuseMeanFreePath(ActualSSProfilesTexture.Load(int3(BSSS_DMFP_OFFSET, SubsurfaceProfileInt, 0)));
+	float3 SurfaceAlbedo = ActualSSProfilesTexture.Load(int3(BSSS_SURFACEALBEDO_OFFSET, SubsurfaceProfileInt, 0)).rgb;
+	float3 ScalingFactor = GetSearchLightDiffuseScalingFactor3D(SurfaceAlbedo);//assuming that the volume albedo is the same to the surface albedo for transmission;
+	float4 Output=float4(0,0,0,1);
+	
+	float3 r = Thickness / MeanFreePath.xyz;
+	Output.xyz= 0.25*SurfaceAlbedo*(exp(-ScalingFactor * r) + 3 * exp(-ScalingFactor * r / 3));
+	return Output;
+}

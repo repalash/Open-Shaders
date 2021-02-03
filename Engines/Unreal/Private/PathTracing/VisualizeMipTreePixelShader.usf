@@ -1,0 +1,43 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	VisualizeMipTrreePixelShader.usf: Interactive visualization of variance map.
+===============================================================================================*/
+
+#include "../Common.ush"
+
+uint3 Dimensions;
+Buffer<float> MipTree;
+
+uint2 DimensionsAtLevel(uint Level)
+{
+	return uint2(Dimensions.x >> Level, Dimensions.y >> Level);
+}
+
+uint BufferOffsetAtPixel(uint2 Pixel, uint Level)
+{
+	uint Offset = 0;
+	for (uint LevelIndex = 0; LevelIndex < Level; ++LevelIndex)
+	{
+		uint2 MipLevelDimensions = DimensionsAtLevel(LevelIndex);
+		Offset += MipLevelDimensions.x * MipLevelDimensions.y;
+	}
+
+	uint2 MipLevelDimensions = DimensionsAtLevel(Level);
+	Offset += Pixel.y * MipLevelDimensions.x + Pixel.x;
+	return Offset;
+}
+
+void VisualizeMipTreePS(
+	in noperspective float2 UV : TEXCOORD0,
+	out float4 OutColor : SV_Target0,
+	out float OutVariance : SV_Target1
+)
+{
+	uint MipLevel = 2;
+	uint2 TexCoord = UV * DimensionsAtLevel(MipLevel);
+	uint BufferOffset = BufferOffsetAtPixel(TexCoord, MipLevel);
+
+	OutColor = 0.f;
+	OutVariance = MipTree[BufferOffset];
+}

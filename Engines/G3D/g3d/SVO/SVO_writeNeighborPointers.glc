@@ -1,0 +1,95 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_writeNeighborPointers.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#extension GL_NV_gpu_shader5 : enable
+#extension GL_EXT_shader_image_load_store : enable
+#extension GL_EXT_bindable_uniform : enable
+#extension GL_NV_shader_buffer_load : enable
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+/** Used for reading the total thread count from the fourth element */
+layout(r32ui) uniform uimageBuffer   dispatchIndirectLevelBuffer;
+
+
+
+/** Level to render */
+uniform int             level;
+
+#include <SVO/SVO.glsl>
+
+
+void writeNeighbor(ivec3 voxelCoords, int nsTileIndex, int curNeighbor){
+	ivec3 tileOffset;
+	/*tileOffset.x= ((curNeighbor&3)==0 ? 1 : 0); // * -(curNeighbor&4);
+	tileOffset.y= ((curNeighbor&3)==1 ? 1 : 0); // * -(curNeighbor&4);
+	tileOffset.z= ((curNeighbor&3)==2 ? 1 : 0) ; //* -(curNeighbor&4);*/
+
+	if(curNeighbor==0)
+		tileOffset=ivec3(1, 0, 0);
+	else if(curNeighbor==1)
+		tileOffset=ivec3(0, 1, 0);
+	else
+		tileOffset=ivec3(0, 0, 1);
+
+	ivec3 neighborCoords=voxelCoords+tileOffset;
+	int startNodeIndex = (int)svoGetRootLocation(SVO_CUR_SVO_ID); 
+	SVO_LEVEL_VAR_TYPE startLevel=1; SVO_LEVEL_VAR_TYPE outLevel;
+	int neighborNodeIdx=svoTraverseOctreeDown(startNodeIndex, startLevel, neighborCoords, level, outLevel);
+
+	int neighborTileIdx;
+	if(outLevel==level && neighborNodeIdx!=0 && neighborNodeIdx!=0xFFFFFFFF){
+		neighborTileIdx=int( GLSL_GLOBAL_LOAD(d_childIndexBuffer+neighborNodeIdx) );
+
+		if(neighborTileIdx==0xFFFFFFFF)
+			neighborTileIdx=0;
+	}else{
+		neighborTileIdx=0;
+	}
+
+
+	d_neighborsIndexBuffer[nsTileIndex+curNeighbor] = neighborTileIdx;
+}
+
+void main() {
+
+	uint threadIndex = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * (WORK_GROUP_SIZE_X * WORK_GROUP_SIZE_Y) + gl_LocalInvocationID.x + gl_LocalInvocationID.y * WORK_GROUP_SIZE_X;
+	
+	uint numThreads = imageLoad(dispatchIndirectLevelBuffer, 3).r;
+    if (threadIndex >= numThreads) { return; }
+
+	uint nodeIndex = threadIndex + imageLoad(levelIndexBuffer, level-1).r;
+
+	//Bottom-up coordinates calculation
+
+	vec3  pos = vec3(0.0);
+	pos = svoGetPositionFromLevelIndex( level, int(nodeIndex) );
+
+	int levelRes=1<<level;
+	ivec3 voxelCoords= ivec3(pos*float(levelRes));
+
+	//
+
+	int tileIndex = int( GLSL_GLOBAL_LOAD(d_childIndexBuffer+nodeIndex) );
+
+	if(tileIndex!=0 && tileIndex!=0xFFFFFFFF){
+
+		int nsTileIndex = (tileIndex/8)*SVO_NUM_NEIGHBOR_POINTERS;
+
+		for(int n=0; n<SVO_NUM_NEIGHBOR_POINTERS; n++){
+			writeNeighbor(voxelCoords, nsTileIndex, n);
+		}
+	}
+
+
+}

@@ -1,0 +1,45 @@
+#version 330
+/**
+  \file data-files/shader/Texture/Texture_copy.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#expect DEPTH "1 if a depth buffer, 0 for a non-depth buffer"
+#expect IS_LAYERED "1 if source is a layered texture"
+
+uniform int layer;
+uniform sampler2DArray layeredSrc;
+uniform sampler2D   src;
+uniform float       scale;
+uniform vec2        shift;
+
+#if (DEPTH == 0)
+    uniform int         mipLevel;
+	out vec4 result;
+#endif
+
+
+void main() {
+    ivec2 ssC = ivec2(gl_FragCoord.xy * scale + shift);
+
+
+#   if (DEPTH == 1)
+#       if IS_LAYERED
+            gl_FragDepth = texelFetch(layeredSrc, ivec3(ssC, layer), 0).r;
+#       else
+            gl_FragDepth = texelFetch(src, ssC, 0).r;
+#       endif
+        
+#   else
+#       if IS_LAYERED
+            result = texelFetch(layeredSrc, ivec3(ssC, layer), mipLevel);
+#       else
+            result = texelFetch(src, ssC, mipLevel);
+#       endif
+#   endif
+}
+

@@ -1,0 +1,44 @@
+#version 430
+/**
+  \file data-files/shader/SVO/SVO_clearTree.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#extension GL_NV_gpu_shader5 : require
+#extension GL_NV_shader_thread_group : require
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+
+#include <SVO/SVO.glsl>
+
+
+
+
+void main() {
+
+
+	uint poolOffset = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * (WORK_GROUP_SIZE_X * WORK_GROUP_SIZE_Y) + gl_LocalInvocationID.x + gl_LocalInvocationID.y * WORK_GROUP_SIZE_X;
+
+
+#if 1 //clear
+	if(poolOffset<octreePoolNumNodes){
+		d_childIndexBuffer[poolOffset]		= 0;
+	}
+
+	if(poolOffset<(octreePoolNumNodes)/8){
+		d_parentIndexBuffer[poolOffset]	= 0;
+	}
+
+#else  //Init
+
+#endif
+
+}

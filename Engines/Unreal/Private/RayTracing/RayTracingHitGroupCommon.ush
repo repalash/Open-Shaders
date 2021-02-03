@@ -1,0 +1,111 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	RayTracingHitGroupCommon.ush: common header used in all hit group shaders
+=============================================================================*/
+
+#pragma once
+
+#ifndef RAYTRACINGHITGROUPCOMMON_USH_INCLUDED
+#define RAYTRACINGHITGROUPCOMMON_USH_INCLUDED // Workarround for UE-66460
+
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+#include "/Engine/Shared/RayTracingBuiltInResources.h"
+
+uint3 LoadIndices16Bit(ByteAddressBuffer SourceBuffer, uint OffsetInBytes)
+{
+	uint3 Result;
+
+	// ByteAddressBuffer loads must be aligned to DWORD boundary.
+	// We can load 2 DWORDs (4 SHORTs) at a time and extract 3 SHORTs (first 3 or second 3).
+	uint AlignedOffsetInBytes = OffsetInBytes & (~3);
+	const uint2 PackedIndices = SourceBuffer.Load2(AlignedOffsetInBytes);
+
+	if (AlignedOffsetInBytes == OffsetInBytes)
+	{
+		// Extract first 3 SHORTs from 2 DWORDs
+		Result[0] = PackedIndices[0] & 0xffff;
+		Result[1] = PackedIndices[0] >> 16;
+		Result[2] = PackedIndices[1] & 0xffff;
+	}
+	else
+	{
+		// Extract second 3 SHORTs from 2 DWORDs
+		Result[0] = PackedIndices[0] >> 16;
+		Result[1] = PackedIndices[1] & 0xffff;
+		Result[2] = PackedIndices[1] >> 16;
+	}
+
+	return Result;
+}
+
+uint3 LoadIndices32Bit(ByteAddressBuffer SourceBuffer, uint OffsetInBytes)
+{
+	return SourceBuffer.Load3(OffsetInBytes);
+}
+
+float3 LoadVertexPositionFloat3(ByteAddressBuffer SourceBuffer, uint Index, uint StrideInBytes)
+{
+	uint OffsetInBytes = Index * StrideInBytes;
+	return asfloat(SourceBuffer.Load3(OffsetInBytes));
+}
+
+// Explicitly declare "system" resources that will be available to all hit group shaders.
+
+struct FTriangleBaseAttributes
+{
+	uint3 Indices;
+	float3 LocalPositions[3];
+};
+
+FTriangleBaseAttributes LoadTriangleBaseAttributes(uint PrimitiveId)
+{
+	FTriangleBaseAttributes Result = (FTriangleBaseAttributes)0;
+
+	// Fetch vertex indices and positions, then compute local space normal and transform it to world space
+
+	const uint IndexBufferOffsetInBytes = HitGroupSystemRootConstants.IndexBufferOffsetInBytes;
+	const uint IndexBufferStride = HitGroupSystemRootConstants.GetIndexStride();
+	const uint BaseIndex = PrimitiveId * 3;
+
+	if (IndexBufferStride == 0)
+	{
+		// Non-indexed geometry (implicit triangle list indices)
+		Result.Indices = uint3(BaseIndex, BaseIndex + 1, BaseIndex + 2);
+	}
+	else if (IndexBufferStride == 2)
+	{
+		Result.Indices = LoadIndices16Bit(HitGroupSystemIndexBuffer, IndexBufferOffsetInBytes + BaseIndex * IndexBufferStride);
+	}
+	else
+	{
+		Result.Indices = LoadIndices32Bit(HitGroupSystemIndexBuffer, IndexBufferOffsetInBytes + BaseIndex * IndexBufferStride);
+	}
+
+	// Fetch vertex positions (in local space)
+	const uint VertexStride = HitGroupSystemRootConstants.GetVertexStride();
+
+	// #dxr_todo: UE-72160 handle various vertex formats, for now only supporting float3
+	Result.LocalPositions[0] = LoadVertexPositionFloat3(HitGroupSystemVertexBuffer, Result.Indices[0], VertexStride);
+	Result.LocalPositions[1] = LoadVertexPositionFloat3(HitGroupSystemVertexBuffer, Result.Indices[1], VertexStride);
+	Result.LocalPositions[2] = LoadVertexPositionFloat3(HitGroupSystemVertexBuffer, Result.Indices[2], VertexStride);
+
+	return Result;
+}
+
+uint GetInstanceUserData()
+{
+	return InstanceID();
+}
+
+uint GetHitGroupUserData()
+{
+	return HitGroupSystemRootConstants.UserData;
+}
+
+uint GetBaseInstanceIndex()
+{
+	return HitGroupSystemRootConstants.BaseInstanceIndex;
+}
+
+#endif // RAYTRACINGHITGROUPCOMMON_USH_INCLUDED // Workarround for UE-66460

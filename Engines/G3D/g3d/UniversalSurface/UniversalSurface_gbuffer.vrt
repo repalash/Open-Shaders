@@ -1,0 +1,72 @@
+#version 410
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_gbuffer.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <UniversalSurface/UniversalSurface_vertex.glsl>
+
+#expect HAS_BONES
+
+#if HAS_VERTEX_COLOR
+    in vec4 g3d_VertexColor;
+#else
+    const vec4 g3d_VertexColor = vec4(1.0);
+#endif
+
+
+// Fix some problems on Intel GPUs
+#define layout(ignore)
+
+#if HAS_BONES > 0
+    in vec4      g3d_BoneWeights;
+    in ivec4     g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+#   if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+        uniform sampler2D   prevBoneMatrixTexture;
+#   endif
+#endif
+
+#if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+    uniform mat4x3  PreviousObjectToCameraMatrix;
+    out layout(location=7) vec3 csPrevPosition;
+#endif
+
+void main(void) {
+    // Temporary variables needed because some drivers do not allow modifying attribute variables directly
+    vec4 vertex         = g3d_Vertex;
+    vec3 normal         = g3d_Normal;
+    vec4 packedTangent  = g3d_PackedTangent;
+    vec2 tex0           = g3d_TexCoord0;
+    vec2 tex1           = vec2(0);
+#   if defined(NUM_LIGHTMAP_DIRECTIONS) && (NUM_LIGHTMAP_DIRECTIONS > 0)
+        tex1 = g3d_TexCoord1;
+#   endif
+
+#   if defined(GBUFFER_HAS_CS_POSITION_CHANGE) || defined(GBUFFER_HAS_SS_POSITION_CHANGE)
+#       if HAS_BONES > 0
+            mat4 prevBoneTransform = UniversalSurface_getFullBoneTransform(g3d_BoneWeights, g3d_BoneIndices, prevBoneMatrixTexture);
+            csPrevPosition = (PreviousObjectToCameraMatrix * (prevBoneTransform * vertex)).xyz;
+#       else
+            csPrevPosition = (PreviousObjectToCameraMatrix * vertex).xyz;
+#       endif
+#   endif
+
+#   if HAS_BONES > 0
+        // This mutates vertex, normal, and packedTangent
+        UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, vertex, normal, packedTangent);
+#   endif
+
+    UniversalSurface_customOSVertexTransformation(vertex, normal, packedTangent, tex0, tex1);
+
+    UniversalSurface_transform(vertex, normal, packedTangent, tex0, tex1,
+#       if HAS_VERTEX_COLOR
+            g3d_VertexColor
+#       else
+            vec4(0)
+#       endif
+        );
+}

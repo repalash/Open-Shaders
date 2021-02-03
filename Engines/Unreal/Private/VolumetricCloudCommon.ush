@@ -1,0 +1,112 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/**
+ * VolumetricCloudCommon.usf: Common functions for passes using volumetric cloud data.
+ */
+
+
+
+#ifndef D_VOLUMETRIC_CLOUD_COMMON
+#define D_VOLUMETRIC_CLOUD_COMMON
+
+
+#define CENTIMETER_TO_METER		0.01f
+#define KILOMETER_TO_CENTIMETER	100000.0f
+#define KILOMETER_TO_METERS  	1000.0f
+#define CENTIMETER_TO_KILOMETER	(1.0f / KILOMETER_TO_CENTIMETER)
+
+
+// Uv in [0,1]
+// ZDepth = 1.0 for near clip plane (See FReversedZOrthoMatrix)
+// returns Position returns in centimeters
+float3 CloudShadowUvToWorldSpace(in float ZDepth, in float2 UV, in float4x4 WorldToLightClipShadowMatrixInv)
+{
+	const float NearZDepth = 1.0f; // using FReversedZOrthoMatrix
+	float4 ClipCoord = float4(UV * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), ZDepth, 1.0f);
+	float4 HomogeneousCoord = mul(ClipCoord, WorldToLightClipShadowMatrixInv);
+	float3 WorldPos = HomogeneousCoord.xyz / HomogeneousCoord.www;
+	return WorldPos;
+}
+
+
+
+// WorldSpace in centimeters
+// returns UV in [0,1]
+// returns UV in [0,1]
+float2 CloudShadowWorldSpaceToUv(in float3 WorldSpace, in float4x4 WorldToLightClipShadowMatrix, inout float z)
+{
+	float4 ClipSpace = mul(float4(WorldSpace, 1.0f), WorldToLightClipShadowMatrix);
+	ClipSpace /= ClipSpace.wwww;
+	z = ClipSpace.z;
+	float2 UVs = ClipSpace.xy;
+	UVs = 0.5f + float2(0.5f, -0.5f) * UVs;
+	return UVs;
+}
+
+
+
+// WorldSpace in centimeters
+// returns transmittance
+float GetCloudVolumetricShadow(in float3 WorldSpace, in float4x4 CloudShadowmapWorldToLightClipMatrix, in float ShadowmapFarDepthKm,
+	Texture2D<float3> VolumetricCloudShadowMapTexture, SamplerState VolumetricCloudShadowMapTextureSampler, inout float OutOpticalDepth)
+{
+	float CloudShadowSampleZ = 0.0f;
+	float2 UVs = CloudShadowWorldSpaceToUv(WorldSpace, CloudShadowmapWorldToLightClipMatrix, CloudShadowSampleZ);
+	const float3 CloudShadowData = VolumetricCloudShadowMapTexture.SampleLevel(VolumetricCloudShadowMapTextureSampler, UVs.xy, 0).rgb;
+	const float ShadowFrontDepthKm = CloudShadowData.r;	// unit kilometer
+	const float MeanExtinction = CloudShadowData.g;		// unit 1/m
+	const float MaxOpticalDepth = CloudShadowData.b;	// unitless
+	const float SampleDepthKm = saturate(1.0f - CloudShadowSampleZ) * ShadowmapFarDepthKm;
+	OutOpticalDepth = MeanExtinction * (max(0.0f, SampleDepthKm - ShadowFrontDepthKm) * KILOMETER_TO_METERS);
+	OutOpticalDepth = min(MaxOpticalDepth, OutOpticalDepth);
+	const float CloudShadowFactor = saturate(exp(-OutOpticalDepth));
+	return CloudShadowFactor;
+}
+
+
+
+
+
+
+
+float4 GetCloudLuminanceTransmittanceOverFog(
+	float4 NDC, float3 SampledWorldPos, float3 CameraWorldPos,
+	Texture2D<float4> VolumetricCloudColor, SamplerState VolumetricCloudColorSampler,
+	Texture2D<float4> VolumetricCloudDepth, SamplerState VolumetricCloudDepthSampler,
+	float OneOverPreExposure, float4 CurrentVertexFog)
+{
+	float2 ScreenUv = (NDC.xy / NDC.ww) * float2(0.5f, -0.5f) + 0.5f;
+
+	const float CloudFrontDepthKm = Texture2DSample(VolumetricCloudDepth, VolumetricCloudDepthSampler, ScreenUv).r;
+	const float DistanceFromCameraKm = length(SampledWorldPos.xyz - CameraWorldPos) * CENTIMETER_TO_KILOMETER;
+	const float DepthInsideKm = DistanceFromCameraKm - CloudFrontDepthKm;
+	float4 FinalFog = CurrentVertexFog;
+	if (DepthInsideKm > 0.0f)
+	{
+		float4 CloudFog = Texture2DSample(VolumetricCloudColor, VolumetricCloudColorSampler, ScreenUv);
+		CloudFog.rgb *= OneOverPreExposure;
+
+		const float SoftBlendingDistanceKm = 0.5f;// 500 meters
+		const float BlendFactor = saturate(DepthInsideKm / SoftBlendingDistanceKm);
+		const float4 FogToApplyUnder = CurrentVertexFog;
+		const float4 FogToApplyOver = lerp(float4(0.0, 0.0, 0.0, 1.0), CloudFog, BlendFactor);
+
+		// Apply any other fog under the cloud contribution because the cloud data alreayd has heightfog and aerial perspective applied on it.
+		// It is an approximation but it works well practically.
+		FinalFog.rgb = FogToApplyOver.rgb + FogToApplyUnder.rgb * FogToApplyOver.a;
+		// And combine both transmittance.
+		FinalFog.a = FogToApplyOver.a * FogToApplyUnder.a;
+	}
+
+	return FinalFog;
+}
+
+
+
+
+
+
+
+#endif // D_VOLUMETRIC_CLOUD_COMMON
+
+

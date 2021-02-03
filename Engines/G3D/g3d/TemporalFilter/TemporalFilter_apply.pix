@@ -1,0 +1,68 @@
+#version 330
+/**
+  \file data-files/shader/TemporalFilter/TemporalFilter_apply.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <reverseReprojection.glsl>
+#include <Texture/Texture.glsl>
+
+#expect FILTER_COMPONENT_COUNT "1, 2, 3, or 4"
+
+uniform_Texture(sampler2D, unfilteredValue_);
+uniform_Texture(sampler2D, ssVelocity_);
+uniform_Texture(sampler2D, depth_);
+uniform_Texture(sampler2D, previousDepth_);
+uniform_Texture(sampler2D, previousValue_);
+
+uniform mat4x3 cameraToWorld;
+uniform mat4x3 cameraToWorldPrevious;
+uniform vec3 clipInfo;
+uniform ProjInfo projInfo;
+uniform float hysteresis;
+uniform float falloffStartDistance;
+uniform float falloffEndDistance;
+uniform vec2 guardBandSize;
+
+out float4 result;
+
+void main() {
+    vec2 screenCoord = gl_FragCoord.xy;
+    ivec2 C = ivec2(screenCoord);
+    vec4 currentVal = texelFetch(unfilteredValue_buffer, C, 0);
+
+    vec2 ssV = texelFetch(ssVelocity_buffer, C, 0).rg * ssVelocity_readMultiplyFirst.xy + ssVelocity_readAddSecond.xy;
+
+    float depth = texelFetch(depth_buffer, C, 0).r;
+    vec3 currentWSPosition = reconstructWSPositionFromDepth(screenCoord, depth, projInfo, clipInfo, cameraToWorld);
+    float distance;
+    vec2 previousCoord = screenCoord - ssV;
+    if (previousCoord.x < guardBandSize.x || previousCoord.y < guardBandSize.y ||
+        previousCoord.x > unfilteredValue_size.x - guardBandSize.x || 
+        previousCoord.y > unfilteredValue_size.y - guardBandSize.y) { // outside guard band
+        result = currentVal;
+        return;
+    }
+
+    vec4 previousVal = reverseReprojection(screenCoord, currentWSPosition, ssV, previousValue_buffer, 
+                         previousDepth_buffer, unfilteredValue_invSize.xy, clipInfo, projInfo, cameraToWorldPrevious, distance);
+
+    float weight = hysteresis * (1.0 - smoothstep(falloffStartDistance, falloffEndDistance, distance));
+#   ifdef DEBUG
+    result = vec4(weight, 1.0);
+#   else
+        result = currentVal;
+#       if FILTER_COMPONENT_COUNT == 1
+            result.x = weight * previousVal.x + (1.0 - weight) * currentVal.x;
+#       elif FILTER_COMPONENT_COUNT == 2
+            result.xy = weight * previousVal.xy + (1.0 - weight) * currentVal.xy;
+#       elif FILTER_COMPONENT_COUNT == 3
+            result.xyz = weight * previousVal.xyz + (1.0 - weight) * currentVal.xyz;
+#       elif FILTER_COMPONENT_COUNT == 4
+            result = weight * previousVal + (1.0 - weight) * currentVal;
+#       endif
+#   endif
+}

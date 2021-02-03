@@ -1,0 +1,46 @@
+#version 410 or 460
+/**
+  \file data-files/shader/ParticleSurface/ParticleSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+
+/** x,y,z, angle */
+in float4       position;
+
+/** radius, coverage, userdata */
+in float3       shape;
+
+/** material layer index, texelWidth, flags, userdataInt */
+in int4         materialProperties;
+
+/** World space normal XYZ and W = confidence (0 = use billboard, 1 = use particle normal) */
+in float4       normal;
+
+/** World-space position of the center of the photon */
+layout(location = 0) out Point3  wsCenterVertexOutput;
+
+/** Radius of the bounding shape */
+layout(location = 1) out float3  shapeVertexOutput;
+
+layout(location = 2) out int4    materialPropertiesVertexOutput;
+layout(location = 3) out float   angleVertexOutput;
+layout(location = 4) out Vector3 normalVertexOutput;
+layout(location = 5) out float   normalWeightVertexOutput;
+
+void main() {
+    angleVertexOutput           = position[3];
+    shapeVertexOutput           = shape;
+    materialPropertiesVertexOutput = materialProperties;
+
+    normalVertexOutput          = g3d_WorldToCameraNormalMatrix * (2.0 * normal.xyz / 255.0 - 1.0);
+    normalWeightVertexOutput    = normal.w / 255.0;
+
+    // Undo gamma compression
+    wsCenterVertexOutput        = position.xyz;
+    gl_Position                 = float4(g3d_WorldToCameraMatrix * float4(position.xyz, 1.0), 1.0);
+}

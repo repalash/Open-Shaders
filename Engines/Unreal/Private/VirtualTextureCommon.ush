@@ -1,0 +1,685 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "Common.ush"
+#include "Random.ush"
+
+#ifndef NUM_VIRTUALTEXTURE_SAMPLES
+#error NUM_VIRTUALTEXTURE_SAMPLES should be set to the number of VT samples that will be done before including this file (exluding any lightmap samples)
+#endif
+
+#ifndef LIGHTMAP_VT_ENABLED
+#define LIGHTMAP_VT_ENABLED 0
+#endif
+
+/** Struct used to store feedback information in. */
+struct FVirtualTextureFeedbackParams
+{
+	uint Request;	// The tile to request for this pixel
+#if (NUM_VIRTUALTEXTURE_SAMPLES + LIGHTMAP_VT_ENABLED) > 1	
+	uint RequestId;	// The id of the VT texture sample this pixel will generate feedback for
+#endif	
+};
+
+/** Initializes the FVirtualTextureFeedbackParams for the pixel shader. */
+void InitializeVirtualTextureFeedback(in out FVirtualTextureFeedbackParams Params, uint2 SvPosition, uint FrameNumber)
+{
+#if (NUM_VIRTUALTEXTURE_SAMPLES + LIGHTMAP_VT_ENABLED) > 1
+	uint2 PixelPos = SvPosition;
+	PixelPos /= VIRTUAL_TEXTURE_FEEDBACK_FACTOR;
+	uint NumVTSamplesInShader = NUM_VIRTUALTEXTURE_SAMPLES + LIGHTMAP_VT_ENABLED;
+	Params.RequestId = (PixelPos.x + PixelPos.y * VIRTUAL_TEXTURE_FEEDBACK_FACTOR + FrameNumber) % NumVTSamplesInShader;
+	Params.Request = 0xFFFFFFFF;
+#else
+	Params.Request = 0xFFFFFFFF;	
+#endif	
+}
+
+/** Store feedback info for a VT request in the passed in FVirtualTextureFeedbackParams. */
+void StoreVirtualTextureFeedback(in out FVirtualTextureFeedbackParams Params, uint RequestId, uint Request)
+{
+#if (NUM_VIRTUALTEXTURE_SAMPLES + LIGHTMAP_VT_ENABLED) > 1
+	Params.Request = (RequestId == Params.RequestId) ? Request : Params.Request;
+#else
+	Params.Request = Request;	
+#endif
+}
+
+/** This should be called at the end of the pixel shader to write out the gathered VT feedback info to the OutputBuffer. */
+void FinalizeVirtualTextureFeedback(in FVirtualTextureFeedbackParams Params, float4 SvPosition, float Opacity, uint FrameNumber, RWBuffer<uint> OutputBuffer)
+{
+	uint2 PixelPos = SvPosition.xy;	
+	uint FeedbackPos = 0;
+	// This code will only run every few pixels...
+	[branch] if (((PixelPos.x | PixelPos.y) & (VIRTUAL_TEXTURE_FEEDBACK_FACTOR-1)) == 0)
+	{
+		// TODO use append buffer ?
+		PixelPos /= VIRTUAL_TEXTURE_FEEDBACK_FACTOR;
+		FeedbackPos = PixelPos.y*View.VirtualTextureFeedbackStride + PixelPos.x;
+
+		// When using DBuffer, feedback buffer is blending using decal opacity for opaque objects
+		// This way we avoid overwriting values already written to feedback buffer while rendering dbuffer decals
+#if MATERIALBLENDING_ANY_TRANSLUCENT || (USE_DBUFFER && MATERIALDECALRESPONSEMASK)
+
+		// Stochastic alpha testing
+#if  MATERIALBLENDING_ADDITIVE || MATERIALBLENDING_MODULATE
+		// Opacity may not make sense for additive and modulation blending
+		// Use a value of 0.25f so we have up to 4 layers of VT transparancy
+		const float Alpha = 0.25f;  
+#else
+		// Opacity values smaller/larger than the reciprocal of the downscale factor get clamped so at least one pixel will resolve
+		const float VTDownscaleEpsilon = 1.0f / VIRTUAL_TEXTURE_FEEDBACK_FACTOR;
+		const float Alpha =  clamp(Opacity, VTDownscaleEpsilon, 1.0f - VTDownscaleEpsilon);                  
+#endif
+        const float AlphaThreshold = frac( PseudoRandom(PixelPos) + // Random  value in 0-1 on 128 x 128 pixel grid
+											SvPosition.w + // Add in depth so we pick different thresholds on different depths 
+											(FrameNumber / (float)VIRTUAL_TEXTURE_FEEDBACK_FACTOR) // Add in framenumber for extra jitter so the pseudorandom pattern changes over time
+											);  
+											
+        // Threshold is uniform pseudo random this conditional has a higher probability to succeed for higher apha values
+        // that means more opaque surfaces get more pixels in the feedback buffer which is what we want
+        [branch] if (Alpha > AlphaThreshold)				
+        {
+            OutputBuffer[FeedbackPos] = Params.Request;
+        }     
+#else	
+		OutputBuffer[FeedbackPos] = Params.Request;
+#endif
+	}	
+}
+
+/**
+ * Address Mode Logic
+ * Apply before after calculating mip level/derivatives!
+ */
+
+#define VTADDRESSMODE_CLAMP 0u
+#define VTADDRESSMODE_WRAP 1u
+#define VTADDRESSMODE_MIRROR 2u
+
+float ApplyAddressModeMirror(float v)
+{
+	float t = frac(v * 0.5f) * 2.0f;
+	return 1.0f - abs(t - 1.0f);
+}
+
+float ApplyAddressMode(float v, uint AddressMode)
+{
+	// For CLAMP address mode, can't clamp to 1.0f, otherwise 'uint(UV * SizeInPages)' will overflow page table bounds by 1
+	// Instead, clamp to slightly below 1, this ensures that when rounded down to uint, above value will be at most 'SizeInPages - 1'
+	// The actual texel we clamp to doesn't matter too much for sampling physical texture, since we have borders around the physical pages
+	// Just need to make sure we don't clamp too far and chop off valid texels at the edge of texture
+	const float MaxTextureSize = 65536.0f;
+
+	if(AddressMode == VTADDRESSMODE_WRAP) return frac(v);
+	else if(AddressMode == VTADDRESSMODE_MIRROR) return ApplyAddressModeMirror(v);
+	else return clamp(v, 0.0f, 1.0f - (1.0f / MaxTextureSize));
+}
+
+float2 ApplyAddressMode(float2 UV, uint AddressU, uint AddressV)
+{
+	return float2(ApplyAddressMode(UV.x, AddressU), ApplyAddressMode(UV.y, AddressV));
+}
+
+/** Non aniso mip level calculation. */
+float MipLevel2D( float2 dUVdx, float2 dUVdy )
+{
+	const float px = dot( dUVdx, dUVdx );
+	const float py = dot( dUVdy, dUVdy );
+	return 0.5f * log2( max( px, py ) );
+}
+
+/** Aniso mip level calculation. */
+float MipLevelAniso2D( float2 dUVdx, float2 dUVdy, const float MaxAnisoLog2 )
+{
+	const float px = dot( dUVdx, dUVdx );
+	const float py = dot( dUVdy, dUVdy );
+
+	const float MinLevel = 0.5f * log2( min( px, py ) );
+	const float MaxLevel = 0.5f * log2( max( px, py ) );
+
+	const float AnisoBias = min( MaxLevel - MinLevel, MaxAnisoLog2 );
+	const float Level = MaxLevel - AnisoBias;
+	
+	return Level;
+}
+
+/** Unpacked contents of per page table uniforms. */
+struct VTPageTableUniform
+{
+	uint XOffsetInPages; // 12
+	uint YOffsetInPages; // 12
+	uint MaxLevel; // 4
+	uint vPageTableMipBias; // 8
+	uint ShiftedPageTableID; // 4
+	uint AdaptiveLevelBias; // 4
+
+	float2 SizeInPages;
+	float2 UVScale;
+	float MaxAnisoLog2;
+};
+
+/** Unpack the per page table uniforms. */
+VTPageTableUniform VTPageTableUniform_Unpack(uint4 PackedPageTableUniform0, uint4 PackedPageTableUniform1)
+{
+	VTPageTableUniform result;
+	result.UVScale = asfloat(PackedPageTableUniform0.xy);
+	result.SizeInPages = asfloat(PackedPageTableUniform0.zw);
+	result.MaxAnisoLog2 = asfloat(PackedPageTableUniform1.x);
+	result.XOffsetInPages = PackedPageTableUniform1.y & 0xfff;
+	result.YOffsetInPages = (PackedPageTableUniform1.y >> 12) & 0xfff;
+	result.vPageTableMipBias = (PackedPageTableUniform1.y >> 24) & 0xff;
+	result.MaxLevel = PackedPageTableUniform1.z & 0xf;
+	result.AdaptiveLevelBias = (PackedPageTableUniform1.z >> 4) & 0xf;
+	result.ShiftedPageTableID = PackedPageTableUniform1.w;
+	return result;
+}
+
+/** Structure carrying page table read result. Is passed as inout parameter and partially filled by several functions. */
+struct VTPageTableResult
+{
+	float2 UV;
+	float2 dUVdx;
+	float2 dUVdy;
+	uint4 PageTableValue[2];
+	uint PackedRequest;
+};
+
+/** Calculate mip level including stochastic noise. Also stores derivatives to OutResult for use when sampling physical texture. */
+int TextureComputeVirtualMipLevel(
+	in out VTPageTableResult OutResult,
+	float2 dUVdx, float2 dUVdy, float MipBias,
+	float2 SvPositionXY,
+	VTPageTableUniform PageTableUniform)
+{
+	OutResult.dUVdx = dUVdx * PageTableUniform.SizeInPages;
+	OutResult.dUVdy = dUVdy * PageTableUniform.SizeInPages;
+
+	const float Noise = InterleavedGradientNoise(SvPositionXY, View.StateFrameIndexMod8);
+	const float ComputedLevel = MipLevelAniso2D(OutResult.dUVdx, OutResult.dUVdy, PageTableUniform.MaxAnisoLog2) + MipBias + Noise * 0.5f - 0.25f;
+
+	return (int)floor(ComputedLevel) + int(PageTableUniform.vPageTableMipBias);
+}
+
+/** Samples page table indirection and any apply changes to UV, vLevel and PageTable information for adaptive page tables. */
+void ApplyAdaptivePageTableUniform(
+	Texture2D<uint> PageTableIndirection,
+	in out VTPageTableResult InOutResult,
+	in out VTPageTableUniform InOutPageTableUniform,
+	in out float2 UV,
+	in out int vLevel)
+{
+	if (vLevel < 0)
+	{
+		// Requested level not stored in low mips so find the adaptive page table entry for this UV.
+		float2 AdaptiveGridPos = UV * InOutPageTableUniform.SizeInPages;
+		int2 AdaptiveGridCoord = (int2)floor(AdaptiveGridPos);
+		float2 AdaptiveGridUV = frac(AdaptiveGridPos);
+		uint PackedAdaptiveDesc = PageTableIndirection.Load(int3(AdaptiveGridCoord, 0));
+
+		[branch]
+		if (PackedAdaptiveDesc != 0)
+		{
+			// A valid entry was found so apply changes.
+			InOutPageTableUniform.XOffsetInPages = PackedAdaptiveDesc & 0xfff;
+			InOutPageTableUniform.YOffsetInPages = (PackedAdaptiveDesc >> 12) & 0xfff;
+			InOutPageTableUniform.MaxLevel = (PackedAdaptiveDesc >> 24) & 0xf;
+			InOutPageTableUniform.SizeInPages = 1 << InOutPageTableUniform.MaxLevel;
+
+			vLevel += InOutPageTableUniform.MaxLevel;
+			InOutResult.dUVdx *= InOutPageTableUniform.SizeInPages;
+			InOutResult.dUVdy *= InOutPageTableUniform.SizeInPages;
+
+			UV = frac(AdaptiveGridPos);
+		}
+	}
+}
+
+/** Load from page table and store results. Single page table texture version. */
+void TextureLoadVirtualPageTableInternal(
+	in out VTPageTableResult OutResult,
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, int vLevel)
+{
+	OutResult.UV = UV * PageTableUniform.SizeInPages;
+
+	const uint vLevelClamped = clamp(vLevel, 0, int(PageTableUniform.MaxLevel));
+	const uint vPageX = (uint(OutResult.UV.x) + PageTableUniform.XOffsetInPages) >> vLevelClamped;
+	const uint vPageY = (uint(OutResult.UV.y) + PageTableUniform.YOffsetInPages) >> vLevelClamped;
+
+	OutResult.PageTableValue[0] = PageTable0.Load(int3(vPageX, vPageY, vLevelClamped));
+	OutResult.PageTableValue[1] = uint4(0u, 0u, 0u, 0u);
+
+	// PageTableID packed in upper 4 bits of 'PackedPageTableUniform', which is the bit position we want it in for PackedRequest as well, just need to mask off extra bits
+	OutResult.PackedRequest = PageTableUniform.ShiftedPageTableID;
+	OutResult.PackedRequest |= vPageX;
+	OutResult.PackedRequest |= vPageY << 12;
+
+	// Feedback always encodes vLevel+1, and subtracts 1 on the CPU side.
+	// This allows the CPU code to know when we requested a negative vLevel which indicates that we don't have sufficient virtual texture resolution.
+	const uint vLevelPlusOneClamped = clamp(vLevel + 1, 0, int(PageTableUniform.MaxLevel + 1));
+	OutResult.PackedRequest |= vLevelPlusOneClamped << 24;
+}
+
+/** Load from page table and store results. Two page table texture version. */
+void TextureLoadVirtualPageTableInternal(
+	in out VTPageTableResult OutResult,
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, int vLevel)
+{
+	OutResult.UV = UV * PageTableUniform.SizeInPages;
+
+	const uint vLevelClamped = clamp(vLevel, 0, int(PageTableUniform.MaxLevel));
+	const uint vPageX = (uint(OutResult.UV.x) + PageTableUniform.XOffsetInPages) >> vLevelClamped;
+	const uint vPageY = (uint(OutResult.UV.y) + PageTableUniform.YOffsetInPages) >> vLevelClamped;
+
+	OutResult.PageTableValue[0] = PageTable0.Load(int3(vPageX, vPageY, vLevelClamped));
+	OutResult.PageTableValue[1] = PageTable1.Load(int3(vPageX, vPageY, vLevelClamped));
+
+	// PageTableID packed in upper 4 bits of 'PackedPageTableUniform', which is the bit position we want it in for PackedRequest as well, just need to mask off extra bits
+	OutResult.PackedRequest = PageTableUniform.ShiftedPageTableID;
+	OutResult.PackedRequest |= vPageX;
+	OutResult.PackedRequest |= vPageY << 12;
+
+	// Feedback always encodes vLevel+1, and subtracts 1 on the CPU side.
+	// This allows the CPU code to know when we requested a negative vLevel which indicates that we don't have sufficient virtual texture resolution.
+	const uint vLevelPlusOneClamped = clamp(vLevel + 1, 0, int(PageTableUniform.MaxLevel + 1));
+	OutResult.PackedRequest |= vLevelPlusOneClamped << 24;
+}
+
+/**
+ * Public functions used by the material system to sample virtual textures.
+ * These boiler plate functions implement the used permutations from the matrix of sampling behaviours:
+ *  - One or two page table textures
+ *  - Sample(Bias)/SampleGrad/SampleLevel
+ *  - Adaptive page table indirection on or off
+ *  - Feedback on or off
+ *  - Anisotropic filtering on or off
+ */ 
+
+// LoadPageTable: 1 Page table
+VTPageTableResult TextureLoadVirtualPageTable(
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV, 
+	MaterialFloat MipBias, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = 0;
+#if PIXELSHADER
+	vLevel = TextureComputeVirtualMipLevel(Result, ddx(UV), ddy(UV), MipBias, SvPositionXY, PageTableUniform);
+#endif // PIXELSHADER
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, No feedback
+VTPageTableResult TextureLoadVirtualPageTable(
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV, 
+	MaterialFloat MipBias, float2 SvPositionXY)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = 0;
+#if PIXELSHADER
+	vLevel = TextureComputeVirtualMipLevel(Result, ddx(UV), ddy(UV), MipBias, SvPositionXY, PageTableUniform);
+#endif // PIXELSHADER
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	return Result;
+}
+
+// LoadPageTable: 2 Page tables
+VTPageTableResult TextureLoadVirtualPageTable(
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat MipBias, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = 0;
+#if PIXELSHADER
+	vLevel = TextureComputeVirtualMipLevel(Result, ddx(UV), ddy(UV), MipBias, SvPositionXY, PageTableUniform);
+#endif // PIXELSHADER
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTable1, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 2 Page tables, No feedback
+VTPageTableResult TextureLoadVirtualPageTable(
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat MipBias, float2 SvPositionXY)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = 0;
+#if PIXELSHADER
+	vLevel = TextureComputeVirtualMipLevel(Result, ddx(UV), ddy(UV), MipBias, SvPositionXY, PageTableUniform);
+#endif // PIXELSHADER
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTable1, PageTableUniform, UV, vLevel);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, SampleGrad
+VTPageTableResult TextureLoadVirtualPageTableGrad(
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat2 dUVdx, MaterialFloat2 dUVdy, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	int vLevel = TextureComputeVirtualMipLevel(Result, dUVdx * PageTableUniform.UVScale, dUVdy * PageTableUniform.UVScale, 0, SvPositionXY, PageTableUniform);
+	UV = UV * PageTableUniform.UVScale;
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 2 Page tables, SampleGrad
+VTPageTableResult TextureLoadVirtualPageTableGrad(
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat2 dUVdx, MaterialFloat2 dUVdy, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0.0f;
+	int vLevel = TextureComputeVirtualMipLevel(Result, dUVdx * PageTableUniform.UVScale, dUVdy * PageTableUniform.UVScale, 0, SvPositionXY, PageTableUniform);
+	UV = UV * PageTableUniform.UVScale;
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTable1, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, SampleLevel
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level, 
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = (int)floor(Level);
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, SampleLevel, No feedback
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = (int)floor(Level);
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	return Result;
+}
+
+// LoadPageTable: 2 Page tables, SampleLevel
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = (int)floor(Level);
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTable1, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 2 Page tables, SampleLevel, No feedback
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0, Texture2D<uint4> PageTable1,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = (int)floor(Level);
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTable1, PageTableUniform, UV, vLevel);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, Adaptive
+VTPageTableResult TextureLoadVirtualPageTable(
+	Texture2D<uint4> PageTable0,
+	Texture2D<uint> PageTableIndirection,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat MipBias, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	UV = UV * PageTableUniform.UVScale;
+	int vLevel = 0;
+#if PIXELSHADER
+	vLevel = TextureComputeVirtualMipLevel(Result, ddx(UV), ddy(UV), MipBias, SvPositionXY, PageTableUniform);
+#endif // PIXELSHADER
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	ApplyAdaptivePageTableUniform(PageTableIndirection, Result, PageTableUniform, UV, vLevel);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, Adaptive, SampleGrad
+VTPageTableResult TextureLoadVirtualPageTableGrad(
+	Texture2D<uint4> PageTable0,
+	Texture2D<uint> PageTableIndirection,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat2 dUVdx, MaterialFloat2 dUVdy, float2 SvPositionXY,
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	int vLevel = TextureComputeVirtualMipLevel(Result, dUVdx * PageTableUniform.UVScale, dUVdy * PageTableUniform.UVScale, 0, SvPositionXY, PageTableUniform);
+	UV = UV * PageTableUniform.UVScale;
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	ApplyAdaptivePageTableUniform(PageTableIndirection, Result, PageTableUniform, UV, vLevel);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, Adaptive, SampleLevel
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0,
+	Texture2D<uint> PageTableIndirection,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level, 
+	uint SampleIndex,
+	in out FVirtualTextureFeedbackParams Feedback)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	// Level is an index into the full size adaptive VT. AdaptiveLevelBias shifts it relative to the low mips allocated VT.
+	int vLevel = (int)floor(Level) - PageTableUniform.AdaptiveLevelBias;
+	UV = UV * PageTableUniform.UVScale;
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	ApplyAdaptivePageTableUniform(PageTableIndirection, Result, PageTableUniform, UV, vLevel);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	StoreVirtualTextureFeedback(Feedback, SampleIndex, Result.PackedRequest);
+	return Result;
+}
+
+// LoadPageTable: 1 Page table, Adaptive, SampleLevel, No feedback
+VTPageTableResult TextureLoadVirtualPageTableLevel(
+	Texture2D<uint4> PageTable0,
+	Texture2D<uint> PageTableIndirection,
+	VTPageTableUniform PageTableUniform,
+	float2 UV, uint AddressU, uint AddressV,
+	MaterialFloat Level)
+{
+	VTPageTableResult Result = (VTPageTableResult)0;
+	// Level is an index into the full size adaptive VT. AdaptiveLevelBias shifts it relative to the low mips allocated VT.
+	int vLevel = (int)floor(Level) - PageTableUniform.AdaptiveLevelBias;
+	UV = UV * PageTableUniform.UVScale;
+	UV = ApplyAddressMode(UV, AddressU, AddressV);
+	ApplyAdaptivePageTableUniform(PageTableIndirection, Result, PageTableUniform, UV, vLevel);
+	TextureLoadVirtualPageTableInternal(Result, PageTable0, PageTableUniform, UV, vLevel);
+	return Result;
+}
+
+/** Unpacked contents of per physical sample uniform. */
+struct VTUniform
+{
+	// Page sizes are scaled by RcpPhysicalTextureSize
+	float pPageSize;
+	float vPageSize;
+	float vPageBorderSize;
+	uint PageCoordinateBitCount;
+};
+
+/** Unpack the physical sample uniform. */
+VTUniform VTUniform_Unpack(uint4 PackedUniform)
+{
+	VTUniform result;
+	result.pPageSize = asfloat(PackedUniform.w);
+	result.vPageSize = asfloat(PackedUniform.y);
+	result.vPageBorderSize = asfloat(PackedUniform.z);
+	result.PageCoordinateBitCount = PackedUniform.x == 0 ? 8 : 6;
+	return result;
+}
+
+/** Applies proper scaling to dUVdx/dUVdy in PageTableResult. */
+float2 VTComputePhysicalUVs(in out VTPageTableResult PageTableResult, uint LayerIndex, VTUniform Uniform)
+{
+	const uint PackedPageTableValue = PageTableResult.PageTableValue[LayerIndex / 4u][LayerIndex & 3u];
+
+	// See packing in PageTableUpdate.usf
+	const uint vLevel = PackedPageTableValue & 0xf;
+	const float UVScale = 1.0f / (float)(1 << vLevel);
+	const float pPageX = (float)((PackedPageTableValue >> 4) & ((1 << Uniform.PageCoordinateBitCount) - 1));
+	const float pPageY = (float)(PackedPageTableValue >> (4 + Uniform.PageCoordinateBitCount));
+
+	const float2 vPageFrac = frac(PageTableResult.UV * UVScale);
+	const float2 pUV = float2(pPageX, pPageY) * Uniform.pPageSize + (vPageFrac * Uniform.vPageSize + Uniform.vPageBorderSize);
+
+	const float ddxyScale = UVScale * Uniform.vPageSize;
+	PageTableResult.dUVdx *= ddxyScale;
+	PageTableResult.dUVdy *= ddxyScale;
+	return pUV;
+}
+
+// SamplePhysicalTexture: Aniso On
+MaterialFloat4 TextureVirtualSample(
+	Texture2D Physical, SamplerState PhysicalSampler,
+	VTPageTableResult PageTableResult, uint LayerIndex,
+	VTUniform Uniform)
+{
+	const float2 pUV = VTComputePhysicalUVs(PageTableResult, LayerIndex, Uniform);
+	return Physical.SampleGrad(PhysicalSampler, pUV, PageTableResult.dUVdx, PageTableResult.dUVdy);
+}
+
+// SamplePhysicalTexture: Aniso Off
+MaterialFloat4 TextureVirtualSampleLevel(
+	Texture2D Physical, SamplerState PhysicalSampler,
+	VTPageTableResult PageTableResult, uint LayerIndex,
+	VTUniform Uniform)
+{
+	const float2 pUV = VTComputePhysicalUVs(PageTableResult, LayerIndex, Uniform);
+	// No need to apply dUVdx/dUVdy, don't support anisotropic when sampling a specific level
+	return Physical.SampleLevel(PhysicalSampler, pUV, 0.0f);
+}
+
+
+/**
+	Helper function to convert world space to virtual texture UV space
+	todo[vt]: For large worlds we will probably want to use position relative to Camera to avoid precision issues
+*/
+float2 VirtualTextureWorldToUV(in float3 WorldPos, in float3 Origin, in float3 U, in float3 V)
+{
+	float3 P = WorldPos - Origin;
+	return float2(dot(P, U), dot(P, V));
+}
+
+/** Unpack color from YCoCg stored in BC3. */
+float3 VirtualTextureUnpackBaseColorYCoCg(in float4 PackedValue)
+{
+	float Y = PackedValue.a;
+	float Scale = 1.f / ((255.f / 8.f) * PackedValue.b + 1.f);
+	float Co = (PackedValue.r - 128.f / 255.f) * Scale;
+	float Cg = (PackedValue.g - 128.f / 255.f) * Scale;
+	return float3(Y + Co - Cg, Y + Cg, Y - Co - Cg);
+}
+
+/** Generic normal unpack funtion. */
+float3 VirtualTextureUnpackNormal(in float2 PackedXY, in float PackedSignZ)
+{
+	float2 NormalXY = PackedXY * (255.f / 127.f) - 1.f;
+	float SignZ = PackedSignZ * 2.f - 1.f;
+	float NormalZ = sqrt(saturate(1.0f - dot(NormalXY, NormalXY))) * SignZ;
+	return float3(NormalXY, NormalZ);
+}
+
+/** Unpack normal from BC3. */
+float3 VirtualTextureUnpackNormalBC3(in float4 PackedValue)
+{
+	return VirtualTextureUnpackNormal(PackedValue.ag, 1.f);
+}
+
+/** Unpack normal from two BC3 textures. */
+float3 VirtualTextureUnpackNormalBC3BC3(in float4 PackedValue0, in float4 PackedValue1)
+{
+	return VirtualTextureUnpackNormal(float2(PackedValue0.a, PackedValue1.a), PackedValue1.b);
+}
+
+/** Unpack normal from BC5. */
+float3 VirtualTextureUnpackNormalBC5(in float4 PackedValue)
+{
+	return VirtualTextureUnpackNormal(PackedValue.rg, 1.f);
+}
+
+/** Unpack normal from BC5 and BC1 textures. */
+float3 VirtualTextureUnpackNormalBC5BC1(in float4 PackedValue0, in float4 PackedValue1)
+{
+	return VirtualTextureUnpackNormal(float2(PackedValue0.x, PackedValue0.y), PackedValue1.b);
+}
+
+/** Unpack 16 bit height (with some hardcoded range scale/bias). */
+float VirtualTextureUnpackHeight(in float4 PackedValue, in float2 UnpackHeightScaleBias)
+{
+	return PackedValue.r * UnpackHeightScaleBias.x + UnpackHeightScaleBias.y;
+}

@@ -1,0 +1,21 @@
+#version 150 compatibility
+uniform sampler2D WS_POSITION_buffer;
+uniform sampler2D LAMBERTIAN_buffer;
+uniform sampler2D SVO_POSITION_buffer;
+
+out vec3 color;
+
+void main() {
+	ivec2 coord = ivec2(gl_VertexID & (BUFFER_WIDTH-1), gl_VertexID/BUFFER_WIDTH );
+	
+    vec4 wPos = vec4(texelFetch(WS_POSITION_buffer, coord, 0).rgb, 1);
+	vec4 svoPos = vec4(texelFetch(SVO_POSITION_buffer, coord, 0).rgb, 1);
+    //color = texelFetch(LAMBERTIAN_buffer, coord, 0).rgb;
+	color = (svoPos.rgb)*1.0f;
+
+    //pos = gl_Vertex;
+	//gl_Position   = gl_ModelViewProjectionMatrix * wPos;
+	gl_Position   = gl_ModelViewProjectionMatrix * svoPos;
+
+    gl_ClipVertex = gl_ModelViewMatrix * wPos;
+}

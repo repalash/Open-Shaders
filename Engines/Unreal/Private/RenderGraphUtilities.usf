@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	RenderGraphUtilities.usf
+=============================================================================*/
+
+#include "Common.ush"
+
+Buffer<uint4> RectMinMaxBuffer;
+float2 InvViewSize;
+
+void RasterizeToRectsVS(
+	in uint InstanceId : SV_InstanceID,
+	in uint VertexId : SV_VertexID,
+	out float4 Position : SV_POSITION)
+{
+	uint4 RectMinMax = RectMinMaxBuffer[InstanceId];
+
+	uint2 RectMin = RectMinMax.xy;
+	uint2 RectMax = RectMinMax.zw;
+
+	uint2 VertexCoord;
+	VertexCoord.x = VertexId == 1 || VertexId == 2 || VertexId == 4 ? RectMax.x : RectMin.x;
+	VertexCoord.y = VertexId == 2 || VertexId == 4 || VertexId == 5 ? RectMax.y : RectMin.y;
+
+	Position = float4(float2(VertexCoord) * InvViewSize * float2(2.0f, -2.0f) + float2(-1.0, 1.0f), 0.0f, 1.0f);
+}

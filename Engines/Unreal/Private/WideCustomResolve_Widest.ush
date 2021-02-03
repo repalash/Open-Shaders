@@ -1,0 +1,111 @@
+//
+// This file has been automatically generated
+//
+
+#if MSAA_SAMPLE_COUNT == 2
+
+// filter=bspline, r=1.5 with cutoff=0.00784313725490196
+float3 resolve_bspline(uint2 pos)
+{
+	float3 sampleSum = 0;
+	float weightSum = 0;
+
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, -1), 0, 0.033501687796111256, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 0, 0.14105701296377302, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 0, 0.14105701296377302, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 0, 0.49682272453233683, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 1, 0.49682272453233683, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 1, 0.14105701296377302, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 1, 0.14105701296377302, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 1), 1, 0.033501687796111256, sampleSum, weightSum);
+	// 8 samples
+	return sampleSum / weightSum;
+}
+
+#endif /* MSAA2x */
+
+#if MSAA_SAMPLE_COUNT == 4
+
+// filter=bspline, r=1.5 with cutoff=0.00784313725490196
+float3 resolve_bspline(uint2 pos)
+{
+	float3 sampleSum = 0;
+	float weightSum = 0;
+
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, -1), 3, 0.03026498061452987, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 1, 0.012247827296542132, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 2, 0.06502405719651616, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 3, 0.2513298781328992, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, -1), 2, 0.03026498061452987, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 0, 0.012247827296542132, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 1, 0.2513298781328992, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 3, 0.06502405719651616, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 0, 0.4620897606520458, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 1, 0.4620897606520458, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 2, 0.4620897606520458, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 3, 0.4620897606520458, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 0, 0.06502405719651616, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 2, 0.2513298781328992, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 3, 0.012247827296542132, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 1), 1, 0.03026498061452987, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 0, 0.2513298781328992, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 1, 0.06502405719651616, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 2, 0.012247827296542132, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 1), 0, 0.03026498061452987, sampleSum, weightSum);
+	// 20 samples
+	return sampleSum / weightSum;
+}
+
+#endif /* MSAA4x */
+
+#if MSAA_SAMPLE_COUNT == 8
+
+// filter=bspline, r=1.5 with cutoff=0.00784313725490196
+float3 resolve_bspline(uint2 pos)
+{
+	float3 sampleSum = 0;
+	float weightSum = 0;
+
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, -1), 2, 0.0151784294879261, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, -1), 6, 0.0529585205376858, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 0, 0.0118670945196241, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 1, 0.12703584778653, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 2, 0.0529585205376858, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 4, 0.163230309170888, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 5, 0.017076788366456, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, -1), 6, 0.288719608867321, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, -1), 4, 0.0580625099705854, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, -1), 5, 0.0104325075823223, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 0, 0.0635774636374298, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 1, 0.029496277748209, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 2, 0.209355915537282, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 3, 0.00795620784362564, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 6, 0.0759697458319639, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 0), 7, 0.192774320783819, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 0, 0.606372331192617, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 1, 0.606372331192617, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 2, 0.524471790322168, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 3, 0.487920244335862, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 4, 0.421745772741109, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 5, 0.421745772741109, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 6, 0.391699895873873, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 0), 7, 0.266825955957159, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 0, 0.029496277748209, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 1, 0.0635774636374298, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 3, 0.0985375898198422, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 4, 0.163230309170888, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 0), 5, 0.31207800385627, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(-1, 1), 7, 0.138139207564974, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 0, 0.12703584778653, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 1, 0.0118670945196241, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 2, 0.0238877132042035, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 3, 0.192774320783819, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 5, 0.0398344323680373, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(0, 1), 7, 0.192774320783819, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 1), 3, 0.0326676614159454, sampleSum, weightSum);
+	LoadTexSampleAndWeight(Tex, pos + uint2(1, 1), 5, 0.026575186887922, sampleSum, weightSum);
+	// 38 samples
+	return sampleSum / weightSum;
+}
+
+#endif /* MSAA8x */

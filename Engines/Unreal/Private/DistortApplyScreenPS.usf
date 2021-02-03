@@ -1,0 +1,110 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+/*=============================================================================
+	DistortApplyScreenPixelShader.usf: Pixel shader for rendering screen distortion pass
+=============================================================================*/
+
+#include "Common.ush"
+#include "PostProcessCommon.ush"
+
+static const half InvDistortionScaleBias = 1 / 4.0f;
+
+/** 
+ * contains accumulated distortion values as 
+ * R=positive horizontal offset
+ * G=positive vertical offset
+ * B=negative horizontal offset
+ * A=negative vertical offset 
+ */
+
+Texture2D		SceneColorTexture;
+SamplerState	SceneColorTextureSampler;
+  
+ #if USE_MSAA
+Texture2DMS<float4> DistortionMSAATexture;
+Texture2DMS<float4> SceneColorMSAATexture;
+#else
+Texture2D		DistortionTexture;
+SamplerState	DistortionTextureSampler;
+#endif
+
+/** distorts screen texture using accumulated distortion offsets */
+void Main(
+	in noperspective float4 TexCoord: TEXCOORD0,
+	out float4 OutColor : SV_Target0
+#if USE_MSAA
+	, in uint SampleIndex : SV_SampleIndex
+#endif
+	)
+{
+	// sample accumulated distortion and apply inverse scale
+#if USE_MSAA
+	half4 AccumDist = DistortionMSAATexture.Load(int2(TexCoord.xy * View.BufferSizeAndInvSize.xy), SampleIndex);
+#else
+	half4 AccumDist = Texture2DSample(DistortionTexture,DistortionTextureSampler,TexCoord.xy);
+#endif
+
+	// apply inverse scale
+	// offset = [R-B,G-A] 
+	half2 DistBufferUVOffset = (AccumDist.rg - AccumDist.ba);
+
+	//Scale by the screen size and a fudge factor to come close to the offset values we would have had under normal circumstances before my changes. Also flip Y and invert the precision bias scale.
+	DistBufferUVOffset *= InvDistortionScaleBias;
+	
+	
+	float2 NewBufferUV = TexCoord.xy + DistBufferUVOffset;
+
+	// If we're about to sample outside the valid BufferUVMinMax, set to 0 distortion.
+	FLATTEN if ( NewBufferUV.x < View.BufferBilinearUVMinMax.x || NewBufferUV.x > View.BufferBilinearUVMinMax.z ||
+				 NewBufferUV.y < View.BufferBilinearUVMinMax.y || NewBufferUV.y > View.BufferBilinearUVMinMax.w )
+	{
+		NewBufferUV = TexCoord.xy;
+	}
+
+	// sample screen using offset coords
+#if USE_MSAA
+	OutColor = SceneColorMSAATexture.Load(int2(NewBufferUV * View.BufferSizeAndInvSize.xy), SampleIndex);
+#else
+	OutColor = Texture2DSample(SceneColorTexture, SceneColorTextureSampler, NewBufferUV);
+#endif
+}
+
+void Merge(
+	in noperspective float4 TexCoord: TEXCOORD0,
+	out float4 OutColor : SV_Target0
+#if USE_MSAA
+	, in uint SampleIndex : SV_SampleIndex
+#endif
+	)
+{
+#if USE_MSAA
+	OutColor = SceneColorMSAATexture.Load(int2(View.BufferSizeAndInvSize.xy * TexCoord.xy), SampleIndex);
+#else
+	OutColor = Texture2DSample(SceneColorTexture, SceneColorTextureSampler, TexCoord.xy);
+#endif
+}
+
+Texture2D		DistortionAccumulateTexture;
+SamplerState	DistortionAccumulateSampler;
+
+void Merge_Mobile(
+	in noperspective float4 TexCoord: TEXCOORD0,
+	out half4 OutColor : SV_Target0
+)
+{
+	half4 AccumDist = DistortionAccumulateTexture.Sample(DistortionAccumulateSampler, TexCoord.xy);
+	// apply inverse scale
+	// offset = [R-B,G-A] 
+	half2 DistBufferUVOffset = (AccumDist.rg - AccumDist.ba);
+	//Scale by the screen size and a fudge factor to come close to the offset values we would have had under normal circumstances before my changes. Also flip Y and invert the precision bias scale.
+	DistBufferUVOffset *= InvDistortionScaleBias;
+	float2 NewBufferUV = TexCoord.xy + DistBufferUVOffset;
+	// If we're about to sample outside the valid BufferUVMinMax, set to 0 distortion.
+	FLATTEN if ( NewBufferUV.x < View.BufferBilinearUVMinMax.x || NewBufferUV.x > View.BufferBilinearUVMinMax.z ||
+				 NewBufferUV.y < View.BufferBilinearUVMinMax.y || NewBufferUV.y > View.BufferBilinearUVMinMax.w )
+	{
+		NewBufferUV = TexCoord.xy;
+	}
+
+	OutColor = SceneColorTexture.Sample(SceneColorTextureSampler, NewBufferUV.xy);
+}
+

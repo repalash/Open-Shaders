@@ -1,0 +1,59 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/**
+ * LightmapData.ush
+ */
+
+#pragma once
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+
+// Must match FPrecomputedLightingUniformParameters in C++
+struct FLightmapSceneData
+{
+	float4 StaticShadowMapMasks;
+	float4 InvUniformPenumbraSizes;
+	float4 LightMapCoordinateScaleBias;
+	float4 ShadowMapCoordinateScaleBias;
+	float4 LightMapScale[2];
+	float4 LightMapAdd[2];
+	uint4 LightmapVTPackedPageTableUniform[2];
+	uint4 LightmapVTPackedUniform[5];
+};
+
+// Stride of a single lightmap data entry in float4's, must match C++
+#define LIGHTMAP_SCENE_DATA_STRIDE 15
+
+// Fetch from scene lightmap data buffer
+FLightmapSceneData GetLightmapData(uint LightmapDataIndex) 
+{
+	// Note: layout must match FLightmapSceneShaderData in C++
+	// Relying on optimizer to remove unused loads
+
+	FLightmapSceneData LightmapData;
+	uint LightmapDataBaseOffset = LightmapDataIndex * LIGHTMAP_SCENE_DATA_STRIDE;
+	LightmapData.StaticShadowMapMasks = View.LightmapSceneData[LightmapDataBaseOffset + 0];
+	LightmapData.InvUniformPenumbraSizes = View.LightmapSceneData[LightmapDataBaseOffset + 1];
+	LightmapData.LightMapCoordinateScaleBias = View.LightmapSceneData[LightmapDataBaseOffset + 2];
+	LightmapData.ShadowMapCoordinateScaleBias = View.LightmapSceneData[LightmapDataBaseOffset + 3];
+	LightmapData.LightMapScale[0] = View.LightmapSceneData[LightmapDataBaseOffset + 4];
+	LightmapData.LightMapScale[1] = View.LightmapSceneData[LightmapDataBaseOffset + 5];
+	LightmapData.LightMapAdd[0] = View.LightmapSceneData[LightmapDataBaseOffset + 6];
+	LightmapData.LightMapAdd[1] = View.LightmapSceneData[LightmapDataBaseOffset + 7];
+	LightmapData.LightmapVTPackedPageTableUniform[0] = asuint(View.LightmapSceneData[LightmapDataBaseOffset + 8]);
+	LightmapData.LightmapVTPackedPageTableUniform[1] = asuint(View.LightmapSceneData[LightmapDataBaseOffset + 9]);
+
+	for (uint i = 0u; i < 5u; ++i)
+	{
+		LightmapData.LightmapVTPackedUniform[i] = asuint(View.LightmapSceneData[LightmapDataBaseOffset + 10 + i]);
+	}
+
+	return LightmapData;
+}
+
+#else 
+
+// Route to uniform buffer
+#define GetLightmapData(x) PrecomputedLightingBuffer
+
+#endif

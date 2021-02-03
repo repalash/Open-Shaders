@@ -1,0 +1,150 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/**
+ * SceneData.ush
+ */
+// Whether to fetch primitive values (eg LocalToWorld) by dynamically indexing a scene-wide buffer, or to reference a single Primitive uniform buffer
+#define VF_USE_PRIMITIVE_SCENE_DATA ((FEATURE_LEVEL >= FEATURE_LEVEL_SM5 || FEATURE_LEVEL == FEATURE_LEVEL_ES3_1) && VF_SUPPORTS_PRIMITIVE_SCENE_DATA)
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+
+#define NUM_CUSTOM_PRIMITIVE_DATA 9 // Num float4s used for custom data. Must match FCustomPrimitiveData::NumCustomPrimitiveDataFloat4s in SceneTypes.h
+
+// Must match FPrimitiveUniformShaderParameters in C++
+struct FPrimitiveSceneData
+{
+	float4x4 LocalToWorld;
+	float4 InvNonUniformScaleAndDeterminantSign;
+	float4 ObjectWorldPositionAndRadius;
+	float4x4 WorldToLocal;
+	float4x4 PreviousLocalToWorld;
+	float4x4 PreviousWorldToLocal;
+	float3 ActorWorldPosition;
+	float UseSingleSampleShadowFromStationaryLights;
+	float3 ObjectBounds;
+	float LpvBiasMultiplier;
+	float DecalReceiverMask;
+	float PerObjectGBufferData;
+	float UseVolumetricLightmapShadowFromStationaryLights;
+	float DrawsVelocity;
+	float4 ObjectOrientation;
+	float4 NonUniformScale;
+	float3 LocalObjectBoundsMin;
+	uint LightingChannelMask;
+	float3 LocalObjectBoundsMax;
+	uint LightmapDataIndex;
+	float3 PreSkinnedLocalBoundsMin;
+	int SingleCaptureIndex;
+	float3 PreSkinnedLocalBoundsMax;
+	uint OutputVelocity;
+	float4 CustomPrimitiveData[NUM_CUSTOM_PRIMITIVE_DATA];
+};
+
+// Stride of a single primitive's data in float4's, must match C++
+#define PRIMITIVE_SCENE_DATA_STRIDE 36
+
+struct FPrimitiveIndex
+{
+#if VF_GPU_SCENE_TEXTURE
+	uint IndY;
+	uint IndX;
+#else // !VF_GPU_SCENE_TEXTURE
+	uint BaseOffset;
+#endif // VF_GPU_SCENE_TEXTURE
+};
+
+FPrimitiveIndex SetupPrimitiveIndexes(uint PrimitiveId)
+{
+	FPrimitiveIndex PrimitiveIndex;
+#if VF_GPU_SCENE_TEXTURE
+	PrimitiveIndex.IndY = (PrimitiveId & 0xFFFF0000) >> 16;
+	PrimitiveIndex.IndX = (PrimitiveId & 0xFFFF) * PRIMITIVE_SCENE_DATA_STRIDE;
+#else // !VF_GPU_SCENE_TEXTURE
+	PrimitiveIndex.BaseOffset = PrimitiveId * PRIMITIVE_SCENE_DATA_STRIDE;
+#endif // VF_GPU_SCENE_TEXTURE
+	return PrimitiveIndex;
+}
+
+
+float4 LoadPrimitivePrimitiveSceneDataElement(FPrimitiveIndex PrimitiveIndex, uint ItemIndex)
+{
+#if VF_GPU_SCENE_TEXTURE
+	return View.PrimitiveSceneDataTexture.Load(int3(PrimitiveIndex.IndX + ItemIndex, PrimitiveIndex.IndY, 0));
+#else // !VF_GPU_SCENE_TEXTURE
+	return View.PrimitiveSceneData[PrimitiveIndex.BaseOffset + ItemIndex];
+#endif // VF_GPU_SCENE_TEXTURE
+}
+
+// Fetch from scene primitive buffer
+FPrimitiveSceneData GetPrimitiveData(uint PrimitiveId)
+{
+	// Note: layout must match FPrimitiveSceneShaderData in C++
+	// Relying on optimizer to remove unused loads
+	FPrimitiveIndex PrimitiveIndex = SetupPrimitiveIndexes(PrimitiveId);
+
+	FPrimitiveSceneData PrimitiveData;
+
+	PrimitiveData.LocalToWorld[0] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 0);
+	PrimitiveData.LocalToWorld[1] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 1);
+	PrimitiveData.LocalToWorld[2] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 2);
+	PrimitiveData.LocalToWorld[3] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 3);
+
+	PrimitiveData.InvNonUniformScaleAndDeterminantSign = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 4);
+	PrimitiveData.ObjectWorldPositionAndRadius = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 5);
+
+	PrimitiveData.WorldToLocal[0] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 6);
+	PrimitiveData.WorldToLocal[1] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 7);
+	PrimitiveData.WorldToLocal[2] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 8);
+	PrimitiveData.WorldToLocal[3] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 9);
+
+	PrimitiveData.PreviousLocalToWorld[0] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 10);
+	PrimitiveData.PreviousLocalToWorld[1] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 11);
+	PrimitiveData.PreviousLocalToWorld[2] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 12);
+	PrimitiveData.PreviousLocalToWorld[3] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 13);
+
+	PrimitiveData.PreviousWorldToLocal[0] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 14);
+	PrimitiveData.PreviousWorldToLocal[1] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 15);
+	PrimitiveData.PreviousWorldToLocal[2] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 16);
+	PrimitiveData.PreviousWorldToLocal[3] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 17);
+
+	PrimitiveData.ActorWorldPosition = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 18).xyz;
+	PrimitiveData.UseSingleSampleShadowFromStationaryLights = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 18).w;
+
+	PrimitiveData.ObjectBounds = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 19).xyz;
+	PrimitiveData.LpvBiasMultiplier = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 19).w;
+
+	PrimitiveData.DecalReceiverMask = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 20).x;
+	PrimitiveData.PerObjectGBufferData = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 20).y;
+	PrimitiveData.UseVolumetricLightmapShadowFromStationaryLights = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 20).z;
+	PrimitiveData.DrawsVelocity = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 20).w;
+
+	PrimitiveData.ObjectOrientation = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 21);
+	PrimitiveData.NonUniformScale = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 22);
+
+	PrimitiveData.LocalObjectBoundsMin = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 23).xyz;
+	PrimitiveData.LightingChannelMask = asuint(LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 23).w);
+
+	PrimitiveData.LocalObjectBoundsMax = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 24).xyz;
+	PrimitiveData.LightmapDataIndex = asuint(LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 24).w);
+
+	PrimitiveData.PreSkinnedLocalBoundsMin = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 25).xyz;
+	PrimitiveData.SingleCaptureIndex = asuint(LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 25).w);
+
+	PrimitiveData.PreSkinnedLocalBoundsMax = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 26).xyz;
+	PrimitiveData.OutputVelocity = asuint(LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex, 26).w);
+
+	UNROLL
+	for (int i = 0; i < NUM_CUSTOM_PRIMITIVE_DATA; i++)
+	{
+		PrimitiveData.CustomPrimitiveData[i] = LoadPrimitivePrimitiveSceneDataElement(PrimitiveIndex,  27 + i);
+	}
+
+	return PrimitiveData;
+}
+
+#else // !VF_USE_PRIMITIVE_SCENE_DATA
+
+// Route to Primitive uniform buffer
+#define GetPrimitiveData(x) Primitive
+
+#endif

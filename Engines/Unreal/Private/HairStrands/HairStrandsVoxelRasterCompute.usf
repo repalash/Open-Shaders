@@ -1,0 +1,201 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsVoxelPageCommonStruct.ush"
+#include "../Common.ush"
+
+#include "HairStrandsVertexFactoryCommon.ush"
+#include "HairStrandsVoxelPageCommon.ush"
+
+///////////////////////////////////////////////////////////////////////////
+uint			DispatchCountX;
+uint			MaxRasterCount;
+uint			FrameIdMod8;
+uint			MacroGroupId;
+uint			HairStrandsVF_bIsCullingEnable;
+float			HairStrandsVF_Radius;
+float			HairStrandsVF_Length;
+float			HairStrandsVF_Density;
+float3			HairStrandsVF_PositionOffset;
+uint			HairStrandsVF_VertexCount;
+float4x4		HairStrandsVF_LocalToWorldPrimitiveTransform;
+Buffer<uint4>	HairStrandsVF_PositionBuffer;
+
+#if PERMUTATION_CULLING == 1
+Buffer<uint>	HairStrandsVF_CullingIndirectBuffer;
+Buffer<uint>	HairStrandsVF_CullingIndexBuffer;
+Buffer<float>	HairStrandsVF_CullingRadiusScaleBuffer;
+Buffer<uint>	IndirectBufferArgs;
+#endif
+
+uint			VirtualVoxelParams_PageIndexCount;
+uint			VirtualVoxelParams_PageResolution;
+float			VirtualVoxelParams_VoxelWorldSize;
+uint3			VirtualVoxelParams_PageCountResolution;
+uint3			VirtualVoxelParams_PageTextureResolution;
+
+Buffer<uint>	VirtualVoxelParams_PageIndexBuffer;
+Buffer<uint4>	VirtualVoxelParams_PageIndexCoordBuffer;
+StructuredBuffer<FPackedVirtualVoxelNodeDesc> VirtualVoxelParams_NodeDescBuffer;
+
+RWTexture3D<uint> OutPageTexture;
+
+///////////////////////////////////////////////////////////////////////////
+
+float3 GetHairVoxelJitter(uint2 PixelCoord, uint Seed)
+{
+	return float3(
+		InterleavedGradientNoise(PixelCoord.xy, Seed),
+		InterleavedGradientNoise(PixelCoord.xy, Seed * 117),
+		InterleavedGradientNoise(PixelCoord.xy, Seed * 7901));
+}
+
+#define JITTER_ENABLE 0
+
+// These number need to match HairStrandsClusterCulling.usf
+#define GROUP_SIZE 32
+#define GROUP_COUNT_X 16
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+#if PERMUTATION_CULLING == 1
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * GROUP_COUNT_X;
+#else
+	uint VertexIndex0 = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * DispatchCountX;
+#endif
+
+	//const uint VertexIndex = DispatchThreadID.x + DispatchThreadID.y * GROUP_SIZE * DispatchCountX;
+	uint VertexIndex1 = min(VertexIndex0 + 1, HairStrandsVF_VertexCount - 1);
+	if (VertexIndex0 >= HairStrandsVF_VertexCount)
+		return;
+
+	float LodRadiusScale0 = 1;
+	float LodRadiusScale1 = 1;
+#if PERMUTATION_CULLING == 1
+	if (HairStrandsVF_bIsCullingEnable)
+	{
+		const uint VertexCountAfterCulling = HairStrandsVF_CullingIndirectBuffer[3];
+		uint FetchIndex0 = VertexIndex0;
+		uint FetchIndex1 = VertexIndex1;
+		if (FetchIndex0 >= VertexCountAfterCulling)
+		{
+			return;
+		}
+		FetchIndex1 = min(FetchIndex0 + 1, VertexCountAfterCulling - 1);
+
+		VertexIndex0 = HairStrandsVF_CullingIndexBuffer[FetchIndex0];
+		LodRadiusScale0 = HairStrandsVF_CullingRadiusScaleBuffer[FetchIndex0];
+
+		VertexIndex1 = HairStrandsVF_CullingIndexBuffer[FetchIndex1];
+		LodRadiusScale1 = HairStrandsVF_CullingRadiusScaleBuffer[FetchIndex1];
+
+		if (LodRadiusScale0 <= 0.0f)
+		{
+			return;
+		}
+	}
+#endif
+
+	const FHairControlPoint CP0 = UnpackHairControlPoint(
+		HairStrandsVF_PositionBuffer[VertexIndex0],
+		HairStrandsVF_PositionOffset,
+		HairStrandsVF_Radius * LodRadiusScale0,
+		HairStrandsVF_Length);
+
+	if (CP0.Type == HAIR_CONTROLPOINT_END)
+		return;
+
+	const FHairControlPoint CP1 = UnpackHairControlPoint(
+		HairStrandsVF_PositionBuffer[VertexIndex1],
+		HairStrandsVF_PositionOffset,
+		HairStrandsVF_Radius * LodRadiusScale1,
+		HairStrandsVF_Length);
+
+	const float DiameterToRadius = 0.5f;
+	const float3 WP0 = mul(float4(CP0.Position, 1), HairStrandsVF_LocalToWorldPrimitiveTransform).xyz;
+	const float HairCoverage0 = CP0.WorldRadius / max(CP0.WorldRadius, DiameterToRadius * VirtualVoxelParams_VoxelWorldSize);
+
+	const float3 WP1 = mul(float4(CP1.Position, 1), HairStrandsVF_LocalToWorldPrimitiveTransform).xyz;
+	const float HairCoverage1 = CP1.WorldRadius / max(CP1.WorldRadius, DiameterToRadius * VirtualVoxelParams_VoxelWorldSize);
+
+	const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(VirtualVoxelParams_NodeDescBuffer[MacroGroupId], VirtualVoxelParams_PageResolution);
+
+	// In order to reduce aliasing, we increase the number of steps. This makes the result more comparable to the raster pass.
+	const float LineStepMultiplier = 1.5f;
+
+	FVirtualVoxelCommonDesc CommonDesc;
+	CommonDesc.PageCountResolution		= VirtualVoxelParams_PageCountResolution;
+	CommonDesc.VoxelWorldSize			= VirtualVoxelParams_VoxelWorldSize / LineStepMultiplier;
+	CommonDesc.PageTextureResolution	= VirtualVoxelParams_PageTextureResolution;
+	CommonDesc.PageResolution			= VirtualVoxelParams_PageResolution;
+
+	// Count the number of fibers which are within a cylinder defined by the voxel size, 
+	// and the distance between the origin and the extent of the volume
+	// This assumes that the voxel volume is cubic (i.e. equal dimensions on all sides)
+	const float3 LineSegment = WP1 - WP0;
+	const float LineLength = length(LineSegment);
+	const float3 StepD = normalize(LineSegment) * CommonDesc.VoxelWorldSize;
+
+	// Step according to voxel size
+	int3 CurrentPageIndexCoord = -1;
+	bool bIsPageValid = false;
+	uint3 PageCoord = 0;
+
+	// If we have long segment we could break them into batch (e.g. 8 voxels long), queue them, and indirect dispatch them. 
+	// This would make the workload more uniform/coherent. Currently, breaking into smaller batch, does not seems to save a 
+	// lot of cost
+	#if JITTER_ENABLE
+	const float3 Jitter = (GetHairVoxelJitter(frac(CP0.Position.xy), FrameIdMod8) * 2 - 1);
+	#else
+	const float3 Jitter = 0;
+	#endif
+
+	const float fMaxStep = LineLength / CommonDesc.VoxelWorldSize;
+	const float MaxStep = float(min(ceil(fMaxStep), MaxRasterCount));
+
+	int3 PreviousCoord = -1;
+	for (float StepIt = 0.0f; StepIt < MaxStep; ++StepIt)
+	{
+		const float U = (StepIt + 0.5f) / float(MaxStep);
+		const float Radius = lerp(CP0.WorldRadius, CP1.WorldRadius, U);
+
+		const float3 HitP = WP0 + StepIt * StepD + Jitter * Radius;
+		const int3 VolumeCoord = PositionToCoord(HitP, NodeDesc.MinAABB, NodeDesc.MaxAABB, NodeDesc.VirtualResolution);
+		const int3 PageIndexCoord = VolumeCoord / CommonDesc.PageResolution;
+
+		// Update page index only when needed
+		if (PageIndexCoord.x != CurrentPageIndexCoord.x ||
+			PageIndexCoord.y != CurrentPageIndexCoord.y ||
+			PageIndexCoord.z != CurrentPageIndexCoord.z)
+		{
+			CurrentPageIndexCoord = PageIndexCoord;
+			const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
+			const uint PageIndex = VirtualVoxelParams_PageIndexBuffer.Load(LinearPageIndexCoord);
+
+			bIsPageValid = PageIndex != INVALID_VOXEL_PAGE_INDEX;
+			if (bIsPageValid)
+			{
+				PageCoord = IndexToCoord(PageIndex, CommonDesc.PageCountResolution);
+			}
+		}
+
+		if (bIsPageValid)
+		{
+			const int3 VoxelPageBase = PageCoord * CommonDesc.PageResolution;
+			const int3 VoxelPageOffset = VolumeCoord - PageIndexCoord * CommonDesc.PageResolution;
+			const int3 VoxelPageCoord = VoxelPageBase + VoxelPageOffset;
+
+			// Insure we don't write multiple time within the same voxel.
+			// This can happen for small hair segment, where both start & end points could be writtent into the same voxel.
+			const bool bRasterize = any(VoxelPageCoord != PreviousCoord);
+
+			const float HairCoverage = lerp(HairCoverage0, HairCoverage1, U);
+			if (bRasterize)
+			{
+				const float VoxelFixPointScale = GetVoxelDensityFixPointScale();
+				InterlockedAdd(OutPageTexture[VoxelPageCoord], HairCoverage * VoxelFixPointScale * HairStrandsVF_Density);
+			}
+			PreviousCoord = VoxelPageCoord;
+		}
+	}
+}

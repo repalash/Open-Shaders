@@ -1,0 +1,57 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../LightShaderParameters.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+#include "../RectLight.ush"
+
+bool GenerateRectLightOcclusionRay(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+)
+{
+	RayOrigin = WorldPosition;
+	RayDirection = float3(0,0,0);
+	RayTMin = 0.0;
+	RayTMax = 0.0;
+	RayPdf = 0.0;
+
+	float3 Tangent = float3(0,0,0);
+	float3 BiTangent = float3(0,0,0);
+	GetRectLightTangents(LightParameters, /* out */ Tangent, /* out */ BiTangent);
+	float2 LightDimensions = GetRectLightDimensions(LightParameters);
+	
+	// Draw random variable
+	RandSample -= 0.5;
+
+	// Map sample point to quad
+	float3 LightSamplePosition = LightParameters.Position + Tangent * LightDimensions.x * RandSample.x + BiTangent * LightDimensions.y * RandSample.y;
+	float3 LightDirection = normalize(LightSamplePosition - WorldPosition);
+
+	// Light-normal culling
+	bool bIsValidRay = dot(-LightDirection, -LightParameters.Direction) >= 0.0;
+
+	// Apply normal perturbation when defining ray
+	RayDirection = LightDirection;
+	RayTMax = length(LightSamplePosition - WorldPosition);
+
+	// Define rectangle
+	FRect Rect;
+	Rect.Origin = LightParameters.Position - WorldPosition;
+	Rect.Axis[0] = Tangent;
+	Rect.Axis[1] = BiTangent;
+	Rect.Axis[2] = cross(Tangent, BiTangent);
+	Rect.Extent = LightDimensions * 0.5f;
+	FSphericalRect SphericalRect = BuildSphericalRect(Rect);
+	RayPdf = 1.0 / SphericalRect.SolidAngle;
+
+	return bIsValidRay;
+}

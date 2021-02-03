@@ -1,0 +1,37 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+
+#include "../SceneTexturesCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+Texture2D<float4> SceneColorTexture;
+Texture2D<uint4>  CategorizationTexture;
+
+// todo aggregate sample
+void MainPS(
+	in FScreenVertexOutput Input,
+	out float4 OutColor  : SV_Target0)
+{
+	OutColor = 0;
+
+	const uint2 PixelCoord = floor(Input.Position.xy);
+	const FCategorizationData CatData = DecodeCategorizationData(CategorizationTexture.Load(uint3(PixelCoord,0)));
+
+	const bool bIsCoveredByHair = CatData.PixelCoverage > 0;
+	if (bIsCoveredByHair)
+	{
+		//if (CatData.PixelCoverage < 1)
+		//{
+		//	const float4 Color = SceneColorSubPixelTexture.Load(uint3(PixelCoord, 0));
+		//	OutColor.xyz = Color.xyz / Color.w;
+		//	OutColor.w = Color.w;
+		//}
+
+		if (CatData.PixelCoverage >= 1)
+		{
+			OutColor = SceneColorTexture.Load(uint3(PixelCoord, 0));
+		}
+	}
+}

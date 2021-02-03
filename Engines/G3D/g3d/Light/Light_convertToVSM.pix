@@ -1,0 +1,29 @@
+#version 330
+/**
+  \file data-files/shader/Light/Light_convertToVSM.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <reconstructFromDepth.glsl>
+
+out vec2 result;
+
+uniform sampler2D stochasticDepth_buffer;
+uniform vec3 stochasticDepth_invSize;
+uniform sampler2D opaqueDepth_buffer;
+uniform vec3 opaqueDepth_size;
+uniform vec3 clipInfo;
+
+void main() {
+    float z = reconstructCSZ(texelFetch(opaqueDepth_buffer, ivec2(gl_FragCoord.xy * stochasticDepth_invSize.xy * opaqueDepth_size.xy), 0).r, clipInfo);
+
+    // Take the closer of the opaque and transparent
+    z = max(z, reconstructCSZ(texelFetch(stochasticDepth_buffer, ivec2(gl_FragCoord.xy), 0).r, clipInfo));
+
+    // z is negative and z^2 is positive, but the z value will end up being squared before
+    // it is applied anyway.
+    result = vec2(z, z * z);
+}

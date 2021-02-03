@@ -1,0 +1,34 @@
+#version 330
+
+
+uniform sampler2D fontTexture;
+uniform float alphaThreshold;
+uniform float textureLODBias; // TODO: Do something with this?
+uniform vec2  borderWidth;
+
+in  vec4 fontColor;
+in  vec4 bColor;
+in  vec2 texCoord;
+out vec4 result;
+
+void main() {
+    float alpha = texture(fontTexture, vec2(texCoord.x, texCoord.y)).a;
+    if ( bColor.a < alphaThreshold ) {
+        if (alpha < alphaThreshold) {
+            discard;
+        }
+        result = fontColor * vec4(1,1,1, alpha);
+        return;
+    }
+    float borderAlpha =             texture(fontTexture, vec2(texCoord.x - borderWidth.x, texCoord.y)).a;
+    borderAlpha = max(borderAlpha,  texture(fontTexture, vec2(texCoord.x + borderWidth.x, texCoord.y)).a);
+    borderAlpha = max(borderAlpha,  texture(fontTexture, vec2(texCoord.x, texCoord.y - borderWidth.y)).a);
+    borderAlpha = max(borderAlpha,  texture(fontTexture, vec2(texCoord.x, texCoord.y + borderWidth.y)).a);
+    borderAlpha *= bColor.a;
+    if (alpha < alphaThreshold && borderAlpha < alphaThreshold) {
+        discard;
+    }
+    float fontAlpha = alpha * fontColor.a;
+    result = vec4(fontColor.rgb * fontAlpha + bColor.rgb * (1 - fontAlpha), borderAlpha);
+    
+}

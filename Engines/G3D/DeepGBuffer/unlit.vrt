@@ -1,0 +1,18 @@
+#version 120 // -*- c++ -*-
+/**
+  \file unlit.pix
+
+  Apply a color and texture.
+ */
+#expect HAS_TEXTURE "1 or 0"
+
+#if HAS_TEXTURE
+    varying vec2 texCoord;
+#endif
+
+void main() {
+#   if HAS_TEXTURE
+        texCoord = gl_MultiTexCoord0.xy;
+#   endif
+    gl_Position = gl_Vertex * gl_ModelViewProjectionMatrixTranspose;
+}

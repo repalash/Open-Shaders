@@ -1,0 +1,285 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ClusteredDeferredShadingPixelShader - applies all local lights in the
+	LightGrid in a full-screen pass, not directional ones as they are done
+	in the traditional deferred passes.
+=============================================================================*/
+
+// Following the lead of Tiled Deferred
+#define SUPPORT_CONTACT_SHADOWS 0
+#define USE_IES_PROFILE 0
+#define NON_DIRECTIONAL_DIRECT_LIGHTING 0
+
+// Used in RectLight.ush, and requires a per-light texture which we cannot support at present.
+// If the textures are atlased or something like that in the future it should be ok to turn on.
+#define USE_SOURCE_TEXTURE 0
+
+#include "Common.ush"
+#include "DeferredShadingCommon.ush"  
+#include "BRDF.ush"
+#include "ShadingModels.ush"
+#include "LightGridCommon.ush"
+#include "DeferredLightingCommon.ush"
+
+
+// Causes the shader to run one pass over the light list per shading model, which cuts down peak register pressure.
+// Moves some overhead out of the inner loop (testing for shading model) which ought to be a good thing also.
+#define USE_PASS_PER_SHADING_MODEL 1
+
+// Extracts out the simple lights into their own loop that is executed first, independently of shading model.
+#define ENABLE_SEPARATE_SIMPLE_LIGHT_LOOP 0
+
+/**
+ * Adds local lighting using the light grid, does not apply directional lights, as they are done elsewhere.
+ * Does not support dynamic shadows, as these require the per-light shadow mask.
+ */
+float3 GetLightGridLocalLighting(const FCulledLightsGridData InLightGridData, float3 WorldPosition, float3 CameraVector, FScreenSpaceData ScreenSpaceData, float2 ScreenUV, uint EyeIndex, float Dither, uint FirstNonSimpleLightIndex)
+{
+	float3 DirectLighting = 0;
+
+	// TODO: Not part of LightGrid ligth data, does it need to be added?
+	float SpecularScale = 1.0f;
+
+	// Limit max to ForwardLightData.NumLocalLights.
+	// This prevents GPU hangs when the PS tries to read from uninitialized NumCulledLightsGrid buffer
+	const uint NumLocalLights = min(InLightGridData.NumLocalLights, GetNumLocalLights(EyeIndex));
+
+	LOOP
+	for (uint LocalLightListIndex = FirstNonSimpleLightIndex; LocalLightListIndex < NumLocalLights; LocalLightListIndex++)
+	{
+		const FLocalLightData LocalLight = GetLocalLightData(InLightGridData.DataStartIndex + LocalLightListIndex, EyeIndex);
+
+		// The lights are sorted such that all that support clustered deferred are at the beginning, there might be others
+		// (e.g., lights with dynamic shadows) so we break out when the condition fails.
+		if (!LocalLight.bClusteredDeferredSupported)
+		{
+			break;
+		}
+
+		FDeferredLightData LightData = (FDeferredLightData)0;
+		LightData.Position = LocalLight.LightPositionAndInvRadius.xyz;
+		LightData.InvRadius = LocalLight.LightPositionAndInvRadius.w;
+
+		// extra-early out since we know light grid is sloppy and all lights in list are radial (have a range)
+		// appears useless
+		float invLightRadiusSq = LightData.InvRadius*LightData.InvRadius;
+		if (length2(WorldPosition - LightData.Position) * invLightRadiusSq > 1.0f)
+		{
+			continue;
+		}
+
+		LightData.Color = LocalLight.LightColorAndFalloffExponent.xyz;
+		//LightData.Color.xy = 0.0f;
+		LightData.FalloffExponent = LocalLight.LightColorAndFalloffExponent.w;
+		LightData.Direction = LocalLight.LightDirectionAndShadowMask.xyz;
+		LightData.SpotAngles = LocalLight.SpotAnglesAndSourceRadiusPacked.xy;
+		LightData.SourceRadius = LocalLight.SpotAnglesAndSourceRadiusPacked.z;
+		LightData.SourceLength = f16tof32(asuint(LocalLight.SpotAnglesAndSourceRadiusPacked.w));
+		LightData.Tangent = LocalLight.LightTangentAndSoftSourceRadius.xyz;
+		LightData.SoftSourceRadius = LocalLight.LightTangentAndSoftSourceRadius.w;
+		LightData.bInverseSquared = LightData.FalloffExponent == 0;
+		// Only directional is not radial, and this loop is only non-directional lights (LIGHT_SOURCE_SHAPE > 0 in trad) 
+		LightData.bRadialLight = true;
+		// Setting it to true follows how it is setup in standard deferred, where only the directional lights are not doing this (LIGHT_SOURCE_SHAPE > 0)
+		//LightData.bSpotLight = true;
+		//LightData.bSpotLight = LightData.SpotAngles.x > -2.0f;
+		LightData.SpecularScale = SpecularScale;
+
+		uint LightTypeAndPackedShadowMapChannelMask = asuint(LocalLight.LightDirectionAndShadowMask.w);
+
+		// bits [17:16] really
+		uint LightType = LightTypeAndPackedShadowMapChannelMask >> 16;
+
+		// TODO: not sure if this check is even needed, standard deferred always seems to set it to true?
+		LightData.bSpotLight = (LightType == LIGHT_TYPE_SPOT);
+
+		// NOTE: supporting the rect-light code path adds ~30% overhead on NVIDIA (RTX 2060) even when not used! 
+		// Presumed register pressure increase again, not profiled in detail.
+		// Rect lights are now disabled by the sorting, so the shader should not handle them, for now.
+		LightData.bRectLight = false;// (LightType == LIGHT_TYPE_RECT);
+
+		// bits [7:0]
+		LightData.ShadowedBits = (LightTypeAndPackedShadowMapChannelMask & 0xFF) != 0 ? 1 : 0;
+		// Static shadowing uses ShadowMapChannel, dynamic shadows are packed into light attenuation using PreviewShadowMapChannel
+		LightData.ShadowMapChannelMask = UnpackShadowMapChannelMask(LightTypeAndPackedShadowMapChannelMask);
+
+		// This matches tiled deferred, since there is no dynamic shadow on the lights used for clustered shading.
+		float4 LightAttenuation = 1.0f;
+
+#if 1
+		FRectTexture RectTexture = InitRectTexture(ForwardLightData.DummyRectLightSourceTexture);
+		// NOTE: uses AO data like tiled deferred (as opposed to forward path)
+		// TODO: Passing in 0,0 as SVPos, what is meaning of this? Only used if 'REFERENCE_QUALITY' is on.
+		float SurfaceShadow = 1.0f;
+		DirectLighting += GetDynamicLighting(WorldPosition, CameraVector, ScreenSpaceData.GBuffer, ScreenSpaceData.AmbientOcclusion, ScreenSpaceData.GBuffer.ShadingModelID, LightData,LightAttenuation, Dither, uint2(0, 0), RectTexture, SurfaceShadow).xyz;
+
+#else // 1
+		FSimpleDeferredLightData SimpleLightData = (FSimpleDeferredLightData)0;
+		SimpleLightData.Position = LightData.Position;
+		SimpleLightData.InvRadius = LightData.InvRadius;
+		SimpleLightData.Color = LightData.Color;
+		SimpleLightData.FalloffExponent = LightData.FalloffExponent;
+		SimpleLightData.bInverseSquared = LightData.bInverseSquared;
+		DirectLighting += GetSimpleDynamicLighting(WorldPosition, CameraVector, ScreenSpaceData.GBuffer.WorldNormal, ScreenSpaceData.AmbientOcclusion, ScreenSpaceData.GBuffer.DiffuseColor, ScreenSpaceData.GBuffer.SpecularColor, ScreenSpaceData.GBuffer.Roughness, SimpleLightData);
+#endif //
+
+	}
+
+	// For debugging
+	//DirectLighting = InLightGridData.NumLocalLights / (float)ForwardLightData.MaxCulledLightsPerCell;
+	return DirectLighting;
+}
+
+#if USE_PASS_PER_SHADING_MODEL
+
+// NOTE: this is a macro since we want to be sure the 'ScreenSpaceData.GBuffer.ShadingModelID = ShadingModelId' is compile time constant
+//       The rest sort of follows.
+// NOTE 2: The screen-space data is loaded inside the if to try to minimize register pressure, but not clear if it is respected.
+#define GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(ShadingModelId, PixelShadingModelId, /*inout float4*/ CompositedLighting, ScreenUV, LightGridData, Dither, FirstNonSimpleLightIndex) \
+{	\
+	BRANCH	\
+	if (PixelShadingModelId == ShadingModelId)	\
+	{	\
+		float2 ScreenPosition = UVAndScreenPos.zw;	\
+		FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(ScreenUV);	\
+		float SceneDepth = CalcSceneDepth(ScreenUV);	\
+		float3 WorldPosition = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), View.ScreenToWorld).xyz;	\
+		float3 CameraVector = normalize(WorldPosition - View.WorldCameraOrigin);	\
+		ScreenSpaceData.GBuffer.ShadingModelID = ShadingModelId;	\
+		CompositedLighting += GetLightGridLocalLighting(LightGridData, WorldPosition, CameraVector, ScreenSpaceData, ScreenUV, 0, Dither, FirstNonSimpleLightIndex); \
+	}	\
+}
+
+#endif // USE_PASS_PER_SHADING_MODEL
+
+
+
+void ClusteredShadingPixelShader(
+	in noperspective float4 UVAndScreenPos : TEXCOORD0,
+	in float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 ScreenUV = UVAndScreenPos.xy;
+
+	uint PixelShadingModelID = GetScreenSpaceData(ScreenUV).GBuffer.ShadingModelID;
+
+	// TODO: This is how it was in TiledDeferred
+	//const float Dither = 0.5f;
+	// BUT: this is how it is in trad. deferred, assumed better:
+	const float Dither = InterleavedGradientNoise(SvPosition.xy, View.StateFrameIndexMod8);
+
+	// ?
+	const uint EyeIndex = 0;
+
+	float SceneDepth = CalcSceneDepth(ScreenUV);
+	float2 LocalPosition = SvPosition.xy - View.ViewRectMin.xy;
+	uint GridIndex = ComputeLightGridCellIndex(uint2(LocalPosition.x, LocalPosition.y), SceneDepth);
+	const FCulledLightsGridData CulledLightGridData = GetCulledLightsGrid(GridIndex, EyeIndex);
+#if 0
+	const LightGridData GridData = GetLightGridData(EyeIndex);
+	uint ZSlice = (uint)(max(0, log2(SceneDepth * GridData.LightGridZParams.x + GridData.LightGridZParams.y) * GridData.LightGridZParams.z));
+	ZSlice = min(ZSlice, (uint)(GridData.CulledGridSize.z - 1));
+	uint3 GridCoordinate = uint3(uint2(LocalPosition.x, LocalPosition.y) >> GridData.LightGridPixelSizeShift, ZSlice);
+
+	if (ZSlice % 2)
+	{
+		OutColor = float(ZSlice) / float(GridData.CulledGridSize.z - 1);
+	}
+	else
+	{
+		OutColor = 1.0f - float(ZSlice) / float(GridData.CulledGridSize.z - 1);
+	}
+
+	if (GridCoordinate.x % 2)
+	{
+		OutColor.xyz = 1.0f - OutColor.xyz;
+	}
+	if (GridCoordinate.y % 2)
+	{
+		OutColor.xyz = 1.0f - OutColor.xyz;
+	}
+	OutColor.w = 0.0f;
+	return;
+#endif // 0
+	// NOTE: this early out helps with the case where there are no lights in the grid cell.
+	if (CulledLightGridData.NumLocalLights == 0 || PixelShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		OutColor = 0;
+		return;
+	}
+
+	float3 CompositedLighting = 0;
+
+#if ENABLE_SEPARATE_SIMPLE_LIGHT_LOOP
+
+	uint FirstNonSimpleLightIndex = 0;
+	{
+		float2 ScreenPosition = UVAndScreenPos.zw;
+		FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(ScreenUV);
+		float3 WorldPosition = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), View.ScreenToWorld).xyz;
+		float3 CameraVector = normalize(WorldPosition - View.WorldCameraOrigin);
+
+		// Limit max to ForwardLightData.NumLocalLights.
+		// This prevents GPU hangs when the PS tries to read from uninitialized NumCulledLightsGrid buffer
+		const uint NumLocalLights = min(CulledLightGridData.NumLocalLights, GetNumLocalLights(EyeIndex));
+
+		uint LocalLightListIndex = 0;
+
+		LOOP
+		for (; LocalLightListIndex < NumLocalLights; LocalLightListIndex++)
+		{
+			const FLocalLightData LocalLight = GetLocalLightData(CulledLightGridData.DataStartIndex + LocalLightListIndex, EyeIndex);
+			if (!LocalLight.bIsSimpleLight)
+			{
+				break;
+			}
+
+			FSimpleDeferredLightData SimpleLightData = (FSimpleDeferredLightData)0;
+			SimpleLightData.Position = LocalLight.LightPositionAndInvRadius.xyz;
+			SimpleLightData.InvRadius = LocalLight.LightPositionAndInvRadius.w;
+			SimpleLightData.Color = LocalLight.LightColorAndFalloffExponent.xyz;
+			SimpleLightData.FalloffExponent = LocalLight.LightColorAndFalloffExponent.w;
+			SimpleLightData.bInverseSquared = SimpleLightData.FalloffExponent == 0;
+
+			CompositedLighting += GetSimpleDynamicLighting(WorldPosition, CameraVector, ScreenSpaceData.GBuffer.WorldNormal, ScreenSpaceData.AmbientOcclusion, ScreenSpaceData.GBuffer.DiffuseColor, ScreenSpaceData.GBuffer.SpecularColor, ScreenSpaceData.GBuffer.Roughness, SimpleLightData);
+		}
+		FirstNonSimpleLightIndex = LocalLightListIndex;
+	}
+#else // !ENABLE_SEPARATE_SIMPLE_LIGHT_LOOP
+	uint FirstNonSimpleLightIndex = 0;
+
+#endif // ENABLE_SEPARATE_SIMPLE_LIGHT_LOOP
+#if USE_PASS_PER_SHADING_MODEL
+
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_DEFAULT_LIT, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_SUBSURFACE, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_PREINTEGRATED_SKIN, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_CLEAR_COAT, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_SUBSURFACE_PROFILE, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_TWOSIDED_FOLIAGE, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_HAIR, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_CLOTH, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_EYE, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	GET_LIGHT_GRID_LOCAL_LIGHTING_SINGLE_SM(SHADINGMODELID_SINGLELAYERWATER, PixelShadingModelID, CompositedLighting, ScreenUV, CulledLightGridData, Dither, FirstNonSimpleLightIndex);
+	// SHADINGMODELID_THIN_TRANSLUCENT - skipping because it can not be opaque
+#else // !USE_PASS_PER_SHADING_MODEL
+
+	float2 ScreenPosition = UVAndScreenPos.zw;
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(ScreenUV);
+	float3 WorldPosition = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), View.ScreenToWorld).xyz;
+	float3 CameraVector = normalize(WorldPosition - View.WorldCameraOrigin);
+
+	uint NumCulledEntryIndex = (ForwardLightData.NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE;
+
+	CompositedLighting += GetLightGridLocalLighting(CulledLightGridData, WorldPosition, CameraVector, ScreenSpaceData, ScreenUV, 0, Dither, FirstNonSimpleLightIndex);
+#endif // USE_PASS_PER_SHADING_MODEL
+	
+#if USE_PREEXPOSURE && !VISUALIZE_LIGHT_CULLING
+	CompositedLighting *= View.PreExposure;
+#endif	 // USE_PREEXPOSURE && !VISUALIZE_LIGHT_CULLING
+	OutColor.rgb = CompositedLighting;
+
+	OutColor.w = 0.0f;
+}
+

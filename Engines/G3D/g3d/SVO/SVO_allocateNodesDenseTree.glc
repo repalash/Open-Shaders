@@ -1,0 +1,75 @@
+#version 420 or 430
+/**
+  \file data-files/shader/SVO/SVO_allocateNodesDenseTree.glc
+
+  Requires WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+ layout(r32ui) uniform uimageBuffer   childIndexBuffer;
+ layout(r32ui) uniform uimageBuffer   parentIndexBuffer;
+ layout(r32ui) uniform uimageBuffer   levelStartIndexBuffer;
+
+/** Number of nodes allocated; indices are number * 8 */
+layout(r32ui) uniform uimageBuffer   numberOfAllocatedNodes;
+
+
+//NEW
+#ifdef DUMMY_PASS
+layout(r32ui) uniform uimageBuffer       levelSizeBuffer;
+#endif
+
+uniform int                          level;
+
+/** Used for reading the total thread count from the fourth element */
+ layout(r32ui) uniform uimageBuffer   dispatchIndirectLevelBuffer;
+
+#define NULL                         (0)
+const uint                           POPULATED = 0xFFFFFFFF;
+
+void main() {
+    uint threadIndex = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * (WORK_GROUP_SIZE_X * WORK_GROUP_SIZE_Y) + gl_LocalInvocationID.x + gl_LocalInvocationID.y * WORK_GROUP_SIZE_X;
+
+    uint numThreads = imageLoad(dispatchIndirectLevelBuffer, 3).r;
+    if (threadIndex >= numThreads) { return; }
+
+	uint levelStartIndex = imageLoad(levelStartIndexBuffer, level ).r;
+    uint nodeIndex = threadIndex + levelStartIndex;
+
+
+	uint nextLevelStartIndex = imageLoad(levelStartIndexBuffer, level+1 ).r;	//SVO_USE_TOP_DENSE
+
+    // See if this node has children; if not, leave the pointer at NULL
+    if (imageLoad(childIndexBuffer, int(nodeIndex)).r == POPULATED) 
+	{
+
+
+		//Warning: DUMMY_PASS not supported
+#ifdef DUMMY_PASS
+#error "Dummy pass not supported"
+#endif
+
+		uint childIndex = nextLevelStartIndex + threadIndex*8;		//Dense tree
+		
+		// Store my child index
+        imageStore(childIndexBuffer, int(nodeIndex), uvec4(childIndex));
+
+		// Store parent index
+        imageStore(parentIndexBuffer, int(childIndex/8U), uvec4(nodeIndex));
+
+
+    }
+}

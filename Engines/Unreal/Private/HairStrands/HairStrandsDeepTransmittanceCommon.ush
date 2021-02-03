@@ -1,0 +1,85 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FHairTransmittanceMask
+{
+	float3 Transmittance;
+	float HairCount;
+	float Visibility;
+};
+
+struct FPackedHairTransmittanceMask
+{
+	float3 Transmittance;
+	uint PackedHairCountAndVisibility;
+};
+
+FPackedHairTransmittanceMask InitNullPackedHairTransmittanceMask()
+{
+	FPackedHairTransmittanceMask Out;
+	Out.Transmittance = 0;
+	Out.PackedHairCountAndVisibility = 0;
+	return Out;
+}
+
+FHairTransmittanceMask InitHairTransmittanceMask()
+{
+	FHairTransmittanceMask Out;
+	Out.Transmittance = 1;
+	Out.HairCount = 0;
+	Out.Visibility = 1;
+	return Out;
+}
+
+FPackedHairTransmittanceMask PackTransmittanceMask(FHairTransmittanceMask In)
+{
+	FPackedHairTransmittanceMask Out;
+	Out.Transmittance = In.Transmittance;
+	Out.PackedHairCountAndVisibility = min(uint(In.HairCount * 1000), uint(0x00FFFFFF)) | (min(uint(In.Visibility * 0xFF), uint(0xFF)) << 24);
+	return Out;
+}
+
+FHairTransmittanceMask UnpackTransmittanceMask(FPackedHairTransmittanceMask  In)
+{
+	FHairTransmittanceMask Out;
+	Out.Transmittance = In.Transmittance;
+	Out.HairCount = float(In.PackedHairCountAndVisibility & 0x00FFFFFF) / 1000.f;
+	Out.Visibility = float((In.PackedHairCountAndVisibility & 0xFF000000) >> 24) / 255.f;
+	return Out;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct FTransmittanceSettings
+{
+	int2	 DeepShadowResolution;
+	int2	 DeepShadowOffset;
+	float4x4 WorldToLightTransform;
+	float3   LightDirection;
+	float4   LightPosition;
+
+	float    DeepShadowDepthBiasScale;
+	float    DeepShadowDensityScale;
+	float	 TransmittanceKernelApertureInDegree;
+	float3   Random;
+	uint	 DebugMode;
+
+	uint TransmittanceKernelType;
+};
+
+FHairTransmittanceMask ComputeTransmittanceFromHairCount(float HairCount, float HairVisibility, FGBufferData GBuffer, float SinLightAngle, Texture3D<float4> InHairScatteringLUTTexture, SamplerState InHairLUTSampler)
+{
+	const FHairAverageScattering AbsorptionData = SampleHairLUT(InHairScatteringLUTTexture, InHairLUTSampler, GBuffer.BaseColor, GBuffer.Roughness, SinLightAngle);
+
+	// Always shift the hair count by one to remove self-occlusion/shadow aliasing and have smootheer transition
+	// This insure the the pow function always starts at 0 for front facing hair
+	FHairTransmittanceMask Out;
+	Out.HairCount = max(0, HairCount - 1);
+	Out.Transmittance = pow(AbsorptionData.A_front, Out.HairCount);
+	Out.Visibility = HairVisibility;
+
+	return Out;
+}

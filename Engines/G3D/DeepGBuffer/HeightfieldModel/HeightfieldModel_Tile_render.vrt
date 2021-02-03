@@ -1,0 +1,15 @@
+#version 120 // -*- c++ -*-
+/** 
+  HeightfieldModel_Tile_render.vrt
+*/
+#include <HeightfieldModel/HeightfieldModel_Tile_vertex.glsl>
+
+void main() {
+    vec4 osVertex;
+    vec3 osNormal;
+    vec2 texCoord0;
+
+    TerrainTile_computeOSInput(osVertex, osNormal, texCoord0);
+
+    UniversalSurface_transform(osVertex, osNormal, vec4(0), texCoord0, vec2(0), vec4(0));
+}

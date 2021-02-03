@@ -1,0 +1,59 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=========================================================================
+	TransmissionCommon.ush: Subsurface scattering transmission utilities.
+=========================================================================*/
+
+#include "SubsurfaceProfileCommon.ush"
+#include "BurleyNormalizedSSSCommon.ush"
+
+SamplerState TransmissionProfilesLinearSampler;
+
+struct FTransmissionProfileParams
+{
+	float ExtinctionScale;
+	float NormalScale;
+	float ScatteringDistribution;
+	float OneOverIOR;
+};
+
+FTransmissionProfileParams GetTransmissionProfileParams(FGBufferData GBufferData)
+{
+	FTransmissionProfileParams Result;
+
+	// 0..255, which SubSurface profile to pick
+	uint SubsurfaceProfileInt = ExtractSubsurfaceProfileInt(GBufferData);
+
+	//X:ExtinctionScale, Y:Normal Scale, Z:ScatteringDistribution, W:OneOverIOR
+	float4 Data = ActualSSProfilesTexture.Load(int3(SSSS_TRANSMISSION_OFFSET, SubsurfaceProfileInt, 0));
+
+	Result.ExtinctionScale = Data.x;
+	Result.NormalScale = Data.y;
+	Result.ScatteringDistribution = Data.z;
+	Result.OneOverIOR = Data.w;
+
+	return Result;
+}
+
+float4 GetTransmissionProfile(FGBufferData GBufferData, float Thickness)
+{
+	// 0..255, which SubSurface profile to pick
+	uint SubsurfaceProfileInt = ExtractSubsurfaceProfileInt(GBufferData);
+	float3 TextureSize;
+	ActualSSProfilesTexture.GetDimensions(0, TextureSize.x, TextureSize.y,TextureSize.z); // TODO: it's slightly faster to pass texture dimensions through a constant buffer
+	bool bUseBurley = GetSubsurfaceTransmittanceProfileUseBurley(SubsurfaceProfileInt);
+	float ProfileOffset = bUseBurley ? BSSS_TRANSMISSION_PROFILE_OFFSET : SSSS_TRANSMISSION_PROFILE_OFFSET;
+	float2 uv = float2((ProfileOffset + Thickness / SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE * (SSSS_TRANSMISSION_PROFILE_SIZE - 1) + 0.5f), SubsurfaceProfileInt + 0.5f) / (TextureSize.xy);
+	return Texture2DSampleLevel(ActualSSProfilesTexture, TransmissionProfilesLinearSampler, uv, 0);
+}
+
+float EncodeThickness(float Thickness)
+{
+	return 1 - Thickness;
+}
+
+float DecodeThickness(float Thickness)
+{
+	return 1 - Thickness;
+}
+

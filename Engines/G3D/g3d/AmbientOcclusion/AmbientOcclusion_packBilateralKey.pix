@@ -1,0 +1,28 @@
+#version 330
+/**
+  \file data-files/shader/AmbientOcclusion/AmbientOcclusion_packBilateralKey.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#include <reconstructFromDepth.glsl>
+#include <Texture/Texture.glsl>
+uniform_Texture(sampler2D, normal_);
+uniform_Texture(sampler2D, csZ_);
+
+#expect FAR_PLANE_Z "(negative) z-coordinate of the far plane"
+
+
+out vec4 result;
+#include <AmbientOcclusion/AmbientOcclusion_constants.glsl>
+#include <AmbientOcclusion/AmbientOcclusion_packBilateralKey.glsl>
+
+void main() {
+    ivec2 ssC   = ivec2(gl_FragCoord.xy);
+    float csZ   = texelFetch(csZ_buffer, ssC, 0).r;
+    vec3 normal = texelFetch(normal_buffer, ssC, 0).xyz * normal_readMultiplyFirst.xyz + normal_readAddSecond.xyz;
+    result      = packBilateralKey(csZ, normal, 0.0, FAR_PLANE_Z);
+}

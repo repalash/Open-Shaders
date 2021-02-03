@@ -1,0 +1,312 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DiaphragmDOF/DOFSetup.usf: Diaphragm DOF's setup shader. 
+=============================================================================*/
+
+#define CONFIG_SETUP 1
+
+#include "DOFDownsample.ush"
+
+
+//------------------------------------------------------- COMPILE TIME CONSTANTS
+
+#if DIM_OUTPUT_RES_DIVISOR == 0
+	#define GROUP_BORDER_SIZE (2 * DEFAULT_GROUP_BORDER_SIZE)
+#else
+	#define GROUP_BORDER_SIZE (DEFAULT_GROUP_BORDER_SIZE)
+#endif
+
+
+//------------------------------------------------------- PARAMETERS
+
+uint4 ViewportRect;
+
+float4 CocModelParameters;
+float2 DepthBlurParameters;
+
+// x: full res basis; y: half res basis.
+float2 CocRadiusBasis;
+
+Texture2D SceneColorTexture;
+Texture2D SceneDepthTexture;
+
+
+//------------------------------------------------------- OUTPUTS
+
+#if CONFIG_DOF_ALPHA
+RWTexture2D<float>	Output0;
+RWTexture2D<float4>	Output1;
+RWTexture2D<float>	Output2;
+
+#else
+RWTexture2D<float4>	Output0;
+RWTexture2D<float4>	Output1;
+
+#endif
+
+
+//------------------------------------------------------- LDS
+
+#define SUBTILE_SIZE (DEFAULT_GROUP_BORDER_SIZE)
+
+#if CONFIG_DOF_ALPHA
+	groupshared float4 SharedColor[SUBTILE_SIZE * SUBTILE_SIZE * 3];
+	groupshared float SharedCocRadius[SUBTILE_SIZE * SUBTILE_SIZE * 3];
+#else
+	groupshared float4 SharedColorAndCocRadius[SUBTILE_SIZE * SUBTILE_SIZE * 3];
+#endif
+
+//------------------------------------------------------- ENTRY POINT
+
+#if DIM_OUTPUT_RES_DIVISOR == 0 // Output full & half resolution.
+
+[numthreads(GROUP_BORDER_SIZE, GROUP_BORDER_SIZE, 1)]
+void SetupCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	uint2 SubGroupId = uint2((GroupThreadIndex & 64) != 0, (GroupThreadIndex & 128) != 0);
+	uint2 SubGroupPos = uint2(GroupThreadIndex & 0x7, (GroupThreadIndex / 8) & 0x7);
+
+	bool bIsDownSamplingSubGroup = GroupThreadIndex < SUBTILE_SIZE * SUBTILE_SIZE;
+	
+	uint2 InputPixelPosition = (uint2(View.ViewRectMin.xy) + GroupId * GROUP_BORDER_SIZE) + SubGroupPos * 2 + SubGroupId;
+
+	// Fetch scene color/depth, and compute CocRadius.
+	float2 SceneBufferUV = (InputPixelPosition + 0.5) * View.BufferSizeAndInvSize.zw;
+	
+	if (true)
+	{
+		SceneBufferUV = clamp(SceneBufferUV, View.BufferBilinearUVMinMax.xy, View.BufferBilinearUVMinMax.zw);
+	}
+
+	float4 SceneColor = SceneColorTexture.SampleLevel(GlobalPointClampedSampler, SceneBufferUV, 0);
+	float DeviceZ = SceneDepthTexture.SampleLevel(GlobalPointClampedSampler, SceneBufferUV, 0).r;
+	float CocRadius = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(DeviceZ));
+	
+	// Convert from translucency to opacity.
+	SceneColor.a = 1 - SceneColor.a;
+
+	// Output full resolution.
+	#if CONFIG_DOF_ALPHA
+	{
+		Output0[uint2(InputPixelPosition)] = CocRadiusBasis.x * CocRadius;
+	}
+	#else
+	{
+		Output0[uint2(InputPixelPosition)] = float4(SceneColor.rgb, CocRadiusBasis.x * CocRadius);
+	}
+	#endif
+
+	// Have the auxiliary thread writing to LDS for main group to downscale.
+	BRANCH
+	if (!bIsDownSamplingSubGroup)
+	{
+		#if CONFIG_DOF_ALPHA
+		{
+			SharedColor[GroupThreadIndex - SUBTILE_SIZE * SUBTILE_SIZE] = SceneColor;
+			SharedCocRadius[GroupThreadIndex - SUBTILE_SIZE * SUBTILE_SIZE] = CocRadiusBasis.y * CocRadius;
+		}
+		#else
+		{
+			SharedColorAndCocRadius[GroupThreadIndex - SUBTILE_SIZE * SUBTILE_SIZE] = float4(SceneColor.rgb, CocRadiusBasis.y * CocRadius);
+		}
+		#endif
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// Have main threads to downscale.
+	BRANCH
+	if (bIsDownSamplingSubGroup)
+	{
+		// fetch from LDS.
+		float4 SceneColors[4];
+		float CocRadii[4];
+
+		SceneColors[0] = SceneColor;
+		CocRadii[0] = CocRadiusBasis.y * CocRadius;
+
+		UNROLL
+		for (uint i = 0; i < 3; i++)
+		{
+			uint LDSIndex = GroupThreadIndex + SUBTILE_SIZE * SUBTILE_SIZE * i;
+			#if CONFIG_DOF_ALPHA
+			{
+				SceneColors[i + 1] = SharedColor[LDSIndex];
+				CocRadii[i + 1] = SharedCocRadius[LDSIndex];
+			}
+			#else
+			{
+				float4 RawLDS = SharedColorAndCocRadius[LDSIndex];
+
+				SceneColors[i + 1] = float4(RawLDS.rgb, 0);
+				CocRadii[i + 1] = RawLDS.a;
+			}
+			#endif
+		}
+		
+		FCocDownsampleParams DownsampleParams;
+		DownsampleParams.CocRadiusMultiplier = 1.0;
+		DownsampleParams.FrameExposureScale = 1.0;
+		DownsampleParams.bDoColorBasedWeighting = false;
+
+		// Downsample.
+		float4 OutColor;
+		float OutCocRadius;
+		DownsampleSceneColorWithCoc(DownsampleParams, SceneColors, CocRadii, OutColor, OutCocRadius);
+	
+		uint2 HalfResOutputPixelPosition = GroupId * (GROUP_BORDER_SIZE / 2) + SubGroupPos;
+
+		//if (all(HalfResOutputPixelPosition < ViewportRect.zw))
+		#if CONFIG_DOF_ALPHA
+		{
+			Output1[HalfResOutputPixelPosition] = OutColor;
+			Output2[HalfResOutputPixelPosition] = OutCocRadius;
+		}
+		#else
+		{
+			Output1[HalfResOutputPixelPosition] = float4(OutColor.rgb, OutCocRadius);
+		}
+		#endif
+	}
+}
+
+
+#elif DIM_OUTPUT_RES_DIVISOR == 1 // Output full resolution only.
+
+[numthreads(GROUP_BORDER_SIZE, GROUP_BORDER_SIZE, 1)]
+void SetupCS(uint2 DispatchThreadId : SV_DispatchThreadID) 
+{
+	float2 SceneBufferUV = (float2(View.ViewRectMin.xy) + (DispatchThreadId + 0.5)) * View.BufferSizeAndInvSize.zw;
+	
+	float4 OutColor = SceneColorTexture.SampleLevel(GlobalPointClampedSampler, SceneBufferUV, 0);
+	
+	float DeviceZ = SceneDepthTexture.SampleLevel(GlobalPointClampedSampler, SceneBufferUV, 0).r;
+	float OutCocRadius = CocRadiusBasis.x * DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(DeviceZ));
+
+	if (all(DispatchThreadId < ViewportRect.zw))
+	{
+		#if CONFIG_DOF_ALPHA
+		{
+			Output0[View.ViewRectMin.xy + DispatchThreadId] = OutCocRadius;
+		}
+		#else
+		{
+			Output0[View.ViewRectMin.xy + DispatchThreadId] = float4(OutColor.xyz, OutCocRadius);
+		}
+		#endif
+	}
+}
+
+
+#elif DIM_OUTPUT_RES_DIVISOR == 2 // Output half resolution only.
+
+[numthreads(GROUP_BORDER_SIZE, GROUP_BORDER_SIZE, 1)]
+void SetupCS(
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID) 
+{
+	// Compute scene buffer uv, but carefully to handle view size % 2 == 1,
+	// because this pass is running at half resolution.
+	float2 SceneBufferUV = (float2(View.ViewRectMin.xy) + 2.0 * (DispatchThreadId + 0.5)) * View.BufferSizeAndInvSize.zw;
+	float2 SceneBufferUVOffset = View.BufferSizeAndInvSize.zw * 0.5;
+			
+	FCocDownsampleParams DownsampleParams;
+	DownsampleParams.CocRadiusMultiplier = 1.0;
+	DownsampleParams.FrameExposureScale = 1.0;
+	DownsampleParams.bDoColorBasedWeighting = false;
+
+	BRANCH
+	if (all(GroupId * GROUP_BORDER_SIZE + (GROUP_BORDER_SIZE + 1) <= ViewportRect.zw))
+	{
+		// Fetch Coc
+		float4 SceneDepthGather = SceneDepthTexture.Gather(GlobalPointClampedSampler, SceneBufferUV);
+		float CocRadii[4];
+		CocRadii[0] = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(SceneDepthGather.w));
+		CocRadii[1] = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(SceneDepthGather.z));
+		CocRadii[2] = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(SceneDepthGather.x));
+		CocRadii[3] = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(SceneDepthGather.y));
+
+		// Fetch color.
+		float4 SceneColors[4];
+		for (uint i = 0; i < 4; i++)
+		{
+			float2 SampleUV = SceneBufferUV + SceneBufferUVOffset * float2(kOffsetsCross3x3[i]);
+			SceneColors[i] = SceneColorTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0);
+
+			// Convert from translucency to opacity.
+			SceneColors[i].a = 1 - SceneColors[i].a;
+		}
+	
+		// Downsample.
+		float4 OutColor;
+		float OutCocRadius;
+		DownsampleSceneColorWithCoc(DownsampleParams, SceneColors, CocRadii, OutColor, OutCocRadius);
+	
+		#if CONFIG_DOF_ALPHA
+		{
+			Output1[DispatchThreadId] = OutColor;
+			Output2[DispatchThreadId] = OutCocRadius;
+		}
+		#else
+		{
+			Output1[DispatchThreadId] = float4(OutColor.rgb, OutCocRadius);
+		}
+		#endif
+	}
+	else
+	{
+		// Sample scene color and depth.
+		float CocRadii[4];
+		float4 SceneColors[4];
+		for (uint i = 0; i < 4; i++)
+		{
+			float2 SampleUV = SceneBufferUV + SceneBufferUVOffset * float2(kOffsetsCross3x3[i]);
+
+			if (true)
+			{
+				SampleUV = clamp(SampleUV, View.BufferBilinearUVMinMax.xy, View.BufferBilinearUVMinMax.zw);
+			}
+
+			SceneColors[i] = SceneColorTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0);
+			
+			// Convert from translucency to opacity.
+			SceneColors[i].a = 1 - SceneColors[i].a;
+
+			float SampleDeviceZ = SceneDepthTexture.SampleLevel(GlobalPointClampedSampler, SampleUV, 0).r;
+			CocRadii[i] = DepthToHalfResCocRadius(CocModelParameters, DepthBlurParameters, ConvertFromDeviceZ(SampleDeviceZ));
+		}
+
+		// Downsample.
+		float4 OutColor;
+		float OutCocRadius;
+		DownsampleSceneColorWithCoc(DownsampleParams, SceneColors, CocRadii, OutColor, OutCocRadius);
+	
+		#if 0 // Lower VGPR footprint.
+			uint2 OutputPixelPosition = 0.5 * SceneBufferUV * View.BufferSizeAndInvSize.xy;
+		#else
+			uint2 OutputPixelPosition = DispatchThreadId;
+		#endif
+
+		if (all(OutputPixelPosition < ViewportRect.zw))
+		{
+			#if CONFIG_DOF_ALPHA
+			{
+				Output1[OutputPixelPosition] = OutColor;
+				Output2[OutputPixelPosition] = OutCocRadius;
+			}
+			#else
+			{
+				Output1[OutputPixelPosition] = float4(OutColor.rgb, OutCocRadius);
+			}
+			#endif
+		}
+	}
+}
+
+
+#else
+	#error Unkown resolution divisor.
+#endif

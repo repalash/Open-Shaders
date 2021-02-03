@@ -1,0 +1,116 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingReflectionsCommon.ush"
+
+#define REFLECTION_RAY_DIRECTION_SORT_TILE_SIZE 32
+
+struct FSortedReflectionRay
+{
+	float3	Origin;
+	uint	PixelCoordinates;
+	float3	Direction;
+	float	Roughness; // Only technically need 8 bits, the rest could be repurposed
+};
+
+uint PackPixelCoordinates(uint2 PixelCoordinates)
+{
+	return (PixelCoordinates.x & 0xFFFF)
+	     | (PixelCoordinates.y << 16);
+}
+
+uint2 UnpackPixelCoordinates(uint PixelCoordinates)
+{
+	return uint2(
+		PixelCoordinates & 0xFFFF,
+		PixelCoordinates >> 16);
+}
+
+float ApplySmoothBias(float Roughness, float SmoothBias)
+{
+	if (SmoothBias > 0)
+	{
+		// SmoothStep-like function up to SmoothBias, original value above
+		float X = saturate(Roughness / SmoothBias);
+		return Roughness * X * X * (3.0 - 2.0 * X);
+	}
+	else
+	{
+		return Roughness;
+	}
+}
+
+FSortedReflectionRay GenerateDeferredReflectionRay(uint2 PixelPos, uint2 UpscaleFactor, float ReflectionMaxNormalBias, float SmoothBias, bool bGlossyReflections)
+{
+	// NOTE: GetPixelCoord() helper is currently intentionally not used here, as it introduces noticeable jitter when upscale factor is used.
+	// Subpixels could potentially be taken into account at a later point, if denoiser can compensate for the jitter.
+	const float2 UV = (float2(PixelPos.xy * UpscaleFactor) + 0.5) * View.BufferSizeAndInvSize.zw;
+
+    // not 'const', may need to be modified below
+	FGBufferData GBuffer         = GetGBufferDataFromSceneTextures(UV);
+	float DeviceZ                = SampleDeviceZFromSceneTextures(UV);
+
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelPos * UpscaleFactor, DeviceZ, WorldPosition, CameraDirection);
+	float3 V = -CameraDirection;
+
+	ModifyGGXAnisotropicNormalRoughness(GBuffer.WorldTangent, GBuffer.Anisotropy, GBuffer.Roughness, GBuffer.WorldNormal, V);
+
+	FSortedReflectionRay Ray = (FSortedReflectionRay)0;
+	Ray.PixelCoordinates = PackPixelCoordinates(PixelPos);
+
+	if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR 
+	 || GBuffer.ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		return Ray;
+	}
+
+	// Use the similar clearcoat approximation as SSR: simply blend base and clear coat roughness
+	if (GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT)
+	{
+		const float ClearCoat = GBuffer.CustomData.x;
+		const float ClearCoatRoughness = GBuffer.CustomData.y;
+
+		// Combined reflection roughness is biased towards clear coat. 
+		// The approximation is quite arbitrary, based on empirical results.
+		GBuffer.Roughness = lerp(ClearCoatRoughness, GBuffer.Roughness, pow(1.0 - ClearCoat, 4.0));
+	}
+
+	float2 E = Rand1SPPDenoiserInput(PixelPos);
+	
+	const bool bOutputForDenoiser = true; // #todo: pass this in via constants when denoiser is on
+	if (bOutputForDenoiser)
+	{
+		E.y *= 1 - GGX_IMPORTANT_SAMPLE_BIAS;
+	}
+	
+	float3x3 TangentBasis = GetTangentBasis(GBuffer.WorldNormal);
+	float3 TangentV       = mul(TangentBasis, V);
+
+	float3 L = (float3)0;
+
+	if (bGlossyReflections)
+	{
+		// Biased roughness is used for GGX sampling, but original value is still used to compute roughness threshold / fade.
+		// This means that biased roughness will never cause more rays to be traced, so will never cause performance drop.
+		float Roughness = ApplySmoothBias(GBuffer.Roughness, SmoothBias);
+		float3 H = mul(ImportanceSampleVisibleGGX(UniformSampleDisk(E), Pow4(Roughness), TangentV).xyz, TangentBasis);
+		L = 2 * dot(V, H) * H - V;
+	}
+	else
+	{
+		L = reflect(-V, GBuffer.WorldNormal);
+	}
+
+	Ray.Origin = WorldPosition;
+	Ray.Direction = L;
+	ApplyCameraRelativeDepthBias(Ray.Origin, Ray.Direction, PixelPos * UpscaleFactor, DeviceZ, GBuffer.WorldNormal, ReflectionMaxNormalBias);
+
+	Ray.Roughness = GBuffer.Roughness;
+
+	return Ray;
+}

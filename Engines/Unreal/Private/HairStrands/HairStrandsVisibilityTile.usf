@@ -1,0 +1,56 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "../Common.ush"
+#include "HairStrandsVisibilityCommon.ush"
+
+#define TILE_SIZE 8
+
+uint2 Resolution;
+uint2 TileResolution;
+uint  TileCount;
+uint  TileSize;
+
+Texture2D<uint4> CategorizationTexture;
+RWTexture2D<uint> OutTileCounter;
+RWTexture2D<uint> OutTileIndexTexture;
+RWBuffer<uint2>   OutTileBuffer;
+
+groupshared uint bAllocationTile;
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(uint GroupIndex : SV_GroupIndex, uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (GroupIndex == 0)
+	{
+		bAllocationTile = 0;
+	}
+
+	uint2 PixelCoord = DispatchThreadId.xy;
+	if (PixelCoord.x >= Resolution.x || PixelCoord.y >= Resolution.y)
+		PixelCoord = Resolution-1;
+
+	const uint2 TileCoord = PixelCoord / TILE_SIZE;
+	const FCategorizationData Categorization = DecodeCategorizationData(CategorizationTexture.Load(uint3(PixelCoord, 0)));
+	if (Categorization.PixelCoverage > 0)
+	{
+		InterlockedOr(bAllocationTile, 1);		
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupIndex == 0)
+	{
+		if (bAllocationTile > 0)
+		{
+			uint AllocationOffset = 0;
+			InterlockedAdd(OutTileCounter[uint2(0, 0)], 1, AllocationOffset);
+			OutTileIndexTexture[TileCoord] = AllocationOffset;
+			OutTileBuffer[AllocationOffset] = TileCoord;
+		}
+		else
+		{
+			OutTileIndexTexture[TileCoord] = INVALID_TILE_OFFSET;
+		}
+	}
+}

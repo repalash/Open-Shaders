@@ -1,0 +1,62 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsMaterialCommon.ush"
+
+void Main(
+	in float4 SvPosition: SV_Position
+	, in uint2 Resolution : DISPATCH_RESOLUTION
+	, in uint TotalNodeCount : DISPATCH_NODE_COUNT
+	#if HAIR_MATERIAL_DEBUG_OR_EMISSIVE_OUTPUT
+	, out float4 OutColor0 : SV_Target0
+	#endif
+	)
+{
+	ResolvedView = ResolveView();
+
+	const uint3 PixelCoord = uint3(floor(SvPosition.xy), 0);
+	const uint SampleIndex = PixelCoord.x + PixelCoord.y * Resolution.x;// MaterialPassParameters.MaxResolution.x;
+	bool bIsValid = false;
+	float3 Emissive = 0;
+	if (SampleIndex < TotalNodeCount)
+	{
+		const FNodeVis InNode = MaterialPassParameters.NodeVis[SampleIndex];
+		
+		const uint PackedSamplePixelCoord = MaterialPassParameters.NodeCoord[SampleIndex];
+		const float2 SamplePixelCoord = float2(PackedSamplePixelCoord & 0xFFFF, (PackedSamplePixelCoord>>16) & 0xFFFF) + float2(0.5f, 0.5f);
+
+		float SampleDepth = InNode.Depth;
+		uint SampleCoverage8bit = InNode.Coverage8bit;
+		uint SamplePrimitiveId = InNode.PrimitiveId;
+		uint SampleMaterialId = InNode.MaterialId;
+
+		if (SampleMaterialId == MaterialPass_MaterialId)
+		{
+			FEvaluateOutput Out = Evaluate(SamplePixelCoord, SampleDepth, SamplePrimitiveId, SampleCoverage8bit, MaterialPass_PrimitiveId, MaterialPassParameters.bUpdateSampleCoverage > 0);
+
+			// Note: Use the syntax _ over the syntax . as on certain platform the UAV buffers are 
+			// stored within a static const struct preventing doing a write operation
+			//
+			// Original code:
+			// MaterialPassParameters.OutNodeData[SampleIndex] = PackHairSample(Out.NodeData);
+			// MaterialPassParameters.OutNodeVelocity[SampleIndex] = Out.NodeVelocity;
+			MaterialPassParameters_OutNodeData[SampleIndex] = PackHairSample(Out.NodeData);
+			MaterialPassParameters_OutNodeVelocity[SampleIndex] = Out.NodeVelocity;
+
+			bIsValid = true;
+			Emissive = Out.NodeData.Emissive * float(Out.NodeData.Coverage8bit / 255.f);
+		}
+	}
+
+	#if HAIR_MATERIAL_DEBUG_OR_EMISSIVE_OUTPUT
+	if (MaterialPassParameters.bOutputEmissive > 0)
+	{
+		OutColor0 = float4(Emissive,1);
+	}
+	else
+	{	
+		OutColor0 = bIsValid ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+	}
+	#endif
+}
+
+

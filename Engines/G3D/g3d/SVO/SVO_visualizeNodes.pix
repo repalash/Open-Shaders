@@ -1,0 +1,21 @@
+#version 420
+/**
+  \file data-files/shader/SVO/SVO_visualizeNodes.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+uniform vec4 color;
+
+in vec4 vertColor;
+out vec4 outColor;
+
+void main() {
+	outColor = vertColor/2.0f;
+    //outColor = color;
+
+	outColor = vec4(1.0f, 0.0f, 0.0f, 1.0f);
+}

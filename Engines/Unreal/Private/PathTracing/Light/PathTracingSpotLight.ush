@@ -1,0 +1,163 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingSpotLight.usf: Light sampling functions for Spot light implementation
+===============================================================================================*/
+
+#pragma once
+
+#include "PathTracingLightCommon.ush"
+
+// #dxr_todo: These are stolen from DynamicLightingCommon.ush but I was having trouble getting that header to include cleanly
+/** 
+ * Calculates attenuation for a spot light.
+ * L normalize vector to light. 
+ * SpotDirection is the direction of the spot light.
+ * SpotAngles.x is CosOuterCone, SpotAngles.y is InvCosConeDifference. 
+ */
+float SpotAttenuationMask(float3 L, float3 SpotDirection, float2 SpotAngles)
+{
+	return saturate((dot(L, -SpotDirection) - SpotAngles.x) * SpotAngles.y);
+}
+float SpotAttenuation(float3 L, float3 SpotDirection, float2 SpotAngles)
+{
+	float ConeAngleFalloff = Square(SpotAttenuationMask(L, SpotDirection, SpotAngles));
+	return ConeAngleFalloff;
+}
+
+
+void SpotLight_GenerateLightRay(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out RayDesc OutLightRay
+)
+{
+	float3 LightDirection = GetPosition(LightId) - Ray.Origin;
+
+	OutLightRay.Origin = Ray.Origin;
+	OutLightRay.TMin = 0.001;
+	OutLightRay.Direction = TangentToWorld(LightUV, normalize(LightDirection));
+
+	// Compute distance to sphere edge
+	float Radius = GetRadius(LightId);
+	float Radius2 = Pow2(Radius);
+
+	float RayLength2 = dot(LightDirection, LightDirection);
+	float RayLength = sqrt(RayLength2);
+	float SinThetaMax2 = Radius2 / RayLength2;
+
+	float CosTheta = LightUV.z;
+	float SinTheta2 = 1.0 - CosTheta * CosTheta;
+
+	OutLightRay.TMax = RayLength * (CosTheta - sqrt(max(SinThetaMax2 - SinTheta2, 0.0)));
+}
+
+void SpotLight_PdfLight(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out float OutPdf
+)
+{
+	OutPdf = 0.0;
+}
+
+void SpotLight_EvalLight(
+	int LightId,
+	float3 LightUV,
+	RayDesc Ray,
+	out float3 OutRadiance
+)
+{
+	float3 LightDirection = GetPosition(LightId) - Ray.Origin;
+	float LightDistanceSquared = dot(LightDirection, LightDirection);
+
+	float3 Color = GetColor(LightId);
+	float Radius = GetRadius(LightId);
+	float Falloff = ComputeAttenuationFalloff(Ray.TMax, GetAttenuation(LightId));
+	OutRadiance = Color * Falloff;
+
+	// #dxr-todo: See math in point lights - ideally spot light would share that logic somehow
+	OutRadiance *= 1.0 / LightDistanceSquared;
+
+	// This appears to be the only difference between point and spot lights
+	float3 LightNormal = GetNormal(LightId);
+	float2 CosConeAngles = GetCosConeAngles(LightId);
+	OutRadiance *= SpotAttenuation(normalize(LightDirection), LightNormal, CosConeAngles);
+}
+
+void SpotLight_EstimateLight(
+	int LightId,
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	out float OutIrradiance
+)
+{
+	float3 LightPosition = GetPosition(LightId);
+	float3 LightNormal = GetNormal(LightId);
+	float LightPower = Luminance(GetColor(LightId));
+	float Radius = GetRadius(LightId);
+	
+	// Distance
+	float3 LightDirection = GetPosition(LightId) - Payload.WorldPos;
+	float LightDistanceSquared = dot(LightDirection, LightDirection);
+	LightDirection = normalize(LightDirection);
+
+	// Geometric term
+	float3 SurfaceNormal = Payload.WorldNormal;
+
+	float NoL = 1.0;
+	if (GetRadius(LightId) == 0.0)
+	{
+		float NoL = dot(SurfaceNormal, LightDirection);
+		NoL = ENABLE_TRANSMISSION && HasTransmission(LightId) ? abs(NoL) : saturate(NoL);
+	}
+
+	float Falloff = ComputeAttenuationFalloff(sqrt(LightDistanceSquared), GetAttenuation(LightId));
+	OutIrradiance = LightPower * Falloff * NoL / LightDistanceSquared;
+	
+	float2 CosConeAngles = GetCosConeAngles(LightId);
+	OutIrradiance *= SpotAttenuation(LightDirection, LightNormal, CosConeAngles);
+}
+	
+void SpotLight_SampleLight(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	int LightId,
+	out float3 OutLightUV,
+	out float OutPdf
+)
+{
+	float Radius = GetRadius(LightId);
+	if (Radius > 0.0)
+	{
+		// Soft case - sample the solid angle subtended by the sphere
+		float3 LightDirection = GetPosition(LightId) - Payload.WorldPos;
+		float LightDistanceSquared = dot(LightDirection, LightDirection);
+		float Radius2 = Pow2(Radius);
+		
+		// outside the light
+		float SinThetaMax2 = Radius2 / LightDistanceSquared;
+		// #dxr_todo: find a better way of handling the region inside the light
+		float CosThetaMax = sqrt(max(1.0 - SinThetaMax2, 0.0));
+		float4 DirAndPdf = UniformSampleCone(RandSample.yz, CosThetaMax);
+
+		OutLightUV = DirAndPdf.xyz;
+#if 0
+		OutPdf = DirAndPdf.w;
+#else
+		// doing the "right" thing leads to unstable math for small radius lights
+		// #dxr_todo: Revisit this when implementing MIS for all lights
+		OutPdf = 1.0;
+#endif
+	}
+	else
+	{
+		// Singular case
+		OutLightUV = float3(0, 0, 1);
+		// #dxr_todo: this isn't really part of the pdf, the pdf should be +inf for the singular case
+		OutPdf = 1.0;
+	}
+}

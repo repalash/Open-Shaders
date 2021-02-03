@@ -1,0 +1,20 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "RayTracingCommon.ush"
+#include "RayTracingHitGroupCommon.ush"
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(DeferredMaterialCHS,
+	FDeferredMaterialPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+	Payload.SortKey = GetHitGroupUserData();
+	Payload.HitT    = RayTCurrent();
+}
+
+RAY_TRACING_ENTRY_MISS(DeferredMaterialMS, 
+	FDeferredMaterialPayload, Payload)
+{
+	Payload.SetMiss();
+}
+

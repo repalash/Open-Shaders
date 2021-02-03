@@ -1,0 +1,43 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	SubsurfaceProfileCommon.ush: Subsurface scattering parameter lookup / decoding constants.
+=============================================================================================*/
+
+#pragma once
+
+// NOTE: Changing offsets below requires updating all instances of #SSSS_CONSTANTS
+// TODO: This needs to be defined in a single place and shared between C++ and shaders!
+#define SSSS_SUBSURFACE_COLOR_OFFSET			0
+#define BSSS_SURFACEALBEDO_OFFSET                (SSSS_SUBSURFACE_COLOR_OFFSET+1)
+#define BSSS_DMFP_OFFSET                        (BSSS_SURFACEALBEDO_OFFSET+1)
+#define SSSS_TRANSMISSION_OFFSET				(BSSS_DMFP_OFFSET+1)
+#define SSSS_BOUNDARY_COLOR_BLEED_OFFSET		(SSSS_TRANSMISSION_OFFSET+1)
+#define SSSS_DUAL_SPECULAR_OFFSET				(SSSS_BOUNDARY_COLOR_BLEED_OFFSET+1)
+#define SSSS_KERNEL0_OFFSET						(SSSS_DUAL_SPECULAR_OFFSET+1)
+#define SSSS_KERNEL0_SIZE						13
+#define SSSS_KERNEL1_OFFSET						(SSSS_KERNEL0_OFFSET + SSSS_KERNEL0_SIZE)
+#define SSSS_KERNEL1_SIZE						9
+#define SSSS_KERNEL2_OFFSET						(SSSS_KERNEL1_OFFSET + SSSS_KERNEL1_SIZE)
+#define SSSS_KERNEL2_SIZE						6
+#define SSSS_KERNEL_TOTAL_SIZE					(SSSS_KERNEL0_SIZE + SSSS_KERNEL1_SIZE + SSSS_KERNEL2_SIZE)
+#define SSSS_TRANSMISSION_PROFILE_OFFSET		(SSSS_KERNEL0_OFFSET + SSSS_KERNEL_TOTAL_SIZE)
+#define SSSS_TRANSMISSION_PROFILE_SIZE			32
+#define BSSS_TRANSMISSION_PROFILE_OFFSET        (SSSS_TRANSMISSION_PROFILE_OFFSET + SSSS_TRANSMISSION_PROFILE_SIZE)
+#define BSSS_TRANSMISSION_PROFILE_SIZE			SSSS_TRANSMISSION_PROFILE_SIZE
+#define	SSSS_MAX_TRANSMISSION_PROFILE_DISTANCE	5.0f // See MaxTransmissionProfileDistance in ComputeTransmissionProfile(), SeparableSSS.cpp
+#define SSSS_MAX_DUAL_SPECULAR_ROUGHNESS		2.0f
+
+// Threshold value at which model switches from SSS to default lit
+#define SSSS_OPACITY_THRESHOLD_EPS 0.10
+
+// One profile per line, encoded using constants above. See FSubsurfaceProfileTexture::CreateTexture() in SubsurfaceProfile.cpp.
+// By default, SSProfilesTexture is "Texture2D SSProfilesTexture", but it can be remapped as in BasePassCommon.usf.
+#ifndef SSProfilesTexture
+Texture2D SSProfilesTexture;
+#endif
+// Rename to allow the base pass to intercept with a value from its pass uniform buffer
+#ifndef ActualSSProfilesTexture
+#define ActualSSProfilesTexture SSProfilesTexture
+#endif
+

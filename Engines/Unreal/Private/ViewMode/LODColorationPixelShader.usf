@@ -1,0 +1,83 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LODColorationPixelSahder.usf: LOD Color.
+=============================================================================*/
+
+#define TEX_COORD_SCALE_ANALYSIS 1
+#define DEBUG_MATERIAL_PARAMETERS 1
+
+#undef SCENE_TEXTURES_DISABLED
+#define SCENE_TEXTURES_DISABLED 1
+
+#undef EYE_ADAPTATION_DISABLED
+#define EYE_ADAPTATION_DISABLED 1
+
+#include "../Common.ush"
+#include "../SHCommon.ush"
+
+struct FTexCoordScalesParams { float Dummy; };
+MaterialFloat StoreTexCoordScale(in out FTexCoordScalesParams Params, float2 UV, int TextureReferenceIndex) { return 1.f; }
+MaterialFloat StoreTexSample(in out FTexCoordScalesParams Params, float4 C, int TextureReferenceIndex) { return 1.f; }
+
+#include "/Engine/Generated/Material.ush"
+#include "../DebugViewModeCommon.ush"
+
+int LODIndex;
+
+#if LIGHTMAP_VT_ENABLED || NUM_VIRTUALTEXTURE_SAMPLES
+EARLYDEPTHSTENCIL
+#endif
+void Main(
+	in FDebugPSIn DebugInputs
+	OPTIONAL_IsFrontFace,
+	out float4 OutColor : SV_Target0
+	)
+{
+#if INSTANCED_STEREO
+	ResolvedView = ResolveView(DebugInputs.EyeIndex);
+#else
+	ResolvedView = ResolveView();
+#endif
+
+	float3 Result = DebugViewModePass.LODColors[LODIndex].rgb;
+
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(DebugInputs, DebugInputs.SvPosition);
+	MaterialParameters.TexCoordScalesParams.Dummy = 0;
+
+	half3 BaseColor;
+	half Opacity;
+	{
+		FPixelMaterialInputs PixelMaterialInputs;
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, DebugInputs.SvPosition, bIsFrontFace);
+
+		// Sample material properties. The results are not used, but the calls to StoreTexCoordScale are still be made.
+		BaseColor = GetMaterialBaseColorRaw(PixelMaterialInputs);
+		Opacity = GetMaterialOpacityRaw(PixelMaterialInputs);
+
+		half3 Emissive = GetMaterialEmissiveRaw(PixelMaterialInputs);
+#if MATERIALBLENDING_ADDITIVE
+		Opacity = (.05 + .95 * Luminance(Emissive));
+#else
+		BaseColor += Emissive;
+#endif
+
+#if MATERIALBLENDING_MASKED
+		clip(GetMaterialMask(PixelMaterialInputs));
+#endif
+	}
+
+	Result *= (.05 + .95 * Luminance(BaseColor));
+
+	OutColor = RETURN_COLOR(float4(Result, Opacity));
+	
+#if NUM_VIRTUALTEXTURE_SAMPLES || LIGHTMAP_VT_ENABLED
+	FinalizeVirtualTextureFeedback(
+		MaterialParameters.VirtualTextureFeedback,
+		MaterialParameters.SvPosition,
+		1.0,
+		View.FrameNumber,
+		View.VTFeedbackBuffer
+	);
+#endif
+}

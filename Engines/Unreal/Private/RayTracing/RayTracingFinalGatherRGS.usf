@@ -1,0 +1,410 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../RectLight.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShadingModels.ush"
+#include "../SceneTextureParameters.ush"
+
+#include "RayTracingCommon.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+#include "RayTracingHitGroupCommon.ush"
+#include "RayTracingGatherPoints.ush"
+
+#include "../PathTracing/Light/PathTracingLightSampling.ush"
+#include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+
+#include "../QuasiRandom.ush"
+
+#define USE_PATHTRACING_MATERIALS 0
+#define USE_REJECTION_CRITERIA 0
+#define USE_REPROJECTION 1
+#define USE_NEIGHBOR_SAMPLES 1
+#define USE_TEMPORAL_SAMPLES 1
+#define USE_NEIGHBOR_VISIBILITY_TEST 0
+
+
+uint SampleIndex;
+uint SamplesPerPixel;
+uint UpscaleFactor;
+uint RenderTileOffsetX;
+uint RenderTileOffsetY;
+float DiffuseThreshold;
+float MaxNormalBias;
+float FinalGatherDistance;
+uint GatherFilterWidth;
+uint GatherPointIterations;
+uint UseFireflySuppression;
+
+RaytracingAccelerationStructure TLAS;
+
+int2 GatherPointsResolution;
+StructuredBuffer<FGatherPoints> GatherPointsBuffer;
+
+RWTexture2D<float4> RWGlobalIlluminationUAV;
+RWTexture2D<float2> RWGlobalIlluminationRayDistanceUAV;
+
+uint DispatchThreadIdToLinearIndex(uint2 DispatchThreadId)
+{
+	return DispatchThreadId.y * GatherPointsResolution.x + DispatchThreadId.x;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin + uint2(RenderTileOffsetX, RenderTileOffsetY);
+	RWGlobalIlluminationUAV[DispatchThreadId] = 0.0;
+	RWGlobalIlluminationRayDistanceUAV[DispatchThreadId] = float2(-1.0, 0.0);
+
+	// Get G-Buffer surface data
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+
+#if 0
+	FGBufferData GBufferData = GetGBufferDataFromSceneTextures(UV);
+#else
+	//#dxr-todo: workaround for flickering. UE-87281
+	FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+#endif
+
+	// Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+	if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+	{
+		GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+	}
+
+	// Cull based on shading model
+	uint ShadingModelID = GBufferData.ShadingModelID;
+	if (ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		return;
+	}
+
+	// Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+	if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+	{
+		GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+	}
+	float3 DiffuseColor = GBufferData.DiffuseColor;
+	if (Luminance(DiffuseColor) < DiffuseThreshold)
+	{
+		return;
+	}
+
+	// Construct position, normal, and view direction
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	float3 WorldNormal = GBufferData.WorldNormal;
+
+//#if USE_REJECTION_CRITERIA
+	// Define rejection criteria and evaluate
+	bool bShouldReject[MAXIMUM_GATHER_POINTS_PER_PIXEL];
+//#endif
+
+	// Create ray differential based on rejection distance (in pixels)
+	UV = (float2(PixelCoord) + 0.5 + float2(0.0, FinalGatherDistance * UpscaleFactor)) * InvBufferSize;
+	RayDesc Ray = CreatePrimaryRay(UV);
+
+	// Intersect ray differential with normal to find world-space distance
+	float d = -dot(WorldNormal, WorldPosition);
+	float T = -(d + dot(WorldNormal, Ray.Origin)) / dot(WorldNormal, Ray.Direction);
+	float3 WorldDeltaPosition = Ray.Origin + T * Ray.Direction;
+	float RejectionDistance = length(WorldDeltaPosition - WorldPosition);
+
+	float3 ExitantRadiance = 0.0;
+	float3 MaxExitantRadianceSample = 0.0;
+	//float HitDistance = 1.0e7;
+	float HitDistance = 0.0;
+	float HitCount = 0.0;
+	uint ValidSamplesPerPixel = 0;
+
+	// Gather from temporal history
+#if USE_TEMPORAL_SAMPLES
+
+	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
+	FRejectionCriteria RejectionCriteria = CreateRejectionCriteria(WorldPosition, RejectionDistance);
+#if USE_REJECTION_CRITERIA
+	CreateRejectionMask(RejectionCriteria, GatherPointsBuffer, GatherPointsIndex, 0, GatherPointsResolution.x* GatherPointsResolution.y, SamplesPerPixel, bShouldReject);
+#endif
+
+	for (uint LocalSampleIndex = 0; LocalSampleIndex < SamplesPerPixel; ++LocalSampleIndex)
+	{
+		//bShouldReject[LocalSampleIndex] = true;
+		//if (LocalSampleIndex == SampleIndex) continue;
+#if USE_REJECTION_CRITERIA
+		if (bShouldReject[LocalSampleIndex])
+		{
+			bShouldReject[LocalSampleIndex] = true;
+			//continue;
+		}
+#endif
+
+#if USE_REPROJECTION
+		float4 ScreenPositionTime = mul(float4(WorldPosition, 1.0), GatherPointData.ViewMatrices[LocalSampleIndex]);
+		ScreenPositionTime.xyz /= ScreenPositionTime.w;
+		if (any(abs(ScreenPositionTime.xy) > 1.0))
+		{
+			bShouldReject[LocalSampleIndex] = true;
+			//continue;
+		}
+
+		float2 ScreenUVTime = ScreenPositionTime.xy * float2(0.5, -0.5) + 0.5;
+		GatherPointsIndex = DispatchThreadIdToLinearIndex(int2(ScreenUVTime * GatherPointsResolution + View.ViewRectMin));
+#endif
+
+		FGatherSample GatherSample = ReadGatherSample(GatherPointsBuffer, GatherPointsIndex, LocalSampleIndex, GatherPointsResolution.x * GatherPointsResolution.y);
+
+#if USE_REPROJECTION
+		float3 GPDistance2 = RejectionCriteria.CreationPoint - GatherSample.CreationPoint;
+		if (dot(GPDistance2, GPDistance2) > RejectionCriteria.DistanceThreshold2)
+		{
+			bShouldReject[LocalSampleIndex] = true;
+		}
+#endif
+
+		uint SampleIndexEnd = (SampleIndex + GatherPointIterations) % SamplesPerPixel;
+		if (SampleIndex < SampleIndexEnd)
+		{
+			if (LocalSampleIndex >= SampleIndex && LocalSampleIndex < SampleIndexEnd)
+				bShouldReject[LocalSampleIndex] = false;
+		}
+		else
+		{
+			if (LocalSampleIndex < SampleIndexEnd || LocalSampleIndex >= SampleIndex)
+				bShouldReject[LocalSampleIndex] = false;
+		}
+
+		if (bShouldReject[LocalSampleIndex])
+		{
+			continue;
+		}
+		ValidSamplesPerPixel++;
+
+		float3 GPPosition = GatherSample.Position;
+		float3 GPIrradiance = GatherSample.Irradiance;
+
+		// Initialize throughput based on BRDF
+		half3 N = WorldNormal;
+		half3 V = -CameraDirection;
+		half3 L = normalize(GPPosition - WorldPosition);
+		float NoL = dot(N, L);
+		if (NoL <= 0.0) continue;
+
+		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+		float3 RayThroughput = LightingSample.Diffuse / DiffuseColor;
+
+		float TargetPdf = NoL / PI;
+		//float TargetPdf = 1.0 / (4.0 * PI);
+		float SourcePdf = GatherSample.Pdf;
+		float Weight = TargetPdf / SourcePdf;
+		float RayPdf = TargetPdf;
+
+		// Firefly prevention attempt
+		if (RayPdf < 1.0e-3) continue;
+
+		// Create ray
+		RayDesc Ray;
+		Ray.Origin = WorldPosition;
+		Ray.Direction = normalize(GPPosition - WorldPosition);
+		Ray.TMin = 0.05;
+		float RayLength = length(GPPosition - WorldPosition);
+		Ray.TMax = max(RayLength - 0.01, Ray.TMin);
+
+		// Trace ray
+		uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			Ray);
+
+		// No hit indicates successful next-event connection
+		if (MinimalPayload.IsMiss() && RayPdf > 0.0)
+		{
+			float3 ExitantRadianceSample = GPIrradiance * RayThroughput * Weight / RayPdf;
+
+			// Tonemap for firefly suppression
+			if (UseFireflySuppression)
+			{
+				ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+			}
+
+			ExitantRadiance += ExitantRadianceSample;
+			MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+			HitDistance += rcp(Ray.TMax);
+
+			HitCount += 1.0;
+		}
+		else
+		{
+			HitDistance += rcp(MinimalPayload.HitT);
+		}
+	}
+#endif
+
+	int GatherFilterWidth2 = GatherFilterWidth * GatherFilterWidth;
+#if USE_NEIGHBOR_SAMPLES
+	// Gather from local neighborhood if confidence in temporal history is low
+	{
+		// dxr_todo: Iterate backwards until history rejection declares all remaining samples invalid
+		for (uint ParentSampleIndex = 0; ParentSampleIndex < SamplesPerPixel; ++ParentSampleIndex)
+		{
+			if (bShouldReject[ParentSampleIndex]) continue;
+
+#if USE_REPROJECTION
+			float4 ScreenPositionTime = mul(float4(WorldPosition, 1.0), GatherPointData.ViewMatrices[ParentSampleIndex]);
+			ScreenPositionTime.xyz /= ScreenPositionTime.w;
+			float2 ScreenUVTime = ScreenPositionTime.xy * float2(0.5, -0.5) + 0.5;
+			int2 GatherPointCentroid = int2(ScreenUVTime * GatherPointsResolution + View.ViewRectMin);
+#endif
+
+			for (uint LocalSampleIndex0 = 0; LocalSampleIndex0 < GatherFilterWidth2; ++LocalSampleIndex0)
+			{
+				uint Midpoint = (GatherFilterWidth2 - 1) / 2;
+				if (LocalSampleIndex0 == Midpoint) continue;
+
+				int2 LocalIndex = int2(LocalSampleIndex0 % GatherFilterWidth, LocalSampleIndex0 / GatherFilterWidth);
+
+#if 1
+				// Preserve stratification domain
+				//int2 GlobalIndex = DispatchThreadId - (DispatchThreadId % GatherFilterWidth) + LocalIndex;
+				int2 GlobalIndex = GatherPointCentroid - (GatherPointCentroid % GatherFilterWidth) + LocalIndex;
+#else
+				// Respect local neighborhood, destroying stratification properties
+				int2 Midpoint2 = GatherFilterWidth / 2;
+				LocalIndex -= Midpoint2;
+				int2 GlobalIndex = DispatchThreadId + LocalIndex;
+				if (any(GlobalIndex < 0) || any(GlobalIndex > View.BufferSizeAndInvSize.xy)) continue;
+#endif
+
+				ValidSamplesPerPixel++;
+				uint GatherPointsIndex = DispatchThreadIdToLinearIndex(GlobalIndex);
+				FGatherSample GatherSample = ReadGatherSample(GatherPointsBuffer, GatherPointsIndex, ParentSampleIndex, GatherPointsResolution.x * GatherPointsResolution.y);
+				float3 GPPosition = GatherSample.Position;
+				float3 GPIrradiance = GatherSample.Irradiance;
+
+				// Initialize throughput based on BRDF
+				half3 N = WorldNormal;
+				half3 V = -CameraDirection;
+				half3 L = normalize(GPPosition - WorldPosition);
+				float NoL = dot(N, L);
+
+				// Threshold against grazing angle, so the the pdf's don't explode
+				if (NoL < 1.0e-3) continue;
+
+				FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+				FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+				float3 RayThroughput = LightingSample.Diffuse / DiffuseColor;
+				float TargetPdf = NoL / PI;
+				//float TargetPdf = 1.0 / (4.0 * PI);
+				float SourcePdf = GatherSample.Pdf;
+				float Weight = TargetPdf / SourcePdf;
+				float RayPdf = TargetPdf;
+
+				// Firefly prevention attempt
+				if (RayPdf < 1.0e-3) continue;
+
+#if USE_NEIGHBOR_VISIBILITY_TEST
+				// Create ray
+				RayDesc Ray;
+				Ray.Origin = WorldPosition;
+				Ray.Direction = normalize(GPPosition - WorldPosition);
+				Ray.TMin = 0.01;
+				float RayLength = length(GPPosition - WorldPosition);
+				Ray.TMax = max(RayLength - 0.01, Ray.TMin);
+
+				// Trace ray
+				uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+				const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+				RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+				FMinimalPayload MinimalPayload = TraceVisibilityRay(
+					TLAS,
+					RayFlags,
+					InstanceInclusionMask,
+					PixelCoord,
+					Ray);
+
+				// No hit indicates successful next-event connection
+				if (MinimalPayload.IsMiss() && RayPdf > 0.0)
+#endif
+				{
+					float3 ExitantRadianceSample = GPIrradiance * RayThroughput * Weight / RayPdf;
+
+					// Tonemap for firefly suppression
+					if (UseFireflySuppression)
+					{
+						ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+					}
+
+					ExitantRadiance += ExitantRadianceSample;
+					MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+					HitDistance += rcp(Ray.TMax);
+					HitCount += 1.0;
+				}
+#if USE_NEIGHBOR_VISIBILITY_TEST
+				else
+				{
+					HitDistance += rcp(MinimalPayload.HitT);
+				}
+#endif
+			}
+		}
+	}
+#endif
+
+	float AmbientOcclusion = 0.0;
+#if 1
+	// Remove worst outlier when using neighbor sampling
+	if (GatherFilterWidth > 1)
+	{
+		ExitantRadiance -= MaxExitantRadianceSample;
+		ValidSamplesPerPixel--;
+	}
+#endif
+
+	if (ValidSamplesPerPixel > 0)
+	{
+		ExitantRadiance /= ValidSamplesPerPixel;
+		// Tonemap inversion for firefly suppression
+		if (UseFireflySuppression)
+		{
+			ExitantRadiance *= rcp(1 - Luminance(ExitantRadiance));
+		}
+
+		AmbientOcclusion = HitCount / ValidSamplesPerPixel;
+		HitDistance = ValidSamplesPerPixel / HitDistance;
+	}
+#if USE_PREEXPOSURE
+	ExitantRadiance *= View.PreExposure;
+#endif
+	ExitantRadiance = ClampToHalfFloatRange(ExitantRadiance);
+#if 0
+	// Threshold against low luminance..
+	float LuminanceThreshold = 1.0 / 256.0;
+	if (Luminance(ExitantRadiance * DiffuseColor) < LuminanceThreshold)
+	{
+		ExitantRadiance = 0.0;
+	}
+#endif
+	if (HitCount == 0.0)
+	{
+		HitDistance = -1.0;
+	}
+
+	RWGlobalIlluminationUAV[DispatchThreadId] = float4(ExitantRadiance, AmbientOcclusion);
+	RWGlobalIlluminationRayDistanceUAV[DispatchThreadId] = float2(HitDistance, ValidSamplesPerPixel);
+}

@@ -1,0 +1,116 @@
+#version 420
+/**
+  \file data-files/shader/SVO/SVO_renderRaycasting.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+uniform mat4 modelViewMat;
+
+uniform float focalLength;
+uniform float screenRatio;
+uniform vec2 renderRes;
+uniform vec3 rayOrigin;
+
+/** Level to render */
+uniform int             level;
+
+
+in vec3 svoPos;
+
+
+#include <SVO/SVO.glsl>
+
+struct Ray {
+	vec3 origin;
+	vec3 dir;
+};
+	 
+struct AABB {
+	vec3 Min;
+	vec3 Max;
+};
+	 
+bool IntersectBox(Ray r, AABB aabb, out float t0, out float t1)
+{
+	vec3 invR = 1.0 / r.dir;
+	vec3 tbot = invR * (aabb.Min-r.origin);
+	vec3 ttop = invR * (aabb.Max-r.origin);
+	vec3 tmin = min(ttop, tbot);
+	vec3 tmax = max(ttop, tbot);
+	vec2 t = max(tmin.xx, tmin.yz);
+	t0 = max(t.x, t.y);
+	t = min(tmax.xx, tmax.yz);
+	t1 = min(t.x, t.y);
+	return t0 <= t1;
+}
+
+
+
+void main() {
+
+#if 1
+	vec3 rayDir;
+	rayDir.xy = (2.0 * (gl_FragCoord.xy / renderRes) - 1.0);
+	rayDir.y=-rayDir.y*screenRatio;
+	//rayDir.x=-rayDir.x;
+	rayDir.z = -focalLength;
+
+	rayDir =  ( vec4(rayDir, 0) * transpose(modelViewMat) ).xyz ;
+
+	rayDir = normalize( rayDir );
+#else
+	vec3 rayDir=normalize(svoPos-rayOrigin);
+#endif
+
+
+	Ray eyeRay = Ray( rayOrigin, (rayDir) );
+
+	AABB aabb = AABB(vec3(0.0001), vec3(0.999));
+
+	float tnear, tfar;
+	bool inter=IntersectBox(eyeRay, aabb, tnear, tfar);
+	if (tnear < 0.0) 
+		tnear = 0.0;
+
+	vec3 rayStart = eyeRay.origin + eyeRay.dir * tnear;
+	vec3 rayStop = eyeRay.origin + eyeRay.dir * tfar;
+
+	//////////////////////////////
+	float t=tnear;
+
+	vec4 finalColor=vec4(0.0f);
+
+	if(inter){
+		while(t<tfar && finalColor.a<0.99f){
+			vec3 samplePos=eyeRay.origin + eyeRay.dir*t;
+
+			int nodeIndex=svoGetNodeIndex(level, samplePos);
+
+			if(nodeIndex!=0){
+				vec4 newCol=vec4(samplePos, 1.0f);
+				newCol.rgb*=newCol.a;
+
+				finalColor += newCol*(1.0f-finalColor.a);
+			}
+
+			t+=0.66f/512.0f;
+		}
+	}
+	//////////////////////////////
+	//gl_FragColor.rgb = svoPos;
+	//gl_FragColor.rgb = svoPos + rayDir;
+	//gl_FragColor.rgb = rayStart;
+	//gl_FragColor.rgb = rayStop;
+
+	if(finalColor.a<=0.0f)
+		discard;
+
+	gl_FragColor.rgb = finalColor.rgb;
+
+
+    gl_FragColor.a = 1;
+}

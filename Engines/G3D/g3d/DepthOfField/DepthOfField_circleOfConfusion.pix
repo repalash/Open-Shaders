@@ -1,0 +1,127 @@
+#version 330
+/**
+  \file data-files/shader/DepthOfField/DepthOfField_circleOfConfusion.pix
+
+  Stores a signed, scaled circle of confusion radius
+  into the output buffer, reading from a depth buffer or linear camera
+  space Z buffer.  Optionally packs the color buffer into the RGB channels.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+/* The near field has a POSITIVE radius in this code and the far
+   field is negative. This is the opposite of other G3D conventions. */
+
+#include <compatibility.glsl>
+#include <reconstructFromDepth.glsl>
+#include <DepthOfField/DepthOfField.glsl>
+
+#expect MODEL "PHYSICAL, ARTIST, or NONE"
+#expect PACK_WITH_COLOR "0 = no color buffer, 1 = read a color buffer and combine the two in the output"
+
+
+#if MODEL != NONE
+#   ifdef CS_Z
+        uniform sampler2D   CS_Z_buffer;
+        uniform sampler2D   CS_Z_readScaleBias;
+#   else 
+        uniform sampler2D   DEPTH_buffer;
+        uniform float3      clipInfo;
+#   endif
+#endif
+
+#if PACK_WITH_COLOR
+    uniform sampler2D       COLOR_buffer;
+#endif
+
+/** Trim this many pixels off all sides */
+uniform int2            trimBandThickness;
+  
+/** For chromablur */
+#define  screenFocusZ nearSharpPlaneZ
+
+
+#if MODEL == PHYSICAL
+    uniform float       focusPlaneZ;
+    uniform float       scale;
+    uniform float       nearSharpPlaneZ;
+    
+    float               nearBlurryPlaneZ;
+	float               farSharpPlaneZ;
+	float               farBlurryPlaneZ;
+	float               nearScale;
+	float               farScale;
+#elif MODEL == ARTIST
+    float               focusPlaneZ;
+    float               scale;
+
+    uniform float       nearBlurryPlaneZ;
+    uniform float       nearSharpPlaneZ;
+    uniform float       farSharpPlaneZ;
+    uniform float       farBlurryPlaneZ;
+
+    /** Scales the near-field z distance to the fraction of the maximum
+        blur radius in either field. Only used in the artist model. */
+    uniform float       nearScale;
+
+    /** Scales the far-field z distance to the fraction of the maximum
+        blur radius in either field. Only used in the artist model.*/
+    uniform float       farScale;
+#endif
+
+// The output radius is SIGNED (before scaled and biased for packing into the frame buffer)
+// The blur and composite passes use negative numbers to distinguish near and far field.
+out vec4 result;
+#if PACK_WITH_COLOR
+#    define color        result.rgb
+#    define radius       result.a
+#else
+#    define radius       result.r
+#endif
+
+#expect COMPUTE_PERCENT "integer screen fraction percent (as a disk radius) within which to render. used for VR. <= 0 to disable"
+
+void main() {        
+    int2 coord = int2(gl_FragCoord.xy) + trimBandThickness;
+
+#   if PACK_WITH_COLOR
+        color = texelFetch(COLOR_buffer, coord, 0).rgb;
+#   endif
+
+    // VR cropping
+#   if COMPUTE_PERCENT > 0
+        if (square(gl_FragCoord.x - g3d_FragCoordExtent.x * 0.5) + square(gl_FragCoord.y - g3d_FragCoordExtent.y * 0.5) > square(0.005 * float(COMPUTE_PERCENT) * max(g3d_FragCoordExtent.x, g3d_FragCoordExtent.y))) {
+            radius = 0.5;
+            return;
+        }
+#   endif
+
+
+    float z;
+#   ifdef CS_Z
+        z = texelFetch(CS_Z_buffer, coord, 0).r * CS_Z_readScaleBias.x + CS_Z_readScaleBias.y;
+#   else
+        z = reconstructCSZ(texelFetch(DEPTH_buffer, coord, 0).r, clipInfo);
+#   endif
+
+	// Baked the maximum circle of confusion into the scale factor so this is in the range -1, 1 and not pixels
+	radius = circleOfConfusionRadiusPixels
+	   (z,
+		focusPlaneZ,
+		screenFocusZ,
+		nearBlurryPlaneZ,
+		nearSharpPlaneZ,
+		farBlurryPlaneZ,
+		farSharpPlaneZ,
+		nearScale,
+		farScale,
+		scale,
+		false,
+		MODEL);
+
+    // (the scale and bias are hardcoded in the blur shader that reads this texture)  
+    radius = clamp(radius, -1.0, 1.0) * 0.5 + 0.5f;
+}

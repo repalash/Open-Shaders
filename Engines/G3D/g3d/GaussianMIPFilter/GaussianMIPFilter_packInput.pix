@@ -1,0 +1,26 @@
+#version 410
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+
+uniform mat4x3 cameraFrame;
+
+// the w component is zero if we should ignore the sample
+uniform_Texture(sampler2D, srcWSNormal_);
+uniform sampler2D srcWSPosition;
+uniform sampler2D srcGlossy;
+
+out vec4 csNormalZ;
+
+void main() {
+    ivec2 C = ivec2(gl_FragCoord.xy);
+    Vector3 wsNormal = normalize(texelFetch(srcWSNormal_buffer, C, 0).xyz * srcWSNormal_readMultiplyFirst.rgb + srcWSNormal_readAddSecond.rgb);
+    Point3 wsPosition = texelFetch(srcWSPosition, C, 0).xyz;
+    Color3 glossy = texelFetch(srcGlossy, C, 0).rgb;
+    
+    if (sum(glossy) == 0) {
+        csNormalZ = vec4(0,0,0,0);
+    } else {
+        csNormalZ.xyz = normalize(wsNormal * mat3x3(cameraFrame));
+        csNormalZ.w = dot(wsPosition - cameraFrame[3], cameraFrame[2]);
+    }
+}

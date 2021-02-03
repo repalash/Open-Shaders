@@ -1,0 +1,30 @@
+#version 120 or 150 compatibility or 420 compatibility
+#include <compatibility.glsl>
+
+uniform float     radius;
+uniform sampler2D sourceTexture;
+uniform vec4      g3d_sz2D_sourceTexture;
+
+void main() {
+    vec2 coord = gl_TexCoord[0].st;
+
+    // This explicit correction to half-pixel positions is needed when rendering to the hardware frame buffer
+    // but not when rendering to a texture.
+    coord = (floor(coord * g3d_sz2D_sourceTexture.xy) + float2(0.5, 0.5)) * g3d_sz2D_sourceTexture.zw;
+
+    // Store the negatives in zw
+    float4 offset = float4(radius * g3d_sz2D_sourceTexture.zw, 0, 0);
+    offset.zw = -offset.xy;
+
+    // Average four texels
+    gl_FragColor.rgb = 
+        0.25 * (
+            // +, +
+            textureLod(sourceTexture, coord + offset.xy, 0).rgb + 
+            // +, -
+            textureLod(sourceTexture, coord + offset.xw, 0).rgb + 
+            // -, +
+            textureLod(sourceTexture, coord + offset.zy, 0).rgb + 
+            // -, -
+            textureLod(sourceTexture, coord + offset.zw, 0).rgb);
+}

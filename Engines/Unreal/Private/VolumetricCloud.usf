@@ -1,0 +1,1628 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/**
+ * VolumetricCloud.usf: Render volumetric cloud on screen.
+ */
+
+
+#include "Common.ush"
+
+#define SceneTexturesStruct RenderVolumetricCloudParameters.SceneTextures
+
+#include "Random.ush"
+#include "VolumetricCloudCommon.ush"
+
+#if defined(SHADER_MAINVS) || defined(SHADER_RENDERVIEW_PS) || defined(SHADER_SHADOW_PS)
+
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+#include "ReflectionEnvironmentShared.ush"
+
+
+struct RenderVolumetricCloudVSToPS
+{
+	FVertexFactoryInterpolantsVSToPS FactoryInterpolants;
+	float4 Position : SV_POSITION;
+};
+
+#if defined(SHADER_RENDERVIEW_PS) || defined(SHADER_SHADOW_PS)
+
+float3 SampleExtinctionCoefficients(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	return clamp(GetMaterialSubsurfaceDataRaw(PixelMaterialInputs).rgb, 0.0f, 65000.0f);
+}
+
+float3 SampleEmissive(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	return USES_EMISSIVE_COLOR ? GetMaterialEmissive(PixelMaterialInputs) : 0.0f;
+}
+
+float3 SampleAlbedo(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	return saturate(GetMaterialBaseColor(PixelMaterialInputs));
+}
+
+float3 SampleAmbientOcclusion(in FPixelMaterialInputs PixelMaterialInputs)
+{
+	return GetMaterialAmbientOcclusion(PixelMaterialInputs);
+}
+
+#endif
+
+#endif
+
+
+
+////////////////////////////////////////////////////////////
+// When we get HZB.hlsl from Reverb, remove that and use common code. 
+// Keeping duplicated code for now to avoid merge pain.
+////////////////////////////////////////////////////////////
+
+// Adapted from HZBOcclusion.usf.
+// Rect contains screen coordinates as {minx, miny, maxx, maxy}. Those coordinates are not clamped to screen edges so they mnight be outside the [0,1]^2.
+bool ViewHierarchicalZBufferMinDepth(float4 ScreenUVMinMax, const float MaxZDepth)
+{
+	float4 Rect = saturate(ScreenUVMinMax);
+	float4 RectPixels = Rect * RenderVolumetricCloudParameters.HZBSize.xyxy;
+
+	float2 RectSize = (RectPixels.zw - RectPixels.xy);
+	float Level = max(ceil(log2(max(RectSize.x, RectSize.y))), RenderVolumetricCloudParameters.HZBUvFactor.z);
+
+	// Check if we can drop one level lower
+	float LevelLower = max(Level - 1, 0);
+	float4 LowerRect = RectPixels * exp2(-LevelLower);
+	float2 LowerRectSize = ceil(LowerRect.zw) - floor(LowerRect.xy);
+	if (all(LowerRectSize <= 4))
+	{
+		Level = LevelLower;
+	}
+
+	// 4x4 samples
+	float2 Scale = RenderVolumetricCloudParameters.HZBUvFactor.xy * (Rect.zw - Rect.xy) / 3;
+	float2 Bias = RenderVolumetricCloudParameters.HZBUvFactor.xy * Rect.xy;
+
+	float4 MinDepth = 1;
+	/*UNROLL*/ for (int i = 0; i < 4; i++)
+	{
+		// TODO could vectorize this
+		float4 Depth;
+		Depth.x = RenderVolumetricCloudParameters.HZBTexture.SampleLevel(RenderVolumetricCloudParameters.HZBSampler, float2(i, 0) * Scale + Bias, Level).r;
+		Depth.y = RenderVolumetricCloudParameters.HZBTexture.SampleLevel(RenderVolumetricCloudParameters.HZBSampler, float2(i, 1) * Scale + Bias, Level).r;
+		Depth.z = RenderVolumetricCloudParameters.HZBTexture.SampleLevel(RenderVolumetricCloudParameters.HZBSampler, float2(i, 2) * Scale + Bias, Level).r;
+		Depth.w = RenderVolumetricCloudParameters.HZBTexture.SampleLevel(RenderVolumetricCloudParameters.HZBSampler, float2(i, 3) * Scale + Bias, Level).r;
+		MinDepth = min(MinDepth, Depth);
+	}
+	MinDepth.x = min(min(MinDepth.x, MinDepth.y), min(MinDepth.z, MinDepth.w));
+
+	// Inverted Z buffer
+	//return RectMax.z >= MinDepth.x ? true : false;
+	return MaxZDepth >= MinDepth.x ? true : false;
+}
+
+
+////////////////////////////////////////////////////////////
+// Single full screen triangle vertex shader
+////////////////////////////////////////////////////////////
+
+#ifdef SHADER_MAINVS
+
+void MainVS(
+	in FVertexFactoryInput FactoryInput,
+	out RenderVolumetricCloudVSToPS Interpolants
+)
+{
+	ResolvedView = ResolveView();
+
+	// Full screen triangle
+	Interpolants.Position = float4(FactoryInput.VertexId == 2 || FactoryInput.VertexId == 1 ? 1.0 : -3.0, FactoryInput.VertexId == 1 ? -3.0 : 1.0, 0.5f, 1.0f);
+
+	const float3 WorldPosition = 0.0f;
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(FactoryInput);
+	float3x3 TangentToLocal = VertexFactoryGetTangentToLocal(FactoryInput, VFIntermediates);
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(FactoryInput, VFIntermediates, WorldPosition, TangentToLocal);
+	Interpolants.FactoryInterpolants = VertexFactoryGetInterpolantsVSToPS(FactoryInput, VFIntermediates, VertexParameters);
+
+	OutputVertexID(Interpolants);
+}
+
+#endif // SHADER_MAINVS
+
+
+
+////////////////////////////////////////////////////////////
+// Common structures and functions
+////////////////////////////////////////////////////////////
+
+#if CLOUD_LAYER_PIXEL_SHADER
+
+float3 HUEtoRGB(in float H)
+{
+	float R = abs(H * 6 - 3) - 1;
+	float G = 2 - abs(H * 6 - 2);
+	float B = 2 - abs(H * 6 - 4);
+	return saturate(float3(R, G, B));
+}
+
+float3 HSVtoRGB(in float3 HSV)
+{
+	float3 RGB = HUEtoRGB(HSV.x);
+	return ((RGB - 1) * HSV.y + 1) * HSV.z;
+}
+
+float3 GetColorCode(float x)
+{
+	float c = (1 - saturate(x)) * 0.6; // Remap [0,1] to Blue-Red
+	return x > 0 ? HSVtoRGB(float3(c, 1, 1)) : float3(0, 0, 0);
+}
+
+bool RayIntersectSphereSolution(float3 RayOrigin, float3 RayDirection, float4 Sphere, inout float2 Solutions)
+{
+	float3 LocalPosition = RayOrigin - Sphere.xyz;
+	float LocalPositionSqr = dot(LocalPosition, LocalPosition);
+
+	float3 QuadraticCoef;
+	QuadraticCoef.x = dot(RayDirection, RayDirection);
+	QuadraticCoef.y = 2 * dot(RayDirection, LocalPosition);
+	QuadraticCoef.z = LocalPositionSqr - Sphere.w * Sphere.w;
+
+	float Discriminant = QuadraticCoef.y * QuadraticCoef.y - 4 * QuadraticCoef.x * QuadraticCoef.z;
+
+	// Only continue if the ray intersects the sphere
+	FLATTEN
+	if (Discriminant >= 0)
+	{
+		float SqrtDiscriminant = sqrt(Discriminant);
+		Solutions = (-QuadraticCoef.y + float2(-1, 1) * SqrtDiscriminant) / (2 * QuadraticCoef.x);
+		return true;
+	}
+
+	return false;
+}
+
+struct FCloudLayerParameters
+{
+	float3 CloudLayerCenter;
+	float PlanetRadius;
+	float BottomRadius;
+	float TopRadius;
+	float ToNormAltitude;
+};
+
+FCloudLayerParameters GetCloudLayerParams()
+{
+	FCloudLayerParameters CloudLayerParams;
+	CloudLayerParams.CloudLayerCenter = RenderVolumetricCloudParameters.CloudLayerCenterKm * KILOMETER_TO_CENTIMETER;
+	CloudLayerParams.PlanetRadius = RenderVolumetricCloudParameters.PlanetRadiusKm * KILOMETER_TO_CENTIMETER;
+	CloudLayerParams.BottomRadius = RenderVolumetricCloudParameters.BottomRadiusKm * KILOMETER_TO_CENTIMETER;
+	CloudLayerParams.TopRadius = RenderVolumetricCloudParameters.TopRadiusKm * KILOMETER_TO_CENTIMETER;
+	CloudLayerParams.ToNormAltitude = 1.0 / (CloudLayerParams.TopRadius - CloudLayerParams.BottomRadius);
+	return CloudLayerParams;
+}
+
+// Function to update the material parameter structure for an evaluation
+void UpdateMaterialCloudParam(inout FMaterialPixelParameters MaterialParameters, 
+	float3 AbsoluteWorldPosition, in ViewState InputView, in FCloudLayerParameters CloudLayerParams)
+{
+	MaterialParameters.AbsoluteWorldPosition = AbsoluteWorldPosition;
+	MaterialParameters.WorldPosition_CamRelative = MaterialParameters.AbsoluteWorldPosition + InputView.PreViewTranslation.xyz;
+	//MaterialParameters.WorldPosition_NoOffsets;				// TODO
+	//MaterialParameters.WorldPosition_NoOffsets_CamRelative;	// TODO
+	MaterialParameters.CameraVector = normalize(InputView.WorldCameraOrigin - MaterialParameters.AbsoluteWorldPosition);
+
+	float CloudSampleAltitude = length(MaterialParameters.AbsoluteWorldPosition - CloudLayerParams.CloudLayerCenter);
+	MaterialParameters.CloudSampleAltitude = CloudSampleAltitude - CloudLayerParams.PlanetRadius;
+	MaterialParameters.CloudSampleAltitudeInLayer = CloudSampleAltitude - CloudLayerParams.BottomRadius;
+	MaterialParameters.CloudSampleNormAltitudeInLayer = saturate(MaterialParameters.CloudSampleAltitudeInLayer * CloudLayerParams.ToNormAltitude);
+
+	const float DefaultConservativeDensity = 1.0f;
+	MaterialParameters.VolumeSampleConservativeDensity = DefaultConservativeDensity;								// Defaults to "medium is potentially present" in case it is not fed by the user.
+#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+	MaterialParameters.VolumeSampleConservativeDensity = GetVolumetricAdvancedMaterialOutput6(MaterialParameters);	// Evaluate conservative density
+#endif
+}
+
+#endif // CLOUD_LAYER_PIXEL_SHADER
+
+
+
+////////////////////////////////////////////////////////////
+// Single full screen triangle vertex shader
+////////////////////////////////////////////////////////////
+
+#ifdef SHADER_RENDERVIEW_PS
+
+#include "/Engine/Private/SkyAtmosphereCommon.ush"
+
+#define FogStruct RenderVolumetricCloudParameters
+#undef MATERIALBLENDING_ADDITIVE	// we need to override this for height fog to appear
+#define MATERIALBLENDING_ADDITIVE 0
+#include "HeightFogCommon.ush"
+#undef MATERIALBLENDING_ADDITIVE
+#define MATERIALBLENDING_ADDITIVE 1	// Restor that back because volumetric material must be additive
+
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED
+#define MATERIAL_VOLUMETRIC_ADVANCED 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERPIXEL
+#define MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERPIXEL 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERSAMPLE
+#define MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERSAMPLE 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_MULTISCATTERING_OCTAVE_COUNT
+#define MATERIAL_VOLUMETRIC_ADVANCED_MULTISCATTERING_OCTAVE_COUNT 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_GRAYSCALE_MATERIAL
+#define MATERIAL_VOLUMETRIC_ADVANCED_GRAYSCALE_MATERIAL 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_RAYMARCH_VOLUME_SHADOW
+#define MATERIAL_VOLUMETRIC_ADVANCED_RAYMARCH_VOLUME_SHADOW 0
+#endif
+#ifndef MATERIAL_VOLUMETRIC_ADVANCED_OVERRIDE_AMBIENT_OCCLUSION
+#define MATERIAL_VOLUMETRIC_ADVANCED_OVERRIDE_AMBIENT_OCCLUSION 0
+#endif
+
+
+#if CLOUD_SAMPLE_ATMOSPHERIC_LIGHT_SHADOWMAP
+
+#define DYNAMICALLY_SHADOWED 1
+#define TREAT_MAXDEPTH_UNSHADOWED 1
+
+#define SHADOW_QUALITY 2
+#define NO_TRANSLUCENCY_AVAILABLE
+
+#include "ShadowProjectionCommon.ush"
+#include "ShadowFilteringCommon.ush"
+
+#define VOLUME_SHADOW_SAMPLING_INPUT 0
+// We cannot have Light0Shadow as an additional global parameter structure when rendering a MeshMaterialShader (only one PassUniformBuffer).
+// So instead it has been included and redirected using a macro here. This however prevents us to have two atmospheric lights casting shadow at the same time...
+#define Light0Shadow RenderVolumetricCloudParameters
+#include "VolumeLightingCommonSampling.ush"
+#undef VOLUME_SHADOW_SAMPLING_INPUT
+#undef Light0Shadow
+
+#endif
+
+float IsotropicPhase()
+{
+	return 1.0f / (4.0f * PI);
+}
+
+// TODO MAKE all phase function common between sky, cloud anmd volumetric
+float HgPhase(float G, float CosTheta)
+{
+	// Reference implementation (i.e. not schlick approximation). 
+	// See http://www.pbr-book.org/3ed-2018/Volume_Scattering/Phase_Functions.html
+	float Numer = 1.0f - G * G;
+	float Denom = 1.0f + G * G + 2.0f * G * CosTheta;
+	return Numer / (4.0f * PI * Denom * sqrt(Denom));
+}
+
+float SamplePhaseFunction(in float PhaseCosTheta, in float PhaseG, in float PhaseG2, in float PhaseBlend)
+{
+	PhaseG = clamp(PhaseG, -0.999f, 0.999f);
+	PhaseG2 = clamp(PhaseG2, -0.999f, 0.999f);
+	PhaseBlend = clamp(PhaseBlend, 0.0f, 1.0f);
+	float MiePhaseValueLight0 = HgPhase(PhaseG, -PhaseCosTheta);	// negate cosTheta because due to WorldDir being a "in" direction. 
+	float MiePhaseValueLight1 = HgPhase(PhaseG2, -PhaseCosTheta);
+	const float Phase = MiePhaseValueLight0 + PhaseBlend * (MiePhaseValueLight1 - MiePhaseValueLight0);
+	return Phase;
+}
+
+
+// Multi scattering approximation based on http://magnuswrenninge.com/wp-content/uploads/2010/03/Wrenninge-OzTheGreatAndVolumetric.pdf
+// 1 is for the default single scattering look. Then [2,N] is for extra "octaves"
+#ifndef MSCOUNT
+#define MSCOUNT (1 + MATERIAL_VOLUMETRIC_ADVANCED_MULTISCATTERING_OCTAVE_COUNT)
+#endif
+
+#if MATERIAL_VOLUMETRIC_ADVANCED_GRAYSCALE_MATERIAL
+	#define MATVEC float
+	#define MATSUF rrr
+#else
+	#define MATVEC float3
+	#define MATSUF rgb
+#endif
+
+struct ParticipatingMediaContext
+{
+	MATVEC ScatteringCoefficients[MSCOUNT];
+	MATVEC ExtinctionCoefficients[MSCOUNT];
+
+	MATVEC TransmittanceToLight0[MSCOUNT];
+#if CLOUD_SAMPLE_SECOND_LIGHT
+	MATVEC TransmittanceToLight1[MSCOUNT];
+#endif
+};
+
+ParticipatingMediaContext SetupParticipatingMediaContext(float3 BaseAlbedo, float3 BaseExtinctionCoefficients, float MsSFactor, float MsEFactor, float3 InitialTransmittanceToLight0, float3 InitialTransmittanceToLight1)
+{
+	const MATVEC ScatteringCoefficients = BaseAlbedo * BaseExtinctionCoefficients;
+	//const float3 AbsorptionCoefficients = max(0.0f, BaseExtinctionCoefficients - ScatteringCoefficients);
+
+	ParticipatingMediaContext PMC;
+	PMC.ScatteringCoefficients[0] = ScatteringCoefficients;
+	PMC.ExtinctionCoefficients[0] = BaseExtinctionCoefficients;
+	PMC.TransmittanceToLight0[0] = InitialTransmittanceToLight0;
+#if CLOUD_SAMPLE_SECOND_LIGHT
+	PMC.TransmittanceToLight1[0] = InitialTransmittanceToLight1;
+#endif
+
+	[unroll]
+	for (int ms = 1; ms < MSCOUNT; ++ms)
+	{
+		PMC.ScatteringCoefficients[ms] = PMC.ScatteringCoefficients[ms - 1] * MsSFactor;
+		PMC.ExtinctionCoefficients[ms] = PMC.ExtinctionCoefficients[ms - 1] * MsEFactor;
+		MsSFactor *= MsSFactor;
+		MsEFactor *= MsEFactor;
+
+		PMC.TransmittanceToLight0[ms] = InitialTransmittanceToLight0;
+#if CLOUD_SAMPLE_SECOND_LIGHT
+		PMC.TransmittanceToLight1[ms] = InitialTransmittanceToLight1;
+#endif
+	}
+
+	return PMC;
+}
+
+
+struct ParticipatingMediaPhaseContext
+{
+	float Phase0[MSCOUNT];
+#if CLOUD_SAMPLE_SECOND_LIGHT
+	float Phase1[MSCOUNT];
+#endif
+};
+
+ParticipatingMediaPhaseContext SetupParticipatingMediaPhaseContext(float BasePhase0, float BasePhase1, float MsPhaseFactor)
+{
+	ParticipatingMediaPhaseContext PMPC;
+	PMPC.Phase0[0] = BasePhase0;
+#if CLOUD_SAMPLE_SECOND_LIGHT
+	PMPC.Phase1[0] = BasePhase1;
+#endif
+
+	[unroll]
+	for (int ms = 1; ms < MSCOUNT; ++ms)
+	{
+		PMPC.Phase0[ms] = lerp(IsotropicPhase(), PMPC.Phase0[0], MsPhaseFactor);
+#if CLOUD_SAMPLE_SECOND_LIGHT
+		PMPC.Phase1[ms] = lerp(IsotropicPhase(), PMPC.Phase1[0], MsPhaseFactor);
+#endif
+		MsPhaseFactor *= MsPhaseFactor;
+	}
+
+	return PMPC;
+}
+
+// When transmittance is below, end tracing and accept full opacity
+#define TransmittanceCutThreshold 0.005f
+
+bool TraceClouds(
+	in float4 SvPosition,
+	inout float4 OutColor0,
+	inout float2 OutColor1,
+	inout float3 RayOrigin,
+	inout float3 RayOriginKm,
+	inout float3 Raydir,
+	inout float TMin,
+	inout float TMax,
+	inout FMaterialPixelParameters MaterialParameters,
+	inout FPixelMaterialInputs PixelMaterialInputs,
+	inout float3 Luminance,
+	inout MATVEC TransmittanceToView,
+	inout float  tAPWeightedSum,
+	inout float  tAPWeightsSum
+	)
+{
+	//
+	// Check tracing start and end position within the cloud layer
+	//
+
+	float2 tTop2 = 0.0f;
+	if (RayIntersectSphereSolution(RayOriginKm, Raydir, float4(RenderVolumetricCloudParameters.CloudLayerCenterKm, RenderVolumetricCloudParameters.TopRadiusKm), tTop2))
+	{
+		float2 tBottom2 = 0.0f;
+		if (RayIntersectSphereSolution(RayOriginKm, Raydir, float4(RenderVolumetricCloudParameters.CloudLayerCenterKm, RenderVolumetricCloudParameters.BottomRadiusKm), tBottom2))
+		{
+			// If we see both intersection in front of us, keep the min/closest, otherwise the max/furthest
+			float TempTop = all(tTop2 > 0.0f) ? min(tTop2.x, tTop2.y) : max(tTop2.x, tTop2.y);
+			float TempBottom = all(tBottom2 > 0.0f) ? min(tBottom2.x, tBottom2.y) : max(tBottom2.x, tBottom2.y);
+
+			if (all(tBottom2 > 0.0f))
+			{
+				// But if we can see the bottom of the layer, make sure we use the camera or the highest top layer intersection
+				TempTop = max(0.0f, min(tTop2.x, tTop2.y));
+			}
+
+			TMin = min(TempBottom, TempTop);
+			TMax = max(TempBottom, TempTop);
+		}
+		else
+		{
+			// Only intersecting with the top atmosphere, we have our min and max t
+			TMin = tTop2.x;
+			TMax = tTop2.y;
+		}
+	}
+	else
+	{
+		// No intersection with at least the top of the atmosphere
+		//OutColor0 = float4(1.0f, 0.0f, 0.0f, 1.0f);
+		return false;
+	}
+	TMin = max(0.0f, TMin) * KILOMETER_TO_CENTIMETER;
+	TMax = max(0.0f, TMax) * KILOMETER_TO_CENTIMETER;
+
+
+	//
+	// Skip tracing if needed
+	//
+
+	if (!(TMax > TMin && TMin < RenderVolumetricCloudParameters.TracingStartMaxDistance))
+	{
+		// The tracing range is invalid or the position is too far to start tracing
+		OutColor0 = float4(0.0f, 0.0f, 0.0f, 1.0f); // need to write again into OutColor0&1 otherwise the compiler was complaining...
+		OutColor1 = MaxHalfFloat;
+		return false;
+	}
+
+
+
+	//
+	// Sample the depth buffer and update tracing distance
+	//
+
+	uint4 TracingCoordToZbufferCoordScaleBias = RenderVolumetricCloudParameters.TracingCoordToZbufferCoordScaleBias;
+	float DeviceZ = RenderVolumetricCloudParameters.SceneDepthTexture.Load(uint3(uint2(SvPosition.xy - 0.5) * TracingCoordToZbufferCoordScaleBias.xy + TracingCoordToZbufferCoordScaleBias.zw, 0)).r;
+#if HAS_INVERTED_Z_BUFFER
+	DeviceZ = max(0.000000000001, DeviceZ);
+#endif
+	float3 DepthBufferWorldPos = SvPositionToWorld(float4(SvPosition.xy, DeviceZ, 1.0));
+	float TDepthBuffer = length(DepthBufferWorldPos - RayOrigin);
+	OutColor1.y = TDepthBuffer * CENTIMETER_TO_KILOMETER;
+
+	if (RenderVolumetricCloudParameters.OpaqueIntersectionMode >= 2)
+	{
+		// Only trace up to the closest between the cloud layer far distance and the depth buffer 
+		TMax = min(TMax, TDepthBuffer);
+	}
+
+
+	//
+	// Prepare a bunch of variable for the tracing
+	//
+
+#if CLOUD_PER_SAMPLE_ATMOSPHERE_TRANSMITTANCE 
+	const float3 Light0Illuminance = ResolvedView.AtmosphereLightColor[0].rgb;
+#else
+	const float3 Light0Illuminance = ResolvedView.AtmosphereLightColorGlobalPostTransmittance[0].rgb;
+#endif
+	const float3 Light0IlluminanceFinal = Light0Illuminance * (RenderVolumetricCloudParameters.EnableAtmosphericLightsSampling ? RenderVolumetricCloudParameters.AtmosphericLightCloudScatteredLuminanceScale[0].rgb : float3(0.0f, 0.0f, 0.0f));
+	const float3 Light0Direction = ResolvedView.AtmosphereLightDirection[0].xyz;
+
+#if CLOUD_SAMPLE_SECOND_LIGHT
+#if CLOUD_PER_SAMPLE_ATMOSPHERE_TRANSMITTANCE 
+	const float3 Light1Illuminance = ResolvedView.AtmosphereLightColor[1].rgb;
+#else
+	const float3 Light1Illuminance = ResolvedView.AtmosphereLightColorGlobalPostTransmittance[1].rgb;
+#endif
+	const float3 Light1IlluminanceFinal = Light1Illuminance * (RenderVolumetricCloudParameters.EnableAtmosphericLightsSampling ? RenderVolumetricCloudParameters.AtmosphericLightCloudScatteredLuminanceScale[1].rgb : float3(0.0f, 0.0f, 0.0f));
+	const float3 Light1Direction = ResolvedView.AtmosphereLightDirection[1].xyz;
+#else // CLOUD_SAMPLE_SECOND_LIGHT
+	const float3 Light1Illuminance = float3(0.0f, 0.0f, 0.0f);
+	const float3 Light1IlluminanceFinal = float3(0.0f, 0.0f, 0.0f);
+	const float3 Light1Direction = float3(0.0f, 0.0f, 0.0f);
+#endif // CLOUD_SAMPLE_SECOND_LIGHT
+
+
+	const bool SkyAtmospherePresentInScene = ResolvedView.SkyAtmospherePresentInScene > 0.0f;
+
+	// Clamp to max distance
+	const float MarchingDistance = min(RenderVolumetricCloudParameters.TracingMaxDistance, TMax - TMin);
+	TMax = TMin + MarchingDistance;
+
+	const uint  IStepCount = RenderVolumetricCloudParameters.SampleCountMax * saturate((TMax - TMin) * RenderVolumetricCloudParameters.InvDistanceToSampleCountMax);
+	const float StepCount = float(IStepCount);
+	const float StepT = (TMax - TMin) / StepCount; // StepT is step distance in centimeters
+	const float dtMeters = StepT * CENTIMETER_TO_METER;
+	// TODO adaptive sample count based on distance
+
+	// This is the scattered sky light luminance assuming a uniform phase function.
+	// TODO Approximate some form of occlusion
+	// TODO have some directionality: use SH from sky atmosphere? Or GetSkySHDiffuse/GetSkySHDiffuseSimple for dynamic SkyLightCapture.
+	float3 DistantSkyLightLuminance = 0.0f;
+	if (RenderVolumetricCloudParameters.EnableDistantSkyLightSampling)
+	{
+		if (SkyAtmospherePresentInScene)
+		{
+			// TODO Only works for ground view. This should be spatially varying for space viewsspace view. 
+			// TODO Have a illuminance texture to get that overall ambient contribution? 
+			// TODO An approximation would be to multiply it with sun transmittance?
+			DistantSkyLightLuminance = Texture2DSampleLevel(View.DistantSkyLightLutTexture, View.DistantSkyLightLutTextureSampler, float2(0.5f, 0.5f), 0.0f).rgb;
+		}
+		else
+		{
+			// That unfortunately will create a bad feedback loop since clouds will be captured in the sky light.
+			DistantSkyLightLuminance = GetSkySHDiffuseSimple(float3(0.0f, 0.0f, 0.0f)); // without SH directionality
+		}
+	}
+
+
+
+	// Evalaute Factors once per pixel
+#if MATERIAL_VOLUMETRIC_ADVANCED
+	const float MsScattFactor = saturate(GetVolumetricAdvancedMaterialOutput3(MaterialParameters));
+	const float MsExtinFactor = saturate(GetVolumetricAdvancedMaterialOutput4(MaterialParameters));
+	const float MsPhaseFactor = saturate(GetVolumetricAdvancedMaterialOutput5(MaterialParameters));
+#else
+	const float MsScattFactor = 1.0f;
+	const float MsExtinFactor = 1.0f;
+	const float MsPhaseFactor = 1.0f;
+#endif
+
+	uint DebugPrimaryMaterialSampleCount = 0;
+	uint DebugShadowSampleCount = 0;
+	uint DebugShadowMaterialSampleCount = 0;
+	uint DebugGroundShadowSampleCount = 0;
+	uint DebugGroundShadowMaterialSampleCount = 0;
+
+	const float3 wi0 = Light0Direction;
+	const float3 wi1 = Light1Direction;
+	const float3 wo = Raydir;
+	const float Phase0CosTheta = dot(wi0, wo);
+	const float Phase1CosTheta = dot(wi1, wo);
+#if MATERIAL_VOLUMETRIC_ADVANCED
+#if MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERPIXEL
+	const float PhaseG = GetVolumetricAdvancedMaterialOutput0(MaterialParameters);
+	const float PhaseG2 = GetVolumetricAdvancedMaterialOutput1(MaterialParameters);
+	const float PhaseBlend = GetVolumetricAdvancedMaterialOutput2(MaterialParameters);
+	const float Phase0 = SamplePhaseFunction(Phase0CosTheta, PhaseG, PhaseG2, PhaseBlend);
+#if CLOUD_SAMPLE_SECOND_LIGHT
+	const float Phase1 = SamplePhaseFunction(Phase1CosTheta, PhaseG, PhaseG2, PhaseBlend);
+#else // CLOUD_SAMPLE_SECOND_LIGHT
+	const float Phase1 = IsotropicPhase();
+#endif // CLOUD_SAMPLE_SECOND_LIGHT
+	ParticipatingMediaPhaseContext PMPC = SetupParticipatingMediaPhaseContext(Phase0, Phase1, MsPhaseFactor);
+#endif
+#else
+	ParticipatingMediaPhaseContext PMPC = SetupParticipatingMediaPhaseContext(IsotropicPhase(), IsotropicPhase(), MsPhaseFactor);
+#endif
+
+	FCloudLayerParameters CloudLayerParams = GetCloudLayerParams();
+
+	const float3 PlanetSurfaceNormal = float3(0.0f, 0.0f, 1.0f);	// Ambient contribution from the clouds is only done on a plane above the planet, e.g. do not support space view yet
+	const float3 GroundBrdfNdotL = saturate(dot(Light0Direction, PlanetSurfaceNormal)) * (RenderVolumetricCloudParameters.GroundAlbedo.rgb / PI); // Assuming pure Lambert diffuse surface.
+	const float3 GroundHemisphereLuminanceIsotropic = (2.0f * PI) * IsotropicPhase(); // Assumes the ground is uniform luminance to the cloud and solid angle is bottom hemisphere 2PI
+	const float3 GroundToCloudTransfertIsoScatter = GroundBrdfNdotL * GroundHemisphereLuminanceIsotropic;
+
+
+	//
+	// TRACING LOOP
+	//
+
+	float t = TMin + 0.5 * StepT;
+	if (RenderVolumetricCloudParameters.IsReflectionRendering == 0)
+	{
+		// Using simple ALU based noise as it seems to work the best now. Mod8 is also used to stabilise the result when the amount of sample cannot converge to the correct integration.
+		t = TMin + (float(Rand3DPCG16(int3(SvPosition.xy, View.StateFrameIndexMod8)).x) * rcp(65536.0)) * StepT;
+	}
+
+
+	float3 S0 = 0.0f;
+	for (uint i = 0; i < IStepCount; ++i)
+	{
+		int ms;
+		float3 SampleWorldPosition = RayOrigin + t * Raydir;
+
+
+		//////////////////////////////
+		// Update FMaterialPixelParameters according to current sample.
+		//////////////////////////////
+		UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition, ResolvedView, CloudLayerParams);
+
+	#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+		if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+		{
+			t += StepT;
+			continue; // Conservative density is 0 so skip and go to the next sample
+		}
+	#endif
+
+
+		//////////////////////////////
+		// Sample the participating media material at the sample position.
+		//////////////////////////////
+		DebugPrimaryMaterialSampleCount++;
+		CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+		const MATVEC ExtinctionCoefficients = SampleExtinctionCoefficients(PixelMaterialInputs);
+		const MATVEC EmissiveLuminance = USES_EMISSIVE_COLOR ? SampleEmissive(PixelMaterialInputs) : 0.0f;
+		const MATVEC Albedo = SampleAlbedo(PixelMaterialInputs);
+
+	#if MATERIAL_VOLUMETRIC_ADVANCED_PHASE_PERSAMPLE
+		const float PhaseG = GetVolumetricAdvancedMaterialOutput0(MaterialParameters);
+		const float PhaseG2 = GetVolumetricAdvancedMaterialOutput1(MaterialParameters);
+		const float PhaseBlend = GetVolumetricAdvancedMaterialOutput2(MaterialParameters);
+		const float Phase0 = SamplePhaseFunction(Phase0CosTheta, PhaseG, PhaseG2, PhaseBlend);
+	#if CLOUD_SAMPLE_SECOND_LIGHT
+		const float Phase1 = SamplePhaseFunction(Phase1CosTheta, PhaseG, PhaseG2, PhaseBlend);
+	#else // CLOUD_SAMPLE_SECOND_LIGHT
+		const float Phase1 = IsotropicPhase();
+	#endif // CLOUD_SAMPLE_SECOND_LIGHT
+		ParticipatingMediaPhaseContext PMPC = SetupParticipatingMediaPhaseContext(Phase0, Phase1, MsPhaseFactor);
+	#endif
+
+		const float3 PlanetCenterToWorldPos = (SampleWorldPosition - ResolvedView.SkyPlanetCenterAndViewHeight.xyz) * CM_TO_SKY_UNIT;
+	#if CLOUD_PER_SAMPLE_ATMOSPHERE_TRANSMITTANCE
+		// Apply per sample change of transmittance due to atmosphere. More expenssive but higher quality, (and required for space view)
+		const float3 AtmosphereTransmittanceToLight0 = GetAtmosphereTransmittance(
+			PlanetCenterToWorldPos, Light0Direction, ResolvedView.SkyAtmosphereBottomRadiusKm, ResolvedView.SkyAtmosphereTopRadiusKm,
+			View.TransmittanceLutTexture, View.TransmittanceLutTextureSampler);
+	#else
+		const float3 AtmosphereTransmittanceToLight0 = 1.0f;
+	#endif
+
+	#if CLOUD_SAMPLE_SECOND_LIGHT && CLOUD_PER_SAMPLE_ATMOSPHERE_TRANSMITTANCE
+		// Apply per sample change of transmittance due to atmosphere. More expenssive but higher quality, (and required for space view)
+		const float3 AtmosphereTransmittanceToLight1 = GetAtmosphereTransmittance(
+			PlanetCenterToWorldPos, Light1Direction, ResolvedView.SkyAtmosphereBottomRadiusKm, ResolvedView.SkyAtmosphereTopRadiusKm,
+			View.TransmittanceLutTexture, View.TransmittanceLutTextureSampler);
+	#else
+		const float3 AtmosphereTransmittanceToLight1 = 1.0f;
+	#endif // CLOUD_SAMPLE_SECOND_LIGHT
+
+
+		ParticipatingMediaContext PMC = SetupParticipatingMediaContext(Albedo, ExtinctionCoefficients, MsScattFactor, MsExtinFactor, AtmosphereTransmittanceToLight0, AtmosphereTransmittanceToLight1);
+
+
+		// We always apply the sky distant luminance as computed by the SkyAtmosphere component for a given altitude. 
+		// TODO: this should be spatially varying accoring to height and sun angle.
+		float3 DistantLightLuminance = DistantSkyLightLuminance;
+	#if MATERIAL_VOLUMETRIC_ADVANCED_OVERRIDE_AMBIENT_OCCLUSION
+		// We reduce the sky contibution as specified by the user instead of the default behavior.
+		DistantLightLuminance *= SampleAmbientOcclusion(PixelMaterialInputs);
+	#else
+		// We reduce the sky contibution at the bottom of the cloud using a cheap gradient that is super fast to apply and artist controlable.
+		DistantLightLuminance *= saturate(RenderVolumetricCloudParameters.SkyLightCloudBottomVisibility + MaterialParameters.CloudSampleNormAltitudeInLayer);
+	#endif
+		
+
+		//////////////////////////////
+		// Evaluate some data if there is medium causing scattering, e.g. shadow, ground lighting
+		//////////////////////////////
+		if (any(PMC.ScatteringCoefficients[0] > 0.0f))
+		{
+			const float MaxTransmittanceToView = max(max(TransmittanceToView.MATSUF.x, TransmittanceToView.MATSUF.y), TransmittanceToView.MATSUF.z);
+
+			//
+			// A- we compute lighting bouncing off the ground: affected by light direction, transmittance in the atmosphere and albedo.
+			//
+			const float3 AtmosphereTransmittanceToGround0	= AtmosphereTransmittanceToLight0; // big approximation when CLOUD_PER_SAMPLE_ATMOSPHERE_TRANSMITTANCE is true
+			const float3 AtmosphereTransmittanceToGround1	= AtmosphereTransmittanceToLight1; // idem
+			const float3 ScatteredLightLuminance			= (AtmosphereTransmittanceToGround0 * Light0Illuminance + AtmosphereTransmittanceToGround1 * Light1Illuminance) * GroundToCloudTransfertIsoScatter;
+			const float3 TransmittedScatteredLightLuminance	= ScatteredLightLuminance * exp(-PMC.ExtinctionCoefficients[0] * MaterialParameters.CloudSampleAltitudeInLayer * CENTIMETER_TO_METER);
+		#if MATERIAL_VOLUMETRIC_ADVANCED_GROUND_CONTRIBUTION
+			if (MaxTransmittanceToView > 0.01f)
+			{
+				DebugGroundShadowSampleCount++;
+				// Cheap approximation assuming a single transmittance using only current sample extinction value. If we are withint the AO texture bounds, we lerp towards its more accurate result.
+				//DistantLightLuminance += TransmittedScatteredLightLuminance;
+
+				MATVEC OpticalDepth = 0.0f;
+				const float ShadowLengthTest = min(5.0 * KILOMETER_TO_CENTIMETER, MaterialParameters.CloudSampleAltitudeInLayer);
+				const float ShadowStepCount = 5.0f;
+				const float InvShadowStepCount = 1.0f / ShadowStepCount;
+
+			#if 1
+				// Non-linear shadow sample distribution, hardcoded to x^2
+				float PreviousNormT = 0.0f;
+				for (float ShadowT = InvShadowStepCount; ShadowT <= 1.0; ShadowT += InvShadowStepCount)
+				{
+					DebugGroundShadowMaterialSampleCount++;
+					float CurrentNormT = ShadowT * ShadowT; // CurrentNormT is the end of the considered segment to integrate, PreviousNormT is its beginning.
+					const float DetlaNormT = CurrentNormT - PreviousNormT;
+					UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition + float3(0.0f, 0.0f, -1.0f) * ShadowLengthTest * (CurrentNormT - 0.5 * DetlaNormT), ResolvedView, CloudLayerParams);
+					PreviousNormT = CurrentNormT;
+				#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+					if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+					{
+						continue; // Conservative density is 0 so skip and go to the next sample
+					}
+				#endif
+					CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+					OpticalDepth += SampleExtinctionCoefficients(PixelMaterialInputs) * ShadowLengthTest * CENTIMETER_TO_METER * DetlaNormT;
+				}
+			#else
+				// Linear shadow sample distribution.
+				const float ShadowDtMeter = ShadowLengthTest * CENTIMETER_TO_METER / ShadowStepCount;
+				const float ShadowJitteringSeed = float(ResolvedView.StateFrameIndexMod8) + PseudoRandom(SvPosition.xy) + i * 17;
+				const float ShadowJitterNorm = InterleavedGradientNoise(SvPosition.xy, ShadowJitteringSeed) - 0.5f;
+				for (float ShadowT = 0.5; ShadowT < ShadowStepCount; ShadowT += 1.0f)
+				{
+					UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition + float3(0.0f, 0.0f, -1.0f) * ShadowLengthTest * (ShadowT * InvShadowStepCount), ResolvedView, CloudLayerParams);
+				#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+					if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+					{
+						continue; // Conservative density is 0 so skip and go to the next sample
+					}
+				#endif
+					CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+					OpticalDepth += SampleExtinctionCoefficients(PixelMaterialInputs) * ShadowDtMeter;
+				}
+			#endif
+
+				DistantLightLuminance += ScatteredLightLuminance * exp(-OpticalDepth);
+			}
+		#endif // MATERIAL_VOLUMETRIC_ADVANCED_GROUND_CONTRIBUTION
+
+		#if CLOUD_SAMPLE_ATMOSPHERIC_LIGHT_SHADOWMAP
+			//
+			// B- sample shadow from opaque if enabled. Only light0 supported.
+			//
+			const float OpaqueShadow = ComputeLight0VolumeShadowing(SampleWorldPosition, false, false);
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				PMC.TransmittanceToLight0[ms] *= OpaqueShadow;
+			}
+		#endif // CLOUD_SAMPLE_ATMOSPHERIC_LIGHT_SHADOWMAP
+
+			//
+			// C- shadow from volumetric LIGHT0
+			//
+			MATVEC ExtinctionAcc[MSCOUNT];
+			const float ShadowLengthTest = RenderVolumetricCloudParameters.ShadowTracingMaxDistance;
+			const float ShadowStepCount = float(RenderVolumetricCloudParameters.ShadowSampleCountMax);
+			const float InvShadowStepCount = 1.0f / ShadowStepCount;
+			const float ShadowJitteringSeed = float(ResolvedView.StateFrameIndexMod8) + PseudoRandom(SvPosition.xy);
+			const float ShadowJitterNorm = 0.5f; // InterleavedGradientNoise(SvPosition.xy, ShadowJitteringSeed); // Disabled jittering for now as this one cannot be hidden well by TAA in some cases.
+		#if MATERIAL_VOLUMETRIC_ADVANCED_RAYMARCH_VOLUME_SHADOW==0 // Use cloud shadowmap instead of ray marching.
+			float OutOpticalDepth = 0.0f;
+			float CloudShadow = GetCloudVolumetricShadow(SampleWorldPosition, RenderVolumetricCloudParameters.CloudShadowmapWorldToLightClipMatrix[0], RenderVolumetricCloudParameters.CloudShadowmapFarDepthKm[0],
+				RenderVolumetricCloudParameters.CloudShadowTexture0, RenderVolumetricCloudParameters.CloudBilinearTextureSampler, OutOpticalDepth);
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				PMC.TransmittanceToLight0[ms] *= exp(-OutOpticalDepth * (ms == 0 ? 1.0f : pow(MsExtinFactor, ms)));
+			}
+		#else 
+			// Use raymarched shadows
+			DebugShadowSampleCount++;
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				ExtinctionAcc[ms] = 0.0f;
+			}
+		#if 0
+			// Linear shadow samples (reference)
+			const float ShadowDtMeter = ShadowLengthTest * CENTIMETER_TO_METER / ShadowStepCount;
+			for (float ShadowT = ShadowJitterNorm; ShadowT < ShadowStepCount; ShadowT += 1.0f)
+			{
+				UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition + Light0Direction * ShadowLengthTest * (ShadowT * InvShadowStepCount), ResolvedView, CloudLayerParams);
+				const float ExtinctionFactor = 1.0f;
+		#else
+			// Non-linear shadow sample distribution, hardcoded to x^2
+			const float ShadowDtMeter = ShadowLengthTest * CENTIMETER_TO_METER;
+			float PreviousNormT = 0.0f;
+			for (float ShadowT = InvShadowStepCount; ShadowT <= 1.0; ShadowT += InvShadowStepCount)
+			{
+				float CurrentNormT = ShadowT * ShadowT; // CurrentNormT is the end of the considered segment to integrate, PreviousNormT is its beginning.
+				const float DetlaNormT = CurrentNormT - PreviousNormT;
+				const float ExtinctionFactor = DetlaNormT;
+				UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition + Light0Direction * ShadowLengthTest * (PreviousNormT + DetlaNormT * ShadowJitterNorm), ResolvedView, CloudLayerParams);
+				PreviousNormT = CurrentNormT;
+		#endif
+
+			#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+				if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+				{
+					continue; // Conservative density is 0 so skip and go to the next sample
+				}
+			#endif
+
+				if (MaterialParameters.CloudSampleNormAltitudeInLayer < 0.0f || MaterialParameters.CloudSampleNormAltitudeInLayer > 1.0f)
+				{
+					break; // Ignore remaining samples since we have just traveld out of the cloud layer.
+				}
+
+				DebugShadowMaterialSampleCount++;
+				CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+				MATVEC ShadowExtinctionCoefficients = SampleExtinctionCoefficients(PixelMaterialInputs);
+
+				ParticipatingMediaContext ShadowPMC = SetupParticipatingMediaContext(0.0f, ShadowExtinctionCoefficients, MsScattFactor, MsExtinFactor, 0.0f, 0.0f);
+
+				[unroll]
+				for (ms = 0; ms < MSCOUNT; ++ms)
+				{
+					ExtinctionAcc[ms] += ShadowPMC.ExtinctionCoefficients[ms] * ExtinctionFactor;
+				}
+			}
+
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				PMC.TransmittanceToLight0[ms] *= exp(-ExtinctionAcc[ms] * ShadowDtMeter);
+			}
+		#endif // Use cloud shadowmap
+
+			//
+			// C- shadow from volumetric LIGHT1
+			//
+		#if CLOUD_SAMPLE_SECOND_LIGHT
+		{ // CLOUD_SAMPLE_SECOND_LIGHT
+		#if MATERIAL_VOLUMETRIC_ADVANCED_RAYMARCH_VOLUME_SHADOW==0 // Use cloud shadowmap instead of ray marching.
+			float OutOpticalDepth = 0.0f;
+			float CloudShadow = GetCloudVolumetricShadow(SampleWorldPosition, RenderVolumetricCloudParameters.CloudShadowmapWorldToLightClipMatrix[1], RenderVolumetricCloudParameters.CloudShadowmapFarDepthKm[1],
+				RenderVolumetricCloudParameters.CloudShadowTexture1, RenderVolumetricCloudParameters.CloudBilinearTextureSampler, OutOpticalDepth);
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				PMC.TransmittanceToLight1[ms] *= exp(-OutOpticalDepth * (ms == 0 ? 1.0f : pow(MsExtinFactor, ms)));
+			}
+		#else // Use cloud shadowmap
+			DebugShadowSampleCount++;
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				ExtinctionAcc[ms] = 0.0f;
+			}
+			// Non-linear shadow sample distribution, hardcoded to x^2
+			const float ShadowDtMeter = ShadowLengthTest * CENTIMETER_TO_METER;
+			float PreviousNormT = 0.0f;
+			for (float ShadowT = InvShadowStepCount; ShadowT <= 1.0; ShadowT += InvShadowStepCount)
+			{
+				float CurrentNormT = ShadowT * ShadowT; // CurrentNormT is the end of the considered segment to integrate, PreviousNormT is its beginning.
+				const float DetlaNormT = CurrentNormT - PreviousNormT;
+				const float ExtinctionFactor = DetlaNormT;
+				UpdateMaterialCloudParam(MaterialParameters, SampleWorldPosition + Light1Direction * ShadowLengthTest * (PreviousNormT + DetlaNormT * ShadowJitterNorm), ResolvedView, CloudLayerParams);
+				PreviousNormT = CurrentNormT;
+
+			#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+				if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+				{
+					continue; // Conservative density is 0 so skip and go to the next sample
+				}
+			#endif
+
+				if (MaterialParameters.CloudSampleNormAltitudeInLayer < 0.0f || MaterialParameters.CloudSampleNormAltitudeInLayer > 1.0f)
+				{
+					break; // Ignore remaining samples since we have just traveld out of the cloud layer.
+				}
+
+				DebugShadowMaterialSampleCount++;
+				CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+				MATVEC ShadowExtinctionCoefficients = SampleExtinctionCoefficients(PixelMaterialInputs);
+
+				ParticipatingMediaContext ShadowPMC = SetupParticipatingMediaContext(0.0f, ShadowExtinctionCoefficients, MsScattFactor, MsExtinFactor, 0.0f, 0.0f);
+
+				[unroll]
+				for (ms = 0; ms < MSCOUNT; ++ms)
+				{
+					ExtinctionAcc[ms] += ShadowPMC.ExtinctionCoefficients[ms] * ExtinctionFactor;
+				}
+			}
+
+			[unroll]
+			for (ms = 0; ms < MSCOUNT; ++ms)
+			{
+				PMC.TransmittanceToLight1[ms] *= exp(-ExtinctionAcc[ms] * ShadowDtMeter);
+			}
+		#endif // Use cloud shadowmap
+		} // CLOUD_SAMPLE_SECOND_LIGHT
+		#endif // CLOUD_SAMPLE_SECOND_LIGHT
+		}
+
+
+		//
+		// From this point, MaterialParameters and CloudLayerParams cannot be used because they have been corrupted by the ray marched volume shadow integrator above!
+		//
+
+
+		// Compute the weighted average of t for the aerial perspective evaluation.
+		if (any(PMC.ExtinctionCoefficients[0]) > 0.0)
+		{
+			float tAPWeight = min(TransmittanceToView.MATSUF.r, min(TransmittanceToView.MATSUF.g, TransmittanceToView.MATSUF.b));
+			tAPWeightedSum += t * tAPWeight;
+			tAPWeightsSum += tAPWeight;
+		}
+
+
+		//////////////////////////////
+		// Evaluate scattered luminance towards camera as well as view transmittance.
+		//////////////////////////////
+		[unroll]
+		for (ms = MSCOUNT-1; ms >= 0; --ms) // Must terminate with 0 because this is where TransmittanceToView is updated.
+		{
+			const MATVEC ScatteringCoefficients = PMC.ScatteringCoefficients[ms];
+			const MATVEC ExtinctionCoefficients = PMC.ExtinctionCoefficients[ms];
+
+			// Light 0
+			const float3 TransmittanceToLight0 = PMC.TransmittanceToLight0[ms];
+			float3 SunSkyLuminance = TransmittanceToLight0 * Light0IlluminanceFinal * PMPC.Phase0[ms];
+			// Light 1
+		#if CLOUD_SAMPLE_SECOND_LIGHT
+			const float3 TransmittanceToLight1 = PMC.TransmittanceToLight1[ms];
+			SunSkyLuminance += TransmittanceToLight1 * Light1IlluminanceFinal * PMPC.Phase1[ms];
+		#endif
+			// Distance sky light
+			// *** The distance sky lighting contribution is ignored from the multi scattering approximation today because occlusion is not correclty handled (and as a result it would make clouds looks flat).
+			// This could be removed when occlusion is better handled or approximated with a simple/expenssive optional  tracing.
+			SunSkyLuminance += (ms == 0 ? DistantLightLuminance : float3(0.0f, 0.0f, 0.0f));
+
+			// *** EmissiveLuminance: it should be (EmissiveLuminance * AbsorptionCoefficients) but not intuitive for artist ==> can be added later as an option for consistency during path tracing. 
+			// See "Production Volume Rendering", 2017, Section 2.2. So right now EmissiveLuminance is in fact LuminancePerMeter.
+			const float3 ScatteredLuminance = SunSkyLuminance * ScatteringCoefficients + EmissiveLuminance;// No dt, because it is part of the analytical integral below.
+
+		#if 0
+			// Default iterative integration
+			const MATVEC SafePathSegmentTransmittance = exp(-ExtinctionCoefficients * dtMeters);
+			Luminance += TransmittanceToView * ScatteredLuminance * dtMeters;
+
+		#elif 1
+			// Improved scattering integration. See slide 28 of "Physically Based and Unified Volumetric Rendering in Frostbite"
+			// Automatically works with emission. Emissive color is considered as a constant luminance emitted in all direction uniformly.
+			MATVEC SafeExtinctionThreshold = 0.000001f;
+			const MATVEC SafeExtinctionCoefficients = max(SafeExtinctionThreshold, ExtinctionCoefficients);
+			const MATVEC SafePathSegmentTransmittance = exp(-SafeExtinctionCoefficients * dtMeters);
+			float3 LuminanceIntegral = (ScatteredLuminance - ScatteredLuminance * SafePathSegmentTransmittance) / SafeExtinctionCoefficients;
+			Luminance += TransmittanceToView * LuminanceIntegral;     
+
+		#else
+			// Another integration that is not working nicely yet: explodes or need to use high extinction threshold 0.000001 to make it safe. And that has an impact on the final image.
+			MATVEC S1 = TransmittanceToLight0 * ScatteringCoefficients;
+			MATVEC SafeExtinctionThreshold = 0.000001f;
+			const MATVEC SafeExtinctionCoefficients = max(SafeExtinctionThreshold, ExtinctionCoefficients);
+			const MATVEC SafePathSegmentTransmittance = exp(-SafeExtinctionCoefficients * dtMeters);
+			MATVEC Factor = SafePathSegmentTransmittance;
+			float3 AnalyticalShadowedScattered = (Factor * S0 - Factor * S1 - Factor * dtMeters * SafeExtinctionCoefficients * S1 + ((-float3(1.0, 1.0, 1.0) + dtMeters * SafeExtinctionCoefficients) * S0 + S1))
+				/ (dtMeters * SafeExtinctionCoefficients * SafeExtinctionCoefficients);
+
+			/// Not handled yet: second light and emissive 
+			float3 SkyScatteredLuminance = SunSkyLuminance * ScatteringCoefficients; 
+			float3 SkyLuminanceIntegral = (ScatteredLuminance - ScatteredLuminance * SafePathSegmentTransmittance) / SafeExtinctionCoefficients;
+			Luminance += TransmittanceToView *  ((AnalyticalShadowedScattered * Light0IlluminanceFinal * PMPC.Phase0[ms]) + (ms == 0 ? SkyLuminanceIntegral : float3(0.0f, 0.0f, 0.0f)) ); 
+			if (ms == 0) S0 = S1;
+
+		#endif
+
+			if (ms == 0)
+			{
+				TransmittanceToView *= SafePathSegmentTransmittance;
+			}
+		}
+
+		// This is helpful for performance. Can result in less light pucnhing through clouds. Should be a setting.
+		if (all(TransmittanceToView < TransmittanceCutThreshold))
+		{
+			break;
+		}
+
+		t += StepT;
+	}
+
+	return true;
+}
+
+
+
+
+
+void MainPS(
+	  in FVertexFactoryInterpolantsVSToPS FactoryInterpolants
+	, in float4 SvPosition : SV_Position
+	, out float4 OutColor0 : SV_Target0
+	, out float2 OutColor1 : SV_Target1
+)
+{
+	ResolvedView = ResolveView();
+
+//#if 0
+//	const float displaySize = 256.0f;
+//	if(all(SvPosition.xy<displaySize))
+//	{
+//		OutColor0 = float4(RenderVolumetricCloudParameters.CloudShadowTexture.Load(uint3(SvPosition.xy,0), 0).rg, 0.0, 0.0f);
+//		return;
+//	}
+//#endif
+
+
+	//
+	// Initialise all the parameters
+	//
+	
+	OutColor0					= float4(0.0f, 0.0f, 0.0f, 1.0f);
+	OutColor1					= MaxHalfFloat;
+
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(FactoryInterpolants, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs	= (FPixelMaterialInputs)0;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, true);
+
+	float3 RayOrigin			= ResolvedView.WorldCameraOrigin;
+	float3 RayOriginKm			= RayOrigin * CENTIMETER_TO_KILOMETER;
+	float3 Raydir				= -MaterialParameters.CameraVector;
+	float TMin					= -999999999.0f;
+	float TMax					= -999999999.0f;
+
+	float3 Luminance			= 0.0f;
+	MATVEC TransmittanceToView	= 1.0f;
+	float tAPWeightedSum		= 0.0f;
+	float tAPWeightsSum			= 0.0f;
+
+
+	//
+	// Trace and get the results
+	//
+
+	if (!TraceClouds(
+		SvPosition,
+		OutColor0,
+		OutColor1,
+		RayOrigin,
+		RayOriginKm,
+		Raydir,
+		TMin,
+		TMax,
+		MaterialParameters,
+		PixelMaterialInputs,
+		Luminance,
+		TransmittanceToView,
+		tAPWeightedSum,
+		tAPWeightsSum))
+	{
+		return;
+	}
+
+
+#if USE_PREEXPOSURE
+	// Exposure used for regular views by the FastSky and AP LUTs.
+	const float ViewPreExposure = ResolvedView.PreExposure;
+	const float ViewOneOverPreExposure = ResolvedView.OneOverPreExposure;
+	// When rendering a real time reflection capture (sky envmap) whe use a different exposure
+	const float OutputPreExposure = (ResolvedView.RealTimeReflectionCapture ? ResolvedView.RealTimeReflectionCapturePreExposure : ViewPreExposure);
+#else
+	const float ViewPreExposure = 1.0f;
+	const float ViewOneOverPreExposure = 1.0f;
+	const float OutputPreExposure = 1.0f
+#endif
+
+
+	//
+	// Apply aerial perspective if needed
+	//
+
+	// This is the default depth when no cloud has been intersected. 
+	// It is better to limit depth to a close distance instead of max float to smooth out cloud edges when intersecting opaque meshes.
+	// No visual issues have been noticed with reprojection+TAA so far.
+	const float NoCloudDepth = TMax;
+
+	const float tAP = tAPWeightsSum==0.0f ? NoCloudDepth : tAPWeightedSum / max(0.0000000001f, tAPWeightsSum);
+	float3 AbsoluteWorldPosition = RayOrigin + tAP * Raydir;
+	float4 AbsoluteWorldPositionNDC = mul(float4(AbsoluteWorldPosition, 1.0f), ResolvedView.WorldToClip);
+	float MeanTransmittance = dot(TransmittanceToView.MATSUF, 1.0f / 3.0f);
+
+	if (RenderVolumetricCloudParameters.EnableAerialPerspectiveSampling && tAPWeightsSum > 0.0f)
+	{
+		// Apply AP only once according to the mean position within the participating media weighted by transmittance/visibility.
+		// This allows to apply AP only once per pixel instead of per sample.
+		float4 AerialPerspective = GetAerialPerspectiveLuminanceTransmittance(
+			ResolvedView.RealTimeReflectionCapture, ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeSizeAndInvSize,
+			AbsoluteWorldPositionNDC, AbsoluteWorldPosition * CM_TO_SKY_UNIT, ResolvedView.WorldCameraOrigin * CM_TO_SKY_UNIT,
+			View.CameraAerialPerspectiveVolume, View.CameraAerialPerspectiveVolumeSampler,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolutionInv,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolution,
+			ResolvedView.SkyAtmosphereAerialPerspectiveStartDepthKm,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKm,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKmInv,
+			ViewOneOverPreExposure);
+
+		// Apply aerial perspective OVER the cloud, assiming coverage is from the full transmittance.
+		// skip if MeanTransmittance is 1
+		float MeanCoverage = 1.0 - MeanTransmittance;
+		Luminance = AerialPerspective.rgb * MeanCoverage + AerialPerspective.a * Luminance;
+	}
+
+
+	//
+	// Apply height fog if needed
+	//
+	if (RenderVolumetricCloudParameters.EnableHeightFog && tAPWeightsSum > 0.0f)
+	{
+		float4 HeightFogInscatteringAndTransmittance = CalculateHeightFog(AbsoluteWorldPosition - ResolvedView.WorldCameraOrigin);
+		
+		if (FogStruct.ApplyVolumetricFog > 0)
+		{
+			float3 VolumeUV = ComputeVolumeUVFromNDC(AbsoluteWorldPositionNDC);
+			const uint EyeIndex = 0;
+			HeightFogInscatteringAndTransmittance = CombineVolumetricFog(HeightFogInscatteringAndTransmittance, VolumeUV, EyeIndex);
+		}
+
+		// Apply aerial perspective OVER the cloud, assiming coverage is from the full transmittance.
+		// skip if MeanTransmittance is 1
+		float MeanCoverage = 1.0 - MeanTransmittance;
+		Luminance = HeightFogInscatteringAndTransmittance.rgb * MeanCoverage + HeightFogInscatteringAndTransmittance.a * Luminance;
+	}
+
+
+	//
+	// Output result
+	//
+
+	float GrayScaleTransmittance = MeanTransmittance < TransmittanceCutThreshold ? 0.0f : MeanTransmittance;
+	OutColor0 = float4(Luminance * OutputPreExposure, GrayScaleTransmittance);
+
+	OutColor1.x = MaxHalfFloat; // Default to far away depth to be flat and not intersect with any geometry.
+	if (RenderVolumetricCloudParameters.OpaqueIntersectionMode >= 1)
+	{
+		OutColor1.x = ((GrayScaleTransmittance > 0.99) ? NoCloudDepth : tAP) * CENTIMETER_TO_KILOMETER; // using a small threshold on transmittance
+	}
+
+#if 0
+	if (RenderVolumetricCloudParameters.SampleCountDebugMode > 0)
+	{
+		uint CountToDebug = 0;
+		switch (RenderVolumetricCloudParameters.SampleCountDebugMode)
+		{
+		case 1:
+			CountToDebug = DebugPrimaryMaterialSampleCount;
+			break;
+		case 2:
+			CountToDebug = DebugShadowSampleCount;
+			break;
+		case 3:
+			CountToDebug = DebugShadowMaterialSampleCount;
+			break;
+		case 4:
+			CountToDebug = DebugGroundShadowSampleCount;
+			break;
+		case 5:
+			CountToDebug = DebugGroundShadowMaterialSampleCount;
+			break;
+		}
+
+		const bool bMediumHit = CountToDebug > 0;
+		OutColor0 = float4(bMediumHit ? GetColorCode(saturate(float(CountToDebug) / 64.0f)) : float3(0.0f, 0.0f, 0.0), bMediumHit ? 0.0f : 1.0f); 
+		OutColor1.x = bMediumHit ? OutColor1.x : MaxHalfFloat;
+	}
+#endif
+}
+
+#endif // SHADER_RENDERVIEW_PS
+
+
+
+#if SHADER_SHADOW_PS
+
+struct CloudShadowTraceContext
+{
+	float		FarDepthKm;
+	float		Strength;
+	float		DepthBias;
+	float		SampleCount;
+	float4		SizeInvSize;
+	float4		TracingPixelScaleOffset;
+	float4		TracingSizeInvSize;
+	float4x4	WorldToLightClipMatrix;
+	float4x4	WorldToLightClipMatrixInv;
+	float3		TraceDir;
+};
+
+void MainPS(
+	in FVertexFactoryInterpolantsVSToPS FactoryInterpolants
+	, in float4 SvPosition : SV_Position
+	, out float3 OutColor0 : SV_Target0
+)
+{
+	ResolvedView = ResolveView();
+
+	CloudShadowTraceContext TraceContext;
+	if (RenderVolumetricCloudParameters.TraceShadowmap>=1)
+	{
+		const uint LightIndex = RenderVolumetricCloudParameters.TraceShadowmap - 1;
+		TraceContext.FarDepthKm					= RenderVolumetricCloudParameters.CloudShadowmapFarDepthKm[LightIndex];
+		TraceContext.Strength					= RenderVolumetricCloudParameters.CloudShadowmapStrength[LightIndex];
+		TraceContext.DepthBias					= RenderVolumetricCloudParameters.CloudShadowmapDepthBias[LightIndex];
+		TraceContext.SampleCount				= RenderVolumetricCloudParameters.CloudShadowmapSampleCount[LightIndex];
+		TraceContext.SizeInvSize				= RenderVolumetricCloudParameters.CloudShadowmapSizeInvSize[LightIndex];
+		TraceContext.TracingSizeInvSize			= RenderVolumetricCloudParameters.CloudShadowmapTracingSizeInvSize[LightIndex];
+		TraceContext.TracingPixelScaleOffset	= RenderVolumetricCloudParameters.CloudShadowmapTracingPixelScaleOffset[LightIndex];
+		TraceContext.WorldToLightClipMatrix		= RenderVolumetricCloudParameters.CloudShadowmapWorldToLightClipMatrix[LightIndex];
+		TraceContext.WorldToLightClipMatrixInv	= RenderVolumetricCloudParameters.CloudShadowmapWorldToLightClipMatrixInv[LightIndex];
+		TraceContext.TraceDir					= RenderVolumetricCloudParameters.CloudShadowmapLightDir[LightIndex];
+	}
+	else
+	{
+		TraceContext.FarDepthKm					= RenderVolumetricCloudParameters.CloudSkyAOFarDepthKm;
+		TraceContext.Strength					= RenderVolumetricCloudParameters.CloudSkyAOStrength;
+		TraceContext.DepthBias					= 0.0f;
+		TraceContext.SampleCount				= RenderVolumetricCloudParameters.CloudSkyAOSampleCount;
+		TraceContext.SizeInvSize				= RenderVolumetricCloudParameters.CloudSkyAOSizeInvSize;
+		TraceContext.TracingSizeInvSize			= TraceContext.SizeInvSize;
+		TraceContext.TracingPixelScaleOffset    = float4(1.0f, 1.0f, 0.0f, 0.0f);
+		TraceContext.WorldToLightClipMatrix		= RenderVolumetricCloudParameters.CloudSkyAOWorldToLightClipMatrix;
+		TraceContext.WorldToLightClipMatrixInv	= RenderVolumetricCloudParameters.CloudSkyAOWorldToLightClipMatrixInv;
+		TraceContext.TraceDir					= RenderVolumetricCloudParameters.CloudSkyAOTraceDir;
+	}
+
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(FactoryInterpolants, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, true);
+
+	FCloudLayerParameters CloudLayerParams = GetCloudLayerParams();
+	float2 UV = float2(SvPosition.xy * TraceContext.TracingPixelScaleOffset.xy + TraceContext.TracingPixelScaleOffset.zw) * TraceContext.SizeInvSize.zw;
+
+	const float NearZDepth = 1.0f; // using FReversedZOrthoMatrix
+	float3 NearClipPlaneWorldPos = CloudShadowUvToWorldSpace(NearZDepth, UV, TraceContext.WorldToLightClipMatrixInv);
+	const float3 LightDirection = TraceContext.TraceDir; // It points from light to surface
+
+
+	// Compute the min and max distance to trace (in the cloud layer)
+	float TMin = -999999999.0f;
+	float TMax = -999999999.0f;
+	float3 RayOrigin = NearClipPlaneWorldPos;
+	float3 RayOriginKm = RayOrigin * CENTIMETER_TO_KILOMETER;
+	float2 tTop2 = 0.0f;
+	bool bTraceTop = false;
+	if (RayIntersectSphereSolution(RayOriginKm, LightDirection, float4(RenderVolumetricCloudParameters.CloudLayerCenterKm, RenderVolumetricCloudParameters.TopRadiusKm), tTop2))
+	{
+		bTraceTop = true;
+		float2 tBottom2 = 0.0f;
+		if (RayIntersectSphereSolution(RayOriginKm, LightDirection, float4(RenderVolumetricCloudParameters.CloudLayerCenterKm, RenderVolumetricCloudParameters.BottomRadiusKm), tBottom2))
+		{
+			// If we see both intersection in front of us, keep the min/closest, otherwise the max/furthest
+			float TempTop = all(tTop2 > 0.0f) ? min(tTop2.x, tTop2.y) : max(tTop2.x, tTop2.y);
+			float TempBottom = all(tBottom2 > 0.0f) ? min(tBottom2.x, tBottom2.y) : max(tBottom2.x, tBottom2.y);
+
+			if (all(tBottom2 > 0.0f))
+			{
+				// But if we can see the bottom of the layer, make sure we use the camera or the highest top layer intersection
+				TempTop = max(0.0f, min(tTop2.x, tTop2.y));
+			}
+			else
+			{
+				// We are inside under the cloud layer, we simply skip shadowing evaluation and mark near clip as front depth (remove >50% of the cost at dusk/dawn time)
+				OutColor0 = float3(0.0f, 0.0f, 0.0f);
+				return;
+			}
+
+			TMin = min(TempBottom, TempTop);
+			TMax = max(TempBottom, TempTop);
+		}
+		else
+		{
+			// Only intersecting with the top atmosphere, we have our min and max t
+			TMin = tTop2.x;
+			TMax = tTop2.y;
+		}
+	}
+	else
+	{
+		// No intersection with the top of the cloud layer
+		OutColor0 = float3(TraceContext.FarDepthKm, 0.0f, 0.0f);
+		return;
+	}
+
+	TMin = max(0.0f, TMin) * KILOMETER_TO_CENTIMETER;
+	TMax = max(0.0f, TMax) * KILOMETER_TO_CENTIMETER;
+	float ClosestIntersection = TMin; // Stay on the near clip plane if we are under the top layer.
+	float3 WorldPosOnLayer = NearClipPlaneWorldPos + LightDirection * ClosestIntersection;
+
+
+
+	float3 ExtinctionAcc = 0.0f;
+	float ExtinctionAccCount = 0.0f;
+	float3 MaxOpticalDepth = 0.0f;
+	const float DefaultFarDepth = TraceContext.FarDepthKm * KILOMETER_TO_CENTIMETER;
+	float NearDepth = DefaultFarDepth;
+
+	const float LayerHeight = CloudLayerParams.TopRadius - CloudLayerParams.BottomRadius;
+	const float ShadowLengthTest = TMax - TMin;
+	const float ShadowStepCount = TraceContext.SampleCount;
+	const float InvShadowStepCount = 1.0f / ShadowStepCount;
+	const float ShadowDtMeter = ShadowLengthTest * CENTIMETER_TO_METER / ShadowStepCount;
+	if (bTraceTop)
+	{
+		// Linear shadow samples (reference)
+		for (float ShadowT = 0.5; ShadowT < ShadowStepCount; ShadowT += 1.0f)
+		{
+			const float SampleT = ShadowLengthTest * (ShadowT * InvShadowStepCount);
+			UpdateMaterialCloudParam(MaterialParameters, WorldPosOnLayer + LightDirection * SampleT, ResolvedView, CloudLayerParams);
+
+		#if MATERIAL_VOLUMETRIC_ADVANCED_CONSERVATIVE_DENSITY
+			if (MaterialParameters.VolumeSampleConservativeDensity.x <= 0.0f)
+			{
+				continue; // Conservative density is 0 so skip and go to the next sample
+			}
+		#endif
+
+			CalcPixelMaterialInputs(MaterialParameters, PixelMaterialInputs);
+
+			float3 ShadowExtinctionCoefficients = SampleExtinctionCoefficients(PixelMaterialInputs);
+
+			bool MediumPresent = any(ShadowExtinctionCoefficients > 0.0f);
+			NearDepth = MediumPresent ? min(NearDepth, SampleT) : NearDepth;
+
+			ExtinctionAcc += ShadowExtinctionCoefficients;
+			MaxOpticalDepth += ShadowExtinctionCoefficients * ShadowDtMeter;
+			ExtinctionAccCount += MediumPresent ? 1.0f : 0.0f;
+		}
+	}
+
+	// We output front depth and also the mean path extinction that is going to be scaled later by the real path length behind the front depth.
+	// We also scale extinction and optical depth by the global cloud shadow strength.
+	const float MeanGreyExtinction = TraceContext.Strength * dot(ExtinctionAcc / max(1.0f, ExtinctionAccCount), float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+	const float MaxGreyOpticalDepth = TraceContext.Strength * dot(MaxOpticalDepth, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+	const bool NoHit = NearDepth == DefaultFarDepth;
+	const float FrontDepth = NoHit ? TMax * CENTIMETER_TO_KILOMETER : (ClosestIntersection + NearDepth) * CENTIMETER_TO_KILOMETER;
+	OutColor0 = float3(max(0.0f, FrontDepth + TraceContext.DepthBias), MeanGreyExtinction , MaxGreyOpticalDepth);
+}
+
+#endif // SHADER_SHADOW_PS
+
+
+
+#if SHADER_SHADOW_FILTER_CS
+
+#include "ShaderDrawDebug.ush"
+#include "MonteCarlo.ush"
+
+SamplerState BilinearSampler;
+Texture2D<float3> CloudShadowTexture;
+RWTexture2D<float3> OutCloudShadowTexture;
+float4 CloudTextureSizeInvSize;
+float4 CloudTextureTexelWorldSizeInvSize;
+float CloudLayerStartHeight;
+float CloudSkyAOApertureScaleMul;
+float CloudSkyAOApertureScaleAdd;
+
+struct CloudShadowData
+{
+	float DepthKm;
+	float MeanExtinction;
+	float MaxOpticalDepth;
+};
+
+CloudShadowData CloudShadowData_LoadSrc(uint2 Coord)
+{
+	float3 TexData = CloudShadowTexture.Load(uint3(Coord, 0));
+	CloudShadowData CloudData;
+	CloudData.DepthKm = TexData.x;
+	CloudData.MeanExtinction = TexData.y;
+	CloudData.MaxOpticalDepth = TexData.z;
+	return CloudData;
+}
+
+CloudShadowData CloudShadowData_Sample(float2 Coord)
+{
+	float3 TexData = CloudShadowTexture.SampleLevel(BilinearSampler, Coord, 0);
+	CloudShadowData CloudData;
+	CloudData.DepthKm = TexData.x;
+	CloudData.MeanExtinction = TexData.y;
+	CloudData.MaxOpticalDepth = TexData.z;
+	return CloudData;
+}
+
+void CloudShadowData_WriteDst(in CloudShadowData CloudData, uint2 Coord)
+{
+	OutCloudShadowTexture[Coord] = float3(CloudData.DepthKm, CloudData.MeanExtinction, CloudData.MaxOpticalDepth);
+}
+
+[numthreads(8, 8, 1)]
+void MainShadowFilterCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	ResolvedView = ResolveView();
+
+
+	if (all(DispatchThreadId.xy < uint2(CloudTextureSizeInvSize.xy)))
+	{
+		const int2 CenterCoord = int2(DispatchThreadId.xy);
+		const float2 CenterUV  = (float2(DispatchThreadId.xy) + 0.5f) * CloudTextureSizeInvSize.zw;
+
+#if PERMUTATION_SKYAO
+
+		CloudShadowData Center = CloudShadowData_LoadSrc(CenterCoord);
+
+		float DepthKm = 0.0f;
+		float MeanExtinction = 0.0f;
+		float MaxOpticalDepth = 0.0f;
+		float SampleCount = 0.0f;
+
+		// SkyAO filter is not a 2d bluer of the volumetric cloud top/bottom shadow map but an integration over the hemisphere at the ground level.
+		// It does not take into account the planet curvature.
+		// We filter transmittance to control the max extinction. Because visibility is the important value to integrate over the hemisphere (not extinction).
+
+		float MaxTransmittance = 0.0f;
+
+		// Hardcoded 64 samples over the hemisphere
+		float SampleMaxU = 4.0f;
+		float SampleIncU = 1.0f / SampleMaxU;
+		float SampleMaxV = 4.0f;
+		float SampleIncV = 1.0f / SampleMaxV;
+		//UNROLL
+		for (float U = 0.5 * SampleIncU; U < SampleMaxU; U += 1.0f)
+		{
+			for (float V = 0.5 * SampleIncV; V < SampleMaxV; V += 1.0f)
+			{
+				const float ZetaU = U / SampleMaxU;
+				const float ZetaV = CloudSkyAOApertureScaleAdd + CloudSkyAOApertureScaleMul * (V / SampleMaxV); // User sample scale to only sample a solid angle smaller than the hemisphere.
+				float4 SampleDir  = UniformSampleHemisphere(float2(U / SampleMaxU, ZetaV));
+				float2 WorldOffset = SampleDir.xy * CloudLayerStartHeight / max(0.0000001f, SampleDir.z);
+				float2 TexelOffset = WorldOffset * CloudTextureTexelWorldSizeInvSize.zw;
+				float2 UVOffset    = TexelOffset * CloudTextureSizeInvSize.zw;
+
+				CloudShadowData Data = CloudShadowData_Sample(CenterUV + UVOffset);	// TODO generate and fetch different mip based on area from projected solid angle.
+				DepthKm += Data.DepthKm;
+				MeanExtinction += Data.MeanExtinction;
+				MaxOpticalDepth += Data.MaxOpticalDepth;
+				MaxTransmittance += exp(-Data.MaxOpticalDepth);
+			}
+		}
+		SampleCount = SampleMaxU * SampleMaxV;
+
+		// For the output, we average all the linear quantities over the solid angle.
+		CloudShadowData OutputCloudData;
+		OutputCloudData.DepthKm = DepthKm / SampleCount;
+		OutputCloudData.MeanExtinction	= MeanExtinction / SampleCount;
+		OutputCloudData.MaxOpticalDepth	= MaxTransmittance > 0.0f ? -log(MaxTransmittance / SampleCount) : 100.0f;
+
+		CloudShadowData_WriteDst(OutputCloudData, CenterCoord);
+
+#else
+
+		CloudShadowData Data0 = CloudShadowData_LoadSrc(CenterCoord * 2 + int2(0, 0));
+		CloudShadowData Data1 = CloudShadowData_LoadSrc(CenterCoord * 2 + int2(1, 0));
+		CloudShadowData Data2 = CloudShadowData_LoadSrc(CenterCoord * 2 + int2(1, 1));
+		CloudShadowData Data3 = CloudShadowData_LoadSrc(CenterCoord * 2 + int2(0, 1));
+		
+		float Mean				= Data0.DepthKm + Data1.DepthKm + Data2.DepthKm + Data3.DepthKm;
+		float StandardDeviation = (abs(Data0.DepthKm - Mean) + abs(Data1.DepthKm - Mean) + abs(Data2.DepthKm - Mean) + abs(Data3.DepthKm - Mean)) * 0.25;
+		Data0.DepthKm			= Mean - StandardDeviation; // Filtered front depth instead of only mean
+
+		Data0.MeanExtinction	+= Data1.MeanExtinction + Data2.MeanExtinction + Data3.MeanExtinction;
+		Data0.MaxOpticalDepth	+= Data1.MaxOpticalDepth + Data2.MaxOpticalDepth + Data3.MaxOpticalDepth;
+
+		Data0.MeanExtinction	*= 1.0f / 4.0f;
+		Data0.MaxOpticalDepth	*= 1.0f / 4.0f;
+
+		CloudShadowData_WriteDst(Data0, CenterCoord);
+
+#endif
+	}
+
+
+}
+
+#endif // SHADER_SHADOW_FILTER_CS
+
+
+
+#if SHADER_DEBUG_SHADOW_CS
+
+#include "ShaderDrawDebug.ush"
+
+Texture2D<float2> CloudTracedTexture;
+float4 CloudTextureSizeInvSize;
+float3 CloudTraceDirection;
+float4x4 CloudWorldToLightClipMatrixInv;
+
+[numthreads(8, 8, 1)]
+void MainDrawDebugShadowCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	//ResolvedView = ResolveView();
+
+	if (all(DispatchThreadId.xy < uint2(CloudTextureSizeInvSize.xy)))
+	{
+		float2 CloudShadowData = CloudTracedTexture.Load(uint3(DispatchThreadId.xy, 0));
+		float NearDepth = CloudShadowData.x * KILOMETER_TO_CENTIMETER;
+		float OpticalDepth = CloudShadowData.y;
+
+		const float NearZDepth = 1.0f; // using FReversedZOrthoMatrix
+		float3 NearClipPlaneWorldPos00 = CloudShadowUvToWorldSpace(NearZDepth, float2(DispatchThreadId.xy+uint2(0,0)) * CloudTextureSizeInvSize.zw, CloudWorldToLightClipMatrixInv);
+		float3 NearClipPlaneWorldPos01 = CloudShadowUvToWorldSpace(NearZDepth, float2(DispatchThreadId.xy+uint2(0,1)) * CloudTextureSizeInvSize.zw, CloudWorldToLightClipMatrixInv);
+		float3 NearClipPlaneWorldPos11 = CloudShadowUvToWorldSpace(NearZDepth, float2(DispatchThreadId.xy+uint2(1,1)) * CloudTextureSizeInvSize.zw, CloudWorldToLightClipMatrixInv);
+		float3 NearClipPlaneWorldPos10 = CloudShadowUvToWorldSpace(NearZDepth, float2(DispatchThreadId.xy+uint2(1,0)) * CloudTextureSizeInvSize.zw, CloudWorldToLightClipMatrixInv);
+
+		//
+
+		NearClipPlaneWorldPos00 += CloudTraceDirection * NearDepth;
+		NearClipPlaneWorldPos01 += CloudTraceDirection * NearDepth;
+		NearClipPlaneWorldPos11 += CloudTraceDirection * NearDepth;
+		NearClipPlaneWorldPos10 += CloudTraceDirection * NearDepth;
+
+		float4 DebugColor = OpticalDepth > 0.0f ? float4(float2(DispatchThreadId.xy) * CloudTextureSizeInvSize.zw, 0.1f, 1.0f)
+			: float4(0.0f, 0.0f, 0.0f, 0.20f);
+
+		if (OpticalDepth > 0.0f)
+		{
+			AddQuad(NearClipPlaneWorldPos00, NearClipPlaneWorldPos01, NearClipPlaneWorldPos11, NearClipPlaneWorldPos10, DebugColor);
+		}
+	}
+}
+
+#endif // SHADER_DEBUG_SHADOW_CS
+
+
+
+#if SHADER_SHADOW_TEMPORAL_PROCESS_CS
+
+SamplerState BilinearSampler;
+Texture2D<float3> CurrCloudShadowTexture;
+Texture2D<float3> PrevCloudShadowTexture;
+RWTexture2D<float3> OutCloudShadowTexture;
+
+float4x4 CurrFrameCloudShadowmapWorldToLightClipMatrixInv;
+float4x4 PrevFrameCloudShadowmapWorldToLightClipMatrix;
+
+float3 CurrFrameLightPos;
+float3 PrevFrameLightPos;
+float3 CurrFrameLightDir;
+float3 PrevFrameLightDir;
+uint CloudShadowMapAnchorPointMoved;
+
+float4 CloudTextureSizeInvSize;
+float4 CloudTextureTracingSizeInvSize;
+float4 CloudTextureTracingPixelScaleOffset;
+float TemporalFactor;
+uint PreviousDataIsValid;
+
+[numthreads(8, 8, 1)]
+void MainShadowTemporalProcessCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	ResolvedView = ResolveView();
+
+	if (all(DispatchThreadId.xy < uint2(CloudTextureSizeInvSize.xy)))
+	{
+		const int2 CenterCoord = int2(DispatchThreadId.xy);
+		const float2 CenterUV = (float2(DispatchThreadId.xy) + 0.5f) * CloudTextureSizeInvSize.zw;
+
+		// Source coord from half resolution
+		const int2 NewTracedDataCoord = CenterCoord / int2(CloudTextureTracingPixelScaleOffset.xy);
+		// Destination coord for full resolution
+		const int2 NewDataCoord = int2(NewTracedDataCoord * int2(CloudTextureTracingPixelScaleOffset.xy) + int2(CloudTextureTracingPixelScaleOffset.zw));
+		// Sampel data for this frame
+		float3 CurrCloudShadowData = CurrCloudShadowTexture.Load(uint3(NewTracedDataCoord, 0));
+
+		float3 FilteredData = CurrCloudShadowData;
+
+		if (PreviousDataIsValid)
+		{
+			const float DummyDepth = 0.0f;
+			float4 ClipCoord = float4(CenterUV * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), DummyDepth, 1.0f); 
+			float4 HomogeneousCoord = mul(ClipCoord, CurrFrameCloudShadowmapWorldToLightClipMatrixInv);
+			float3 WorldPos = HomogeneousCoord.xyz / HomogeneousCoord.www;
+			ClipCoord = mul(float4(WorldPos, 1.0f), PrevFrameCloudShadowmapWorldToLightClipMatrix);
+			ClipCoord /= ClipCoord.wwww;
+			float2 PreviousUVs = 0.5f + float2(0.5f, -0.5f) * ClipCoord.xy;
+
+			// We have a new shadow data to blending with history
+			float3 PrevCloudShadowData = PrevCloudShadowTexture.SampleLevel(BilinearSampler, PreviousUVs, 0);
+
+			if (CloudShadowMapAnchorPointMoved > 0) 
+			{
+				// Approximated reprojection of previous depth into current orthographic volume, to make sure nothing pops when the orthographic projection is translated around on the planet
+				// Only when the anchor poitn as moved, to have light rotation still smoothed out
+				float3 PrevPos = PrevFrameLightPos + PrevFrameLightDir * PrevCloudShadowData.r * KILOMETER_TO_CENTIMETER;
+				PrevCloudShadowData.r = dot(PrevPos - CurrFrameLightPos, CurrFrameLightDir) * CENTIMETER_TO_KILOMETER;
+			}
+
+			if (all(NewDataCoord == CenterCoord))
+			{
+				// A very simple filter for now that does work well for reasonable atmospheric light rotations.
+				FilteredData = PrevCloudShadowData + TemporalFactor * (CurrCloudShadowData - PrevCloudShadowData);
+				FilteredData.x = CurrCloudShadowData.x; // Do not filter depth otherwise we have trouble converging due to precision issue. This will need to be fixed
+			}
+			else
+			{
+				// Simple reproject history
+				FilteredData = PrevCloudShadowData;
+			}
+		}
+
+		OutCloudShadowTexture[CenterCoord] = max(0.0, FilteredData);
+	}
+}
+
+#endif // SHADER_SHADOW_FILTER_CS
+
+

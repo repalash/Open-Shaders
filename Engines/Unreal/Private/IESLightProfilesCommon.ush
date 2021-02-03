@@ -1,0 +1,66 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	IESLightProfiles.usf: Common shader code for IES light profiles
+=============================================================================*/
+
+// IES light profiles
+Texture2D		IESTexture;
+SamplerState	IESTextureSampler;
+
+// Apply IES light profile texture
+float ComputeLightProfileMultiplier(float3 WorldPosition, float3 LightPosition, float3 LightDirection, float3 LightTangent)
+{
+#if USE_IES_PROFILE
+	float3 LightBitangent = normalize( cross( LightTangent, LightDirection ) );
+
+	float4x4 LightTransform = float4x4( float4(LightDirection.xyz, 0), float4(LightBitangent.xyz, 0), float4(LightTangent.xyz, 0), float4(0, 0, 0, 1) );
+	float4x4 InvLightTransform = transpose(LightTransform);
+
+	float3 ToLight = normalize(LightPosition - WorldPosition);
+	float3 LocalToLight = mul(float4(ToLight.xyz, 0), InvLightTransform).xyz;
+
+	// -1..1
+	float DotProd = dot(ToLight, LightDirection);
+	// -PI..PI (this distortion could be put into the texture but not without quality loss or more memory)
+	float Angle = asin(DotProd);
+	// 0..1
+	float NormAngle = Angle / PI + 0.5f;
+
+	float TangentAngle = atan2( -LocalToLight.z, -LocalToLight.y ); // -Y represents 0/360 horizontal angle and we're rotating counter-clockwise
+	float NormTangentAngle = TangentAngle / (PI * 2.f) + 0.5f;
+
+	return Texture2DSampleLevel(IESTexture, IESTextureSampler, float2(NormAngle, NormTangentAngle), 0).r;
+#else 
+	return 1.0f;
+#endif
+}
+
+#if RAYHITGROUPSHADER || RAYGENSHADER || RAYMISSSHADER
+
+// Apply IES light profile texture. Each row of the texture stores one profile.
+float ComputeRayTracingLightProfileMultiplier(
+	float3 WorldPosition,
+	float3 LightPosition,
+	float3 LightDirection,
+	int LightProfileTextureIndex)
+{
+	float Result = 1.f;
+	if (LightProfileTextureIndex >= 0)
+	{
+		const float3 FromLight = normalize(WorldPosition - LightPosition);
+		
+		// -1..1
+		float DotProd = dot(FromLight, LightDirection);
+		// -PI..PI (this distortion could be put into the texture but not without quality loss or more memory)
+		float Angle = asin(DotProd);
+		// 0..1
+		const float NormAngle = Angle / PI + 0.5f;
+		
+		const float2 UV = float2(NormAngle, (float(LightProfileTextureIndex) + 0.5) * RaytracingLightsDataPacked.IESLightProfileInvCount);
+		Result = Texture2DSampleLevel(RaytracingLightsDataPacked.IESLightProfileTexture, RaytracingLightsDataPacked.IESLightProfileTextureSampler, UV, 0).r;
+	}
+
+	return Result;
+}
+#endif // RAYHITGROUPSHADER || RAYGENSHADER || RAYMISSSHADER

@@ -1,0 +1,271 @@
+#version 430
+#ifdef GL_ARB_compute_variable_group_size
+#extension GL_ARB_compute_variable_group_size : enable
+#endif
+
+#extension GL_NV_shader_buffer_load : enable
+#extension GL_NV_shader_buffer_store : enable
+
+#include <g3dmath.glsl>
+
+#include <Texture/Texture.glsl>
+
+#include "../DDGIVolume/DDGIVolume.glsl"
+
+#include <octahedral.glsl>
+// Assumed to be the y dimension of the input textures
+#expect RAYS_PER_PROBE "int"
+#expect BLOCK_SIZE "int"
+
+layout(local_size_variable) in;
+
+layout(std430, binding = 2) restrict readonly buffer RayBlockIndexOffsetSSBO {
+    int rayBlockOffset[];
+};
+
+// BlocBLOCK_SIZE size. Choose so that V + I = k, and k is a multiple of the warp size.
+//const int k = 64;
+
+uniform float                       maxDistance;
+
+uniform mat3                        randomOrientation;
+
+layout(rgb10_a2) uniform image2D    irradianceImage;
+layout(rg16f)    uniform image2D    visibilityImage;
+
+const int                           logIrradianceProbeSideLength =  3; // 2^3 = 8
+const int                           logVisibilityProbeSideLength =  4; // 2^4 = 16
+
+// 2048 floats across 64 threads (8kb)
+shared vec4                         rayIrradianceAndDist[RAYS_PER_PROBE];
+shared vec4                         rayDirection[RAYS_PER_PROBE];
+
+uniform Texture2D                   rayHitLocations;
+uniform Texture2D                   rayHitRadiance;
+
+uniform DDGIVolume                  ddgiVolume;
+
+uniform float                       visibilitySharpness;
+
+uniform float                       irradianceHysteresis;
+uniform float                       visibilityHysteresis;
+
+// Ray data for multiple volume is stored in the input texture.
+// This is an offset in *rows* of the texture, not pixels. This
+// offset is equal to the total number of probes in all preceding
+// volumes.
+uniform int							offset;
+
+// Number of rays processed in each iteration
+const int                           batchSize = RAYS_PER_PROBE / BLOCK_SIZE;
+
+
+// Compute normalized oct coord, mapping top left of top left pixel to (-1,-1)
+vec2 normalizedOctCoord(ivec2 octFragCoord, const int probeSideLength) {
+    // Add back the half pixel to get pixel center normalized coordinates
+    // This pattern can be expanded and flattened, but don't bother for now.
+    return (octFragCoord + 0.5f) * (2.0f / float(probeSideLength)) - 1.0f;
+}
+
+
+void main() {
+    // blockID.x = probe X index in the packed texture (= gridCoord.x + probeCounts.x * gridCoord.y)
+    // blockID.y = probe Y index in the packed texture (= gridCoord.z)
+    // blockID.z = texel subset. There are V^2 + I^2 = 640 = 20*32 texels to process,
+    //             and we assign n=4 threads to each texel. So, the block Z axis always is = 160 
+    int3 blockID = (int3)gl_WorkGroupID.xyz;
+
+    // Probe being processed by this thread (this will be the same across the entire block)
+    int probeIndex = blockID.x + blockID.y * ddgiVolume.probeCounts.x * ddgiVolume.probeCounts.y;
+
+    int rayOffset = rayBlockOffset[probeIndex];
+    if (rayOffset == -1) {
+        return;
+    }
+
+    // This thread's linear ID in the block on [0, 31]
+    int threadID = (int)gl_LocalInvocationID.x;
+
+    // The first thread block process irradiance texels. The others process visibility texels.
+    bool irradianceBlock = blockID.z < (square(ddgiVolume.irradianceProbeSideLength) / BLOCK_SIZE);
+
+    // Set NewlyX probes to their resolved state.
+    vec4 currentOffset = readProbeOffset(ddgiVolume, ivec2(blockID.x, blockID.y));
+
+    // CANNOT USE memoryBarrierShared() HERE: That only makes shared memory access atomic,
+    // it doesn't actually create a barrier.
+    barrier();
+
+    int flag = (int)currentOffset.w;
+    // Newly X probes. When initializing, any probes for which this is the case will not have had rays generated for them.
+    if ((int)currentOffset.w == 2 || (int)currentOffset.w == 4) {
+        currentOffset.w = currentOffset.w + 1.0f;
+    }
+    writeProbeOffset(ddgiVolume, ivec2(blockID.x, blockID.y), currentOffset);
+
+
+    // Probes have 1-pix borders on all sides
+    int2 cornerTexelCoord;
+
+    // Texel relative to the corner of the probe in the final texture.
+    // Every thread processes 1 texel. For the irradiance probe, the numbers work out so that one block exactly
+    // processes the whole probe. For the visibility probe, there are four blocks per probe.
+    int2 relativeTexelCoord;
+
+    // This thread processes a single texel that corresponds to this direction on the sphere 
+    vec3 probeDirection;
+
+    int sideLength =  irradianceBlock ? ddgiVolume.irradianceProbeSideLength : ddgiVolume.visibilityProbeSideLength;
+
+    cornerTexelCoord = blockID.xy * (sideLength + 2) + int2(1, 1);
+
+    // This branch is totally coherent for 8x8 res irradianceProbes
+    if (irradianceBlock) {
+        relativeTexelCoord.x = threadID & (ddgiVolume.irradianceProbeSideLength - 1);
+        // With k = 64, blockID.z is always 0
+        relativeTexelCoord.y = (blockID.z * BLOCK_SIZE + threadID) >> logIrradianceProbeSideLength;
+    } else {
+        const int i = blockID.z - (square(ddgiVolume.irradianceProbeSideLength) / BLOCK_SIZE);
+        relativeTexelCoord.x = (i * BLOCK_SIZE + threadID) & (ddgiVolume.visibilityProbeSideLength - 1);
+        relativeTexelCoord.y = (i * BLOCK_SIZE + threadID) >> logVisibilityProbeSideLength;
+    }
+
+    probeDirection = octDecode(normalizedOctCoord(relativeTexelCoord, sideLength));
+
+    vec4 result = vec4(0);
+    int probeOffsetInAbsoluteRays = offset + (probeIndex - rayOffset) * RAYS_PER_PROBE;
+    for (int batchIndex = 0; batchIndex < batchSize; ++batchIndex) { // (= 4 if k == 64)
+        // Read all the rays
+        {
+            int rayIndex = batchIndex * BLOCK_SIZE + threadID;
+
+            // Cooperatively read k hitDistances, and limit them so that they don't blow out
+            // the variance on a miss or distant hit. If they are negative, that encodes a
+            // backface that should be shortened.
+			// Add offset to read from the correct place in the ray textures.
+            int offsetIdx = probeOffsetInAbsoluteRays + rayIndex;
+            int2 C = ivec2(offsetIdx % RAYS_PER_PROBE, offsetIdx / RAYS_PER_PROBE);
+
+            float d = sampleTextureFetch(rayHitLocations, C, 0).w;
+
+            // If d is negative [backface], then we preserve the sign of d so that later processing will still know that this
+            // was a backface.
+            rayIrradianceAndDist[rayIndex] = float4(sampleTextureFetch(rayHitRadiance, C, 0).rgb, min(maxDistance, abs(d)) * (d < 0 ? -0.2f : 1.0f));
+
+            // Cooperatively read k ray directions [one read/thread]
+            rayDirection[rayIndex] = vec4(randomOrientation * sphericalFibonacci(rayIndex, RAYS_PER_PROBE), 0.0f);
+
+        } // load ray data
+    }
+	
+	// CANNOT USE memoryBarrierShared() HERE: That only makes shared memory access atomic,
+    // it doesn't actually create a barrier.
+	barrier();
+
+    float3 value;
+
+    // Process RAYS_PER_PROBE rays at this pixel across warp
+    if (irradianceBlock) {
+        for (int i = 0; i < RAYS_PER_PROBE; ++i) {
+			float weight = max(0, dot(rayDirection[i].xyz, probeDirection));
+            value = rayIrradianceAndDist[i].rgb;
+            result += float4(value * weight, weight);
+        }
+    } else {
+        for (int i = 0; i < RAYS_PER_PROBE; ++i) {
+			float weight = max(0, dot(rayDirection[i].xyz, probeDirection));
+            weight = pow(weight, visibilitySharpness);
+            // The distance may be negative (encoding a backface)
+            // but because it is SQUARED before use, the sign doesn't
+            // matter.
+			float rayDist = abs(rayIrradianceAndDist[i].w);
+            value = float3(rayDist, square(rayDist), 0);
+            result += float4(value * weight, weight);
+        }
+    }
+
+    // For both irradiance and depth, every thread processes all rays for a single texel, 
+    // so we don't need another barrier again after processing the rays above.
+
+    // Normalize and avoid division by zero
+    const float epsilon = 1e-9 * float(RAYS_PER_PROBE);
+    result.xyz *= 1.0 / max(result.w, epsilon);
+
+    // Account for the extra factor of two from summing the cosine weights.
+    if (irradianceBlock) {
+        result *= 0.5;
+    }
+    
+
+    float h = irradianceBlock ? irradianceHysteresis : visibilityHysteresis;
+
+    // Hysteresis 0 if just woke or just vigilant
+    if (flag == 6.0f || flag == 2.0f || flag == 4.0f) {
+        h = 0.0f;
+    }
+
+	// If a probe just spawned, clear its old data.
+	const Color3 DEAD_PROBE_VALUE = Color3(0,0,0);
+	if (flag == 6.0f) {
+		result.xyz = DEAD_PROBE_VALUE;
+	}
+
+    int2 texelCoord = cornerTexelCoord + relativeTexelCoord;
+
+    const float significantChangeThreshold = 0.25;
+    float newDistributionChangeThreshold = 0.8;
+    if (!irradianceBlock) {
+        newDistributionChangeThreshold *= maxDistance;
+    }
+
+    // This branch will be coherent across a block
+    if (irradianceBlock) {
+        vec4 oldValue = texelFetch(ddgiVolume.irradianceTexture, texelCoord, 0);
+        // Store gamma encoded for more perceptually linear EMWA
+        result.rgb = pow(result.rgb, vec3(ddgiVolume.invIrradianceGamma));
+        
+        float changeMagnitude = maxComponent(result.rgb - oldValue.xyz);
+
+        // Lower the hysteresis when a large change is detected
+        if (abs(changeMagnitude) > significantChangeThreshold) {
+            h = max(0, h - 0.15);
+        }
+		
+        if (abs(changeMagnitude) > newDistributionChangeThreshold) {
+            h = 0.0f;
+        }
+
+        // Useful debug option for probe indexing.
+        //vec3 debugResult = vec3(probeIndexToGridCoord(ddgiVolume, probeIndex)) / vec3(ddgiVolume.probeCounts);
+        //vec2 debugOctCoord = normalizedOctCoord(relativeTexelCoord, sideLength);
+        //if (probeIndex % 3 == 0) {
+        //    debugOctCoord *= -1.0f;
+        //}
+        //vec3 debugResult = 0.5f * (vec3(debugOctCoord + vec2(1,1), 0));
+		imageStore(irradianceImage, texelCoord, //vec4(debugResult, 1));
+			vec4(lerp(result.xyz, oldValue.xyz, h), 1));
+    } else {
+        vec2 oldValue = texelFetch(ddgiVolume.visibilityTexture, texelCoord, 0).rg;
+
+        // Lower the hysteresis when a large change is detected
+        // Note *signed* changeMagnitude
+        float changeMagnitude = maxComponent(oldValue.xy - result.rg);
+
+#if 0
+        if (changeMagnitude > newDistributionChangeThreshold) {
+            h = max(0, h - 0.15);
+        }
+#endif
+        // Doing this for visibility is too unstable.
+        //if (changeMagnitude > newDistributionChangeThreshold) {
+        //    h = 0.0f;
+        //}
+
+        //vec2 debugOctCoord = normalizedOctCoord(relativeTexelCoord, sideLength);
+        //vec3 debugResult = 0.5f * (vec3(debugOctCoord + vec2(1,1), 0));
+
+        // Commented option is useful for debugging border copy
+        imageStore(visibilityImage, texelCoord, //vec4(debugResult, 1));
+            vec4(lerp(result.rg, oldValue, h), 0, 1));
+        }
+}

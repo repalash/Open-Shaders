@@ -1,0 +1,171 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+SkyLight.usf: Light sampling functions for SkyLight implementation
+===============================================================================================*/
+
+#pragma once
+
+#include "../../RayTracing/SkyLightMipTreeCommon.ush"
+#include "../../ReflectionEnvironmentShared.ush"
+
+#define USE_HIERARCHICAL_IMPORTANCE_SAMPLING
+
+void SkyLight_GenerateLightRay(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out RayDesc OutLightRay
+)
+{
+	OutLightRay.Origin = Ray.Origin;
+	OutLightRay.Direction = LightUV;
+	OutLightRay.TMin = 0.0;
+	OutLightRay.TMax = 1.0e27;
+}
+
+void SkyLight_PdfLight(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out float OutPdf
+)
+{
+#ifndef USE_HIERARCHICAL_IMPORTANCE_SAMPLING
+	OutPdf = 1.0 / (2.0 * PI);
+#else
+	// Determine primary direction
+	//uint MipCount = Log2(SkyLight.MipDimensions.x);
+	uint MipCount = log2(SkyLight.MipDimensions.x);
+	uint2 TextureRes;
+	SkyLight.Texture.GetDimensions(TextureRes.x, TextureRes.y);
+	float3 LightDirection = LightUV;
+	uint3 TextureCoord = GetTextureCubeCoordinate(LightDirection, TextureRes);
+	float2 TextureUV = TextureCoord.xy / (float2)TextureRes;
+	uint2 MipCoord = TextureUV * SkyLight.MipDimensions.xy;
+	float FacePdf = PdfFace(MipCount, TextureCoord.z);
+
+	uint StopLevel = min(SkyLight.SamplingStopLevel, MipCount);
+	float MipPdf = PdfMipTree(uint3(MipCoord, TextureCoord.z), StopLevel);
+
+	uint LinearIndex = BufferOffsetAtPixel(MipCoord, StopLevel, SkyLight.MipDimensions.xy);
+	float AreaPdf = SkyLight.SolidAnglePdf[LinearIndex];
+	OutPdf = FacePdf * MipPdf * AreaPdf;
+#endif
+}
+
+void SkyLight_EvalLight(
+	int LightId,
+	float3 LightUV,
+	RayDesc Ray,
+	out float3 OutRadiance
+)
+{
+	OutRadiance = SkyLight.Color * TextureCubeSampleLevel(SkyLight.Texture, SkyLight.TextureSampler, LightUV, 0).rgb;
+}
+
+void SkyLight_EstimateLight(
+	int LightId,
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	out float OutIrradiance
+)
+{
+	float3 WorldNormal = Payload.WorldNormal;
+	// Modifying diffuse contribution to prevent false negatives with PDF estimation
+	float3 SkySHDiffuse = max(GetSkySHDiffuse(WorldNormal), 0.01);
+	float3 SkyLightIrradiance = GetColor(LightId) * SkySHDiffuse;
+	float SkyLightIlluminance = Luminance(SkyLightIrradiance);
+
+	OutIrradiance = SkyLightIlluminance * 2.0f * PI;
+}
+
+void SkyLight_SampleLight(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	int LightId,
+	out float3 OutLightUV,
+	out float OutPdf
+)
+{
+#ifndef USE_HIERARCHICAL_IMPORTANCE_SAMPLING
+	float4 Direction_Tangent = UniformSampleHemisphere(RandSample.yz);
+	OutLightUV = TangentToWorld(Direction_Tangent.xyz, Payload.WorldNormal);
+	OutPdf = Direction_Tangent.w;
+#else
+	float3 WorldPosition = Ray.Origin;
+	float3 WorldNormal = Payload.WorldNormal;
+
+	// Determine the appropriate face to use
+	//uint MipCount = Log2(SkyLight.MipDimensions.x);
+	uint MipCount = log2(SkyLight.MipDimensions.x);
+	float FacePdf = 0.0;
+	uint FaceIndex = SampleFace(MipCount, RandSample.x, FacePdf);
+
+	uint2 MipPixel = 0;
+	float MipPdf = 1.0;
+	uint StopLevel = min(SkyLight.SamplingStopLevel, MipCount);
+	float DecisionTreeSample = RandSample.y;
+	for (uint Index = 0; Index < MipCount - StopLevel; ++Index)
+	{
+		uint MipIndex = MipCount - Index - 1;
+		uint BufferOffset = BufferOffsetAtPixel(MipPixel, MipIndex, SkyLight.MipDimensions.xy);
+		uint4 BufferOffsets = uint4(BufferOffset, BufferOffset + 1, BufferOffset + 2, BufferOffset + 3);
+
+		float4 Cdf = SampleMipTree(FaceIndex, BufferOffsets);
+		Cdf.y += Cdf.x;
+		Cdf.z += Cdf.y;
+		Cdf.w += Cdf.z;
+		Cdf /= Cdf.w;
+
+		if (DecisionTreeSample < Cdf.x)
+		{
+			MipPdf *= Cdf.x;
+			DecisionTreeSample /= Cdf.x;
+		}
+		else if (DecisionTreeSample < Cdf.y)
+		{
+			MipPdf *= Cdf.y - Cdf.x;
+			MipPixel.x += 1;
+			DecisionTreeSample = (DecisionTreeSample - Cdf.x) / (Cdf.y - Cdf.x);
+		}
+		else if (DecisionTreeSample < Cdf.z)
+		{
+			MipPdf *= Cdf.z - Cdf.y;
+			MipPixel.y += 1;
+			DecisionTreeSample = (DecisionTreeSample - Cdf.y) / (Cdf.z - Cdf.y);
+		}
+		else // if (DecisionTreeSample < Cdf.w)
+		{
+			MipPdf *= Cdf.w - Cdf.z;
+			MipPixel += 1;
+			DecisionTreeSample = (DecisionTreeSample - Cdf.z) / (Cdf.w - Cdf.z);
+		}
+
+		MipPixel = uint2(MipPixel.x << 1, MipPixel.y << 1);
+	}
+	MipPixel = uint2(MipPixel.x >> 1, MipPixel.y >> 1);
+
+	// DEBUG: assert cached PDF is equivalent to re-evaluation
+	//MipPdf = PdfSkyLightOcclusionRay(WorldNormal, RayDirection);
+
+	float2 PixelOffset = RandSample.zw;
+	float2 MipPixelUV = (MipPixel + PixelOffset) / float2(DimensionsAtLevel(SkyLight.MipDimensions.xy, StopLevel));
+
+	// Construct Cubemap coordinate
+	uint2 TextureDimensions;
+	SkyLight.Texture.GetDimensions(TextureDimensions.x, TextureDimensions.y);
+	float3 TexelCoord = float3(MipPixelUV * TextureDimensions, FaceIndex);
+
+	// Determine area pdf
+	uint LinearIndex = BufferOffsetAtPixel(MipPixel, StopLevel, SkyLight.MipDimensions.xy);
+	float AreaPdf = SkyLight.SolidAnglePdf[LinearIndex];
+
+	float3 RayDirection = normalize(GetTextureCubeVector(TexelCoord, TextureDimensions));
+	float RayPdf = FacePdf * MipPdf * AreaPdf;
+
+	OutLightUV = RayDirection;
+	OutPdf = RayPdf;
+#endif
+}

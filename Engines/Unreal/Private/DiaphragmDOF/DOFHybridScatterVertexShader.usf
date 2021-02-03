@@ -1,0 +1,141 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DiaphragmDOF/DOFHybridScatterVertexShader.usf: Scattering's vertex shader.
+=============================================================================*/
+
+#include "DOFHybridScatterCommon.ush"
+
+
+//------------------------------------------------------- COMPILE TIME CONSTANTS
+
+static const float2 kSpriteVertices[6] = {
+	float2(-1.0, +1.0),
+	float2(+1.0, +1.0),
+	float2(+1.0, -1.0),
+	float2(-1.0, -1.0),
+	float2(+1.0, -1.0),
+	float2(-1.0, +1.0),
+};
+
+
+//------------------------------------------------------- PARAMETERS
+
+float4 ViewportSize;
+
+float ScatteringScaling;
+float CocRadiusToCircumscribedRadius;
+StructuredBuffer<float4> ScatterDrawList;
+
+
+//------------------------------------------------------- ENTRY POINT
+
+void ScatterMainVS(
+	in uint VertexId : SV_VertexID,
+	in uint InstanceId : SV_InstanceID,
+	out nointerpolation float2 BokehCenter0 : TEXCOORD0,
+	out nointerpolation float4 ColorAndAbsCocRadius0 : TEXCOORD1,
+	out nointerpolation float4 ColorAndAbsCocRadius1 : TEXCOORD2,
+	out nointerpolation float4 ColorAndAbsCocRadius2 : TEXCOORD3,
+	out nointerpolation float4 ColorAndAbsCocRadius3 : TEXCOORD4,
+#if TAYLOR_EXPENDED_COC_INTERSECTION
+	out nointerpolation float4 TaylorExpensionMAD0   : TEXCOORD5,
+	out nointerpolation float4 TaylorExpensionMAD1   : TEXCOORD6,
+#endif
+	out float4 OutPosition : SV_POSITION)
+{
+	#if SCATTERING_GROUP_PACKING
+		// Number scattering group that can be packed per instance.
+		const uint ScatteringGroupPerInstance = VERTEX_SHADER_INVOCATION_TARGET / VERTEX_SHADER_INVOCATION_PER_SCATTERING_GROUP;
+
+		uint LocalSpriteId = VertexId / VERTEX_SHADER_INVOCATION_PER_SCATTERING_GROUP;
+		uint SpriteVertexId = VertexId - LocalSpriteId * VERTEX_SHADER_INVOCATION_PER_SCATTERING_GROUP;
+		uint GlobalSpriteId = ScatteringGroupPerInstance * InstanceId + LocalSpriteId;
+
+	#else //!SCATTERING_GROUP_PACKING
+		uint SpriteVertexId = VertexId;
+		uint GlobalSpriteId = InstanceId;
+
+	#endif
+
+	// Fetches color.
+	float4 Color[PIXEL_COUNT_PER_SCATTER_GROUP];
+	float AbsCocRadius[PIXEL_COUNT_PER_SCATTER_GROUP];
+	float2 TaylorExpension[PIXEL_COUNT_PER_SCATTER_GROUP];
+	float MaxAbsCocRadius = 0;
+	
+	UNROLL
+	for (uint i = 0; i < PIXEL_COUNT_PER_SCATTER_GROUP; i++)
+	{
+		float4 E = ScatterDrawList[5 * GlobalSpriteId + i + 1];
+		Color[i] = float4(E.rgb, 0);
+		AbsCocRadius[i] = E.w;
+
+		if (i == 0)
+			MaxAbsCocRadius = AbsCocRadius[i];
+		else
+			MaxAbsCocRadius = max(MaxAbsCocRadius, AbsCocRadius[i]);
+
+		/** Taylor expension of order 1 of the original intersection equation:
+		 *     I(x = d^2) = M - sqrt(x)
+		 *
+		 *  With:
+		 *     d = PixelDistance from center of the bokeh
+		 *
+		 *  I(x) ~= - x * 0.5 / sqrt(K) + (M - 0.5 * sqrt(K))
+		 *    (x ~= K)
+		 *
+		 *  K=AbsCocRadius^2
+		 */
+		{
+			float M = AbsCocRadius[i] + ANTI_ALIASING_FEATHER_OFFSET;
+			float K = AbsCocRadius[i] * AbsCocRadius[i];
+			
+			// TaylorExpension[i].x = -0.5 / sqrt(K);
+			// TaylorExpension[i].y = M - 0.5 * sqrt(K);
+			
+			TaylorExpension[i].x = -0.5 * rcp(AbsCocRadius[i]);
+			TaylorExpension[i].y = 0.5 * AbsCocRadius[i] + ANTI_ALIASING_FEATHER_OFFSET;
+		}
+	}
+
+	// Output interpolators.
+	{
+		ColorAndAbsCocRadius0 = float4(Color[0].rgb, AbsCocRadius[0]);
+		ColorAndAbsCocRadius1 = float4(Color[1].rgb, AbsCocRadius[1]);
+		ColorAndAbsCocRadius2 = float4(Color[2].rgb, AbsCocRadius[2]);
+		ColorAndAbsCocRadius3 = float4(Color[3].rgb, AbsCocRadius[3]);
+	
+		BokehCenter0 = ScatteringScaling * ScatterDrawList[5 * GlobalSpriteId].xy;
+	
+		#if TAYLOR_EXPENDED_COC_INTERSECTION
+		{
+			TaylorExpensionMAD0.xy = TaylorExpension[0];
+			TaylorExpensionMAD0.zw = TaylorExpension[1];
+			TaylorExpensionMAD1.xy = TaylorExpension[2];
+			TaylorExpensionMAD1.zw = TaylorExpension[3];
+		}
+		#endif
+	}
+
+	#if BOKEH_DRAW_METHOD == BOKEH_DRAW_METHOD_TRIANGLE
+		float2 VertexPos = kSpriteVertices[SpriteVertexId];
+
+	#elif BOKEH_DRAW_METHOD == BOKEH_DRAW_METHOD_INDEXED_TRIANGLE
+		float2 VertexPos = float2(SpriteVertexId % 2, SpriteVertexId / 2) * 2 - 1;
+
+	#elif BOKEH_DRAW_METHOD == BOKEH_DRAW_METHOD_RECT
+		float2 VertexPos = kSpriteVertices[SpriteVertexId];
+		
+	#else
+		#error Unknown bokeh drawing method.
+
+	#endif
+
+	// The center of the pixel group is 0.5 south east of BokehCenter0.
+	const float HalfPixelShift = 0.5;
+
+	float2 ViewportUV = ((MaxAbsCocRadius * CocRadiusToCircumscribedRadius + (HalfPixelShift + ANTI_ALIASING_FEATHER_OFFSET)) * VertexPos + BokehCenter0 + HalfPixelShift) * ViewportSize.zw; 
+
+	OutPosition = float4(ViewportUV.x * 2.0 - 1.0, 1.0 - ViewportUV.y * 2.0, 0.0, 1.0);
+}

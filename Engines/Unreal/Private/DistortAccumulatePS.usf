@@ -1,0 +1,99 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	DistortionAccumulatePixelShader.usf: Pixel shader for accumulating distortion offsets
+=============================================================================*/
+
+#include "Common.ush"
+
+// Reroute distortion pass uniform buffer.
+#if SHADING_PATH_MOBILE
+	#define MobileSceneTextures MobileDistortionPass.SceneTextures
+	#define DistortionParams MobileDistortionPass.DistortionParams
+#else
+	#define SceneTexturesStruct DistortionPass.SceneTextures
+	#define DistortionParams DistortionPass.DistortionParams
+#endif
+
+#include "SceneTexturesCommon.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+#include "DistortionCommon.ush"
+
+void ClipOccludedPixel(float PixelZ, float SceneZ)
+{
+#if	HAS_INVERTED_Z_BUFFER
+	float ClipDepth = PixelZ - SceneZ;
+#else
+	float ClipDepth = SceneZ - PixelZ;
+#endif
+	clip(ClipDepth);
+}
+
+/** output distortion offsets as color so they can be accumulated (via blending) */
+void Main(
+	FVertexFactoryInterpolantsVSToPS Interpolants,
+	float4	PixelPosition	: TEXCOORD6,
+	in float4 SvPosition	: SV_Position
+	OPTIONAL_IsFrontFace,
+	out float4 OutColor		: SV_Target0
+	)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = Interpolants.EyeIndex;
+	ResolvedView = ResolveView(Interpolants.EyeIndex);
+#else
+	const uint EyeIndex = 0;
+	ResolvedView = ResolveView();
+#endif
+
+	// material parameter inputs
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+
+#if SHADING_PATH_MOBILE
+	// Mobile specific: 
+	// distortion primtitives rendered without depth testing
+	// discard pixels that are hidden by manually comparing them to a scene depth
+	float2 BufferUV = SvPositionToBufferUV(SvPosition);
+	ClipOccludedPixel(SvPosition.z, LookupDeviceZ(BufferUV));
+#endif
+	
+	// material distortion offset
+	half3 Normal = GetMaterialNormal(MaterialParameters, PixelMaterialInputs);
+
+	// Prevent silhouettes from geometry that is in front of distortion from being seen in the distortion 
+	float2 NDC = (MaterialParameters.ScreenPosition.xy / MaterialParameters.ScreenPosition.w);
+	float2 ScreenUV = NDC * ResolvedView.ScreenPositionScaleBias.xy + ResolvedView.ScreenPositionScaleBias.wz;
+
+	// X = IOR, Y = Refraction Bias
+	float2 Refraction = GetMaterialRefraction(PixelMaterialInputs);
+
+	// Compute UV distortion
+	float2 BufferUVDistortion = ComputeBufferUVDistortion(
+		MaterialParameters, PixelMaterialInputs, ResolvedView,
+		Normal, DistortionParams, ScreenUV, Refraction, true, EyeIndex);
+
+	// Sample depth at distortion offset
+	float2 DistortBufferUV = ScreenUV + BufferUVDistortion;
+
+#if SHADING_PATH_MOBILE
+	// sample depth from SceneColor.A on Mobile
+	float DistortSceneDepth = ConvertFromDeviceZ(LookupDeviceZ(DistortBufferUV)); 
+#else
+	float DistortSceneDepth = CalcSceneDepth(DistortBufferUV);
+#endif
+
+	// Post process UV distortion according to depth
+	PostProcessUVDistortion(MaterialParameters, PixelMaterialInputs, DistortSceneDepth, BufferUVDistortion, Refraction);
+
+	// store positive and negative offsets separately
+	float2 PosOffset = max(BufferUVDistortion,0);
+	float2 NegOffset = abs(min(BufferUVDistortion,0));
+
+	// output positives in R|G channels and negatives in B|A channels
+	OutColor = float4(PosOffset.x,PosOffset.y,NegOffset.x,NegOffset.y);
+}
+
+

@@ -1,0 +1,71 @@
+#version 410 or 460
+/**
+  \file data-files/shader/SkyboxSurface/SkyboxSurface_render.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+in vec3 direction;
+uniform float alpha;
+
+#ifdef texture0_notNull
+#   ifdef texture0_2DSpherical
+        // Use a 2D spherical-coordinate map
+        uniform sampler2D   texture0_buffer;
+#   else
+        uniform samplerCube texture0_buffer;
+#   endif
+    uniform vec4        texture0_readMultiplyFirst;
+    uniform vec4        texture0_readAddSecond;
+#endif
+
+#ifdef texture1_notNull
+#   ifdef texture1_2DSpherical
+        // Use a 2D spherical-coordinate map
+        uniform sampler2D   texture1_buffer;
+#   else
+        uniform samplerCube texture1_buffer;
+#   endif
+    uniform vec4        texture1_readMultiplyFirst;
+    uniform vec4        texture1_readAddSecond;
+#endif
+
+out vec4 g3d_FragColor;
+
+void main() {
+    g3d_FragColor.a   = 1.0;
+    g3d_FragColor.rgb = vec3(0.0);
+
+#   if defined(texture0_2DSpherical) || defined(texture1_2DSpherical)
+        vec3 d = normalize(direction);
+        // Vertical angle, 0 = north pole
+        float lat = (-d.y * 0.5) + 0.5;
+        // Horizontal angle, 0 = +x
+        float phi   = atan(d.z, d.x);
+
+        vec2 sphereCoord = vec2(phi / (2 * pi), lat);
+#   endif
+
+#   ifdef texture0_notNull
+        g3d_FragColor.rgb += (
+#           ifdef texture0_2DSpherical
+                texture(texture0_buffer, sphereCoord).rgb
+#           else
+                texture(texture0_buffer, direction).rgb 
+#           endif
+            * texture0_readMultiplyFirst.rgb + texture0_readAddSecond.rgb) * (1.0 - alpha);
+#   endif
+
+#   ifdef texture1_notNull
+        g3d_FragColor.rgb += (
+#           ifdef texture0_2DSpherical
+                texture(texture1_buffer, sphereCoord).rgb 
+#           else
+                texture(texture1_buffer, direction).rgb 
+#           endif
+            * texture1_readMultiplyFirst.rgb + texture1_readAddSecond.rgb) * alpha;
+#   endif
+}

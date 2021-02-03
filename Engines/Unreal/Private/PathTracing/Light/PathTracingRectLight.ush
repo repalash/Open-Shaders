@@ -1,0 +1,154 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RectLight.usf: Light sampling functions for Rect light implementation
+===============================================================================================*/
+
+#pragma once
+
+#include "../../RectLight.ush"
+#include "PathTracingLightCommon.ush"
+
+void RectLight_GenerateLightRay(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out RayDesc OutLightRay
+)
+{
+	OutLightRay.Origin = Ray.Origin;
+	OutLightRay.TMin = 0.001;
+	// Get rect parameters to determine 3D direction.
+	float2 DeltaP = float2(GetWidth(LightId), GetHeight(LightId)) * LightUV.xy;
+	float3 LightDir = GetPosition(LightId) + DeltaP.x * GetdPdu(LightId) + DeltaP.y * GetdPdv(LightId) - Ray.Origin;
+
+	OutLightRay.Direction = normalize(LightDir);
+	OutLightRay.TMax = length(LightDir);
+}
+
+void RectLight_PdfLight(
+	RayDesc Ray,
+	int LightId,
+	float3 LightUV,
+	out float OutPdf
+)
+{
+	// TODO: Consider making RectLight a physical light. For now, it is analytical only.
+	OutPdf = 0.0;
+}
+
+void RectLight_EvalLight(
+	int LightId,
+	float3 LightUV,
+	RayDesc Ray,
+	out float3 OutRadiance
+)
+{
+	float3 Color = GetColor(LightId);
+	float Falloff = ComputeAttenuationFalloff(Ray.TMax, GetAttenuation(LightId));
+	OutRadiance = Color * Falloff;
+}
+
+void RectLight_EstimateLight(
+	int LightId,
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	out float OutIrradiance
+)
+{
+	// Distance to centroid
+	// #dxr_todo: UE-72533 Use closest point, instead
+	float3 LightDirection = GetPosition(LightId) - Payload.WorldPos;
+	float LightDistanceSquared = dot(LightDirection, LightDirection);
+	LightDirection = normalize(LightDirection);
+	float3 LightNormal = GetNormal(LightId);
+
+	// Light-normal culling
+	if (dot(-LightDirection, LightNormal) <= 0.0)
+	{
+		OutIrradiance = 0.0;
+		return;
+	}
+
+	// Approximate geometric term
+	float3 SurfaceNormal = Payload.WorldNormal;
+	float NoL = dot(SurfaceNormal, LightDirection);
+	NoL = ENABLE_TRANSMISSION && HasTransmission(LightId) ? abs(NoL) : saturate(NoL);
+	float Area = GetWidth(LightId) * GetHeight(LightId);
+
+	float LightPower = Luminance(GetColor(LightId));
+	float Falloff = ComputeAttenuationFalloff(length(LightDirection), GetAttenuation(LightId));
+	OutIrradiance = LightPower * Falloff * Area * NoL / LightDistanceSquared;
+}
+
+void RectLight_SampleLight(
+	RayDesc Ray,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	int LightId,
+	out float3 OutLightUV,
+	out float OutPdf
+)
+{
+	float3 WorldPosition = Payload.WorldPos;
+	float3 LightPosition = GetPosition(LightId);
+	float3 LightNormal = GetNormal(LightId);
+	float3 LightdPdu = GetdPdu(LightId);
+	float3 LightdPdv = GetdPdv(LightId);
+	float LightWidth = GetWidth(LightId);
+	float LightHeight = GetHeight(LightId);
+	
+	// Compute the visible portion of the light from the current shading point
+	if (false)
+	{
+		float3 ToLight = LightPosition - WorldPosition;
+		FRect VisibleRect = GetRect(
+				ToLight,
+				-LightNormal,
+				LightdPdv,
+				LightWidth*0.5f,
+				LightHeight*0.5f,
+				GetRectLightBarnCosAngle(LightId),
+				GetRectLightBarnLength(LightId),
+				true);
+
+		LightPosition = LightPosition - LightdPdu * VisibleRect.Offset.x - LightdPdv * VisibleRect.Offset.y;	
+		LightWidth	  = VisibleRect.Extent.x * 2.0f;
+		LightHeight   = VisibleRect.Extent.y * 2.0f;
+	}
+
+	// Pick a random position
+	float2 UV = RandSample.yz - 0.5;
+	OutLightUV = float3(UV, 0);
+
+	// Map sample point to quad
+	float3 LightSamplePosition = LightPosition + LightdPdu * LightWidth * UV.x + LightdPdv * LightHeight * UV.y;
+	float3 LightDirection = LightSamplePosition - WorldPosition;
+	float LightDirectionLength = length(LightDirection);
+#if USE_ATTENUATION_TERM
+	float Epsilon = 1.0e-5;
+	if (ComputeAttenuationFalloff(LightDirectionLength, GetAttenuation(LightId)) < Epsilon)
+	{
+		OutPdf = 0.0;
+		return;
+	}
+#endif
+	LightDirection *= rcp(LightDirectionLength);
+
+	// Light-normal culling
+	if (dot(-LightDirection, LightNormal) <= 0.0)
+	{
+		OutPdf = 0.0;
+		return;
+	}
+
+	// Define rectangle and compute solid angle
+	FRect Rect;
+	Rect.Origin = LightPosition - WorldPosition;
+	Rect.Axis[0] = LightdPdu;
+	Rect.Axis[1] = LightdPdv;
+	Rect.Axis[2] = cross(LightdPdu, LightdPdv);
+	Rect.Extent = float2(LightWidth, LightHeight) * 0.5f;
+	FSphericalRect SphericalRect = BuildSphericalRect(Rect);
+	OutPdf = isfinite(SphericalRect.SolidAngle) ? 1.0 / SphericalRect.SolidAngle : 0.0;
+}

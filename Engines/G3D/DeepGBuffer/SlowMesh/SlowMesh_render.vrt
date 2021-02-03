@@ -1,0 +1,16 @@
+#version 120 or 420 compatibility // -*- c++ -*-
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+
+attribute vec4 g3d_Vertex;
+attribute vec3 g3d_Normal;
+attribute vec2 g3d_TexCoord0;
+attribute vec4 g3d_Color;
+
+out vec4 color;
+
+void main() {
+    color = g3d_Color;
+    gl_Position   = g3d_Vertex * gl_ModelViewProjectionMatrixTranspose;
+    gl_ClipVertex = g3d_Vertex * gl_ModelViewMatrixTranspose;
+}

@@ -1,0 +1,165 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+//#define SCENE_TEXTURES_DISABLED 1
+
+#include "../Common.ush"
+#include "HairStrandsDebugCommon.ush"
+#include "HairStrandsMeshProjectionCommon.ush" 
+
+#define INPUT_ROOT_FRAME 0
+#define INPUT_ROOT_TRIANGLE 1
+uint MaxRootCount;
+float4x4 RootLocalToWorld;
+uint DeformedFrameEnable;
+
+#if PERMUTATION_INPUT_TYPE == INPUT_ROOT_FRAME
+Buffer<float4> RootPositionBuffer;
+Buffer<float4> RootNormalBuffer;
+Buffer<uint>   RootBarycentricBuffer;
+#endif
+
+Buffer<float4>  RestPosition0Buffer;
+Buffer<float4>  RestPosition1Buffer;
+Buffer<float4>  RestPosition2Buffer;
+
+Buffer<float4>  DeformedPosition0Buffer;
+Buffer<float4>  DeformedPosition1Buffer;
+Buffer<float4>  DeformedPosition2Buffer; 
+
+void MainVS(
+	uint VertexId : SV_VertexID,
+	out float2 OutVertexUVs : VERTEXUVs,
+	out float3 OutFaceNormal : FACE_NORMAL,
+	out float4 OutPosition : SV_POSITION)
+{
+	ResolvedView = ResolveView();
+
+	float2 UVs = 0;
+
+#if PERMUTATION_INPUT_TYPE == INPUT_ROOT_FRAME  
+	const uint LineVertex = (VertexId%2);
+	const uint LineIndex = VertexId/2;
+
+	OutFaceNormal 	= float3(0,0,1);
+	OutPosition 	= float4(0,0,0,0);
+	if (LineIndex > MaxRootCount) return;
+
+	float3 N;
+	float3 P;
+	{
+		const FHairMeshTriangleWithUVs RestTriangleWithUVs     = GetTriangleWithUVsTransformation(LineIndex, RestPosition0Buffer, RestPosition1Buffer, RestPosition2Buffer);
+		const FHairMeshTriangleWithUVs DeformedTriangleWithUVs = GetTriangleWithUVsTransformation(LineIndex, DeformedPosition0Buffer, DeformedPosition1Buffer, DeformedPosition2Buffer);
+
+		const FHairMeshTriangle RestTriangle			= GetTriangleTransformation(LineIndex, RestPosition0Buffer, RestPosition1Buffer, RestPosition2Buffer);
+		const FHairMeshTriangle DeformedTriangle		= GetTriangleTransformation(LineIndex, DeformedPosition0Buffer, DeformedPosition1Buffer, DeformedPosition2Buffer);
+
+
+		float3 P0 = RootPositionBuffer[LineIndex].xyz;
+		float3 LN = RootNormalBuffer[LineIndex].xyz;
+		float3 B  = DecodeBarycentrics(RootBarycentricBuffer[LineIndex]);
+		float3 P1 = P0 + LN;
+
+		if (DeformedFrameEnable > 0)
+		{
+			UVs = 
+				B.x * DeformedTriangleWithUVs.UV0 +
+				B.y * DeformedTriangleWithUVs.UV1 +
+				B.z * DeformedTriangleWithUVs.UV2;
+		}
+		else
+		{
+			UVs =
+				B.x * RestTriangleWithUVs.UV0 +
+				B.y * RestTriangleWithUVs.UV1 +
+				B.z * RestTriangleWithUVs.UV2;
+		}
+
+		if (DeformedFrameEnable > 0)
+		{
+			P0 = TransformPoint(P0, B, RestTriangle, DeformedTriangle);
+			P1 = TransformPoint(P1, B, RestTriangle, DeformedTriangle);
+		}
+
+		P0 = mul(float4(P0, 1), RootLocalToWorld).xyz;
+		P1 = mul(float4(P1, 1), RootLocalToWorld).xyz;
+
+		N = normalize(P0 - P1);
+		P = LineVertex == 0 ? P0 : P1;
+	}
+#endif
+
+#if PERMUTATION_INPUT_TYPE == INPUT_ROOT_TRIANGLE
+	const uint TriangleVertex = (VertexId % 3);
+	const uint TriangleIndex = VertexId / 3;
+
+	if (TriangleIndex > MaxRootCount) return;
+
+	const FHairMeshTriangleWithUVs RestTriangle		= GetTriangleWithUVsTransformation(TriangleIndex, RestPosition0Buffer, RestPosition1Buffer, RestPosition2Buffer);
+	const FHairMeshTriangleWithUVs DeformedTriangle = GetTriangleWithUVsTransformation(TriangleIndex, DeformedPosition0Buffer, DeformedPosition1Buffer, DeformedPosition2Buffer);
+
+	FHairMeshTriangleWithUVs Tri;
+	if (DeformedFrameEnable > 0)
+		Tri = DeformedTriangle;
+	else
+		Tri = RestTriangle;
+
+	float3 N = Tri.N;
+	float3 P = 0;
+	if (TriangleVertex == 0)
+	{
+		P = Tri.P0;
+		UVs = Tri.UV0;
+	}
+	if (TriangleVertex == 1)
+	{
+		P = Tri.P1;
+		UVs = Tri.UV1;
+	}
+	if (TriangleVertex == 2)
+	{
+		P = Tri.P2;
+		UVs = Tri.UV2;
+	}
+
+	// Debug: To test if the rest-triangle-to-deformed-triangle transformation works correctly
+	#if 0
+	if (DeformedFrameEnable > 0)
+	{
+		float3 Barycentric = 0;
+		if (TriangleVertex == 0)
+		{
+			P = RestTriangle.P0;
+			Barycentric = float3(1, 0, 0);
+		}
+		if (TriangleVertex == 1)
+		{
+			P = RestTriangle.P1;
+			Barycentric = float3(0, 1, 0);
+		}
+		if (TriangleVertex == 2)
+		{
+			P = RestTriangle.P2;
+			Barycentric = float3(0, 0, 1);
+		}
+		P = TransformPoint(P, Barycentric, RestTriangle, DeformedTriangle);
+	}
+	#endif
+
+	P = mul(float4(P, 1), RootLocalToWorld).xyz;
+#endif
+
+	OutVertexUVs = UVs;
+	OutFaceNormal = N;
+	OutPosition = mul(float4(P,1), View.WorldToClip);
+}
+
+void MainPS(
+	in float2 VertexUVs : VERTEXUVs,
+	in float3 FaceNormal : FACE_NORMAL,
+	out float4 OutColor : SV_Target0)
+{
+	FaceNormal += float3(1,1,1);
+	FaceNormal *= 0.5f;
+	OutColor = float4(FaceNormal,1);
+	OutColor = float4(VertexUVs,0, 1);
+}

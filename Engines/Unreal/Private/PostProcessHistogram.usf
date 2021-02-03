@@ -1,0 +1,126 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessHistogram.usf: PostProcessing histogram
+=============================================================================*/
+
+#include "Common.ush"
+#include "ScreenPass.ush"
+#include "PostProcessHistogramCommon.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+
+Texture2D InputTexture;
+
+// Output histogram texture (UAV)
+RWTexture2D<float4> HistogramRWTexture;
+
+// Number of thread groups in the dispatch
+uint2 ThreadGroupCount;
+
+// THREADGROUP_SIZEX*THREADGROUP_SIZEY histograms of the size HISTOGRAM_SIZE
+groupshared float SharedHistogram[HISTOGRAM_SIZE][THREADGROUP_SIZEX][THREADGROUP_SIZEY];
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void MainCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+	uint GroupIndex: SV_GroupIndex)
+{
+	// todo: can be cleared more efficiently
+	// clear all THREADGROUP_SIZEX*THREADGROUP_SIZEY histograms
+	UNROLL for (uint i = 0; i < HISTOGRAM_SIZE; ++i)
+	{
+		SharedHistogram[i][GroupThreadId.x][GroupThreadId.y] = 0.0f;
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+
+	// Each thread group processes LoopX * LoopY texels of the input.
+	uint2 TileSize = uint2(LOOP_SIZEX, LOOP_SIZEY);
+
+	// Top left input texel for this group.
+	uint2 LeftTop = Input_ViewportMin + DispatchThreadId.xy * TileSize;
+
+	float2 InvViewSize = Input_ViewportSizeInverse.xy;
+
+	// Accumulate all pixels into THREADGROUP_SIZEX*THREADGROUP_SIZEY histograms
+	LOOP for (uint y = 0; y < LOOP_SIZEY; ++y)
+	{
+		LOOP for (uint x = 0; x < LOOP_SIZEX; ++x)
+		{
+			uint2 Tile = uint2(x, y);
+			uint2 TexelPos = LeftTop + Tile;
+
+			if(TexelPos.x < Input_ViewportMax.x && TexelPos.y < Input_ViewportMax.y)
+			{
+				float4 SceneColor = InputTexture.Load(int3(TexelPos, 0));
+#if USE_PREEXPOSURE
+				SceneColor.xyz *= View.OneOverPreExposure;
+#endif
+				float LuminanceVal = max(dot(SceneColor.xyz, float3(1.0f, 1.0f, 1.0f)/3.0f), EyeAdaptation_LuminanceMin);
+
+				float LogLuminance = ComputeHistogramPositionFromLuminance(LuminanceVal);
+				float2 ScreenUV = (TexelPos.xy - Input_ViewportMin) * InvViewSize;
+				float ScreenWeight = AdaptationWeightTexture(ScreenUV);
+
+				// Map the normalized histogram position into texels.
+				float fBucket = saturate(LogLuminance) * (HISTOGRAM_SIZE-1);// * 0.9999f;
+
+				// Find two discrete buckets that straddle the continuous histogram position.
+				uint Bucket0 = (uint)(fBucket);
+				uint Bucket1 = Bucket0 + 1;
+
+				Bucket0 = min(Bucket0, uint(HISTOGRAM_SIZE - 1));
+				Bucket1 = min(Bucket1, uint(HISTOGRAM_SIZE - 1));
+
+				// Weighted blend between the two buckets.
+				float Weight1 = frac(fBucket);
+				float Weight0 = 1.0f - Weight1;
+
+				// When EyeAdaptation_BlackHistogramBucketInfluence=.0, we will ignore the last bucket. The main use
+				// case is so the black background pixels in the editor have no effect. But if we have cases where
+				// pixel values can actually be black, we want to set EyeAdaptation_LastHistogramBucketInfluence=1.0.
+				// This value is controlled by the cvar "r.EyeAdaptation.BlackHistogramBucketInfluence"
+				if (Bucket0 == 0)
+				{
+					Weight0 *= EyeAdaptation_BlackHistogramBucketInfluence;
+				}
+
+				// Accumulate the weight to the nearby history buckets.
+				SharedHistogram[Bucket0][GroupThreadId.x][GroupThreadId.y] += Weight0 * ScreenWeight;
+				SharedHistogram[Bucket1][GroupThreadId.x][GroupThreadId.y] += Weight1 * ScreenWeight;
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// Accumulate all histograms into one.
+	if (GroupIndex < HISTOGRAM_SIZE / 4) 
+	{
+		float4 Sum = 0;
+
+		LOOP for (uint y = 0; y < THREADGROUP_SIZEY; ++y)
+		{
+			LOOP for (uint x = 0; x < THREADGROUP_SIZEX; ++x)
+			{
+				Sum += float4(
+					SharedHistogram[GroupIndex * 4 + 0][x][y],
+					SharedHistogram[GroupIndex * 4 + 1][x][y],
+					SharedHistogram[GroupIndex * 4 + 2][x][y],
+					SharedHistogram[GroupIndex * 4 + 3][x][y]);
+			}
+		}
+
+		float2 MaxExtent = Input_ViewportSize;
+		float Area = MaxExtent.x * MaxExtent.y;
+	
+		// Fixed to include borders.
+		float NormalizeFactor = 1.0f / Area;
+
+		// Output texture with one histogram per line, x and y unwrapped into all the lines
+		HistogramRWTexture[uint2(GroupIndex, GroupId.x + GroupId.y * ThreadGroupCount.x)] = Sum * NormalizeFactor;
+	}
+}

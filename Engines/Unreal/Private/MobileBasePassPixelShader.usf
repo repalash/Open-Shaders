@@ -1,0 +1,961 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MobileBasePassPixelShader.usf: Base pass pixel shader used with forward shading
+=============================================================================*/
+
+#include "Common.ush"
+
+// Reroute MobileSceneTextures uniform buffer references to the base pass uniform buffer
+#define MobileSceneTextures MobileBasePass.SceneTextures
+#define EyeAdaptationStruct MobileBasePass
+
+#ifndef MOBILE_QL_FORCE_DISABLE_PREINTEGRATEDGF
+#define MOBILE_QL_FORCE_DISABLE_PREINTEGRATEDGF 0
+#endif
+
+#define FORWARDSHADING_USE_HQ_ENV_BRDF (MATERIAL_USE_PREINTEGRATED_GF && !MOBILE_QL_FORCE_DISABLE_PREINTEGRATEDGF)
+
+//use preintegrated GF lut for simple IBL
+#if FORWARDSHADING_USE_HQ_ENV_BRDF
+#define PreIntegratedGF			MobileBasePass.PreIntegratedGFTexture
+#define PreIntegratedGFSampler	MobileBasePass.PreIntegratedGFSampler
+#endif
+
+#if (MATERIALBLENDING_MASKED || MATERIALBLENDING_SOLID) && ENABLE_AMBIENT_OCCLUSION
+#define AmbientOcclusionTexture			MobileBasePass.AmbientOcclusionTexture
+#define AmbientOcclusionSampler			MobileBasePass.AmbientOcclusionSampler
+#define AmbientOcclusionStaticFraction	MobileBasePass.AmbientOcclusionStaticFraction
+#endif
+
+#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	#define SIMPLE_SINGLE_LAYER_WATER 1
+#endif
+
+#if MAX_DYNAMIC_POINT_LIGHTS > 0
+#if VARIABLE_NUM_DYNAMIC_POINT_LIGHTS
+int NumDynamicPointLights;
+#else
+#define NumDynamicPointLights NUM_DYNAMIC_POINT_LIGHTS
+#endif
+
+#define DynamicSpotLightShadowTexture		MobileDirectionalLight.DirectionalLightShadowTexture
+#define DynamicSpotLightShadowSampler		MobileDirectionalLight.DirectionalLightShadowSampler
+#define DynamicSpotLightShadowBufferSize	MobileDirectionalLight.DirectionalLightShadowSize
+
+#define LightShadowType_PointLight	1
+#define LightShadowType_SpotLight	2
+#define LightShadowType_Shadow		4
+#define ValidLightType LightShadowType_PointLight | LightShadowType_SpotLight
+
+#endif
+
+#ifndef PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS
+#define PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS 0
+#endif
+
+#ifndef PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS_SHADOW
+#define PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS_SHADOW 0
+#endif
+
+#ifndef MOBILE_QL_FORCE_FULLY_ROUGH
+#define MOBILE_QL_FORCE_FULLY_ROUGH 0
+#endif
+#ifndef MOBILE_QL_FORCE_NONMETAL
+#define MOBILE_QL_FORCE_NONMETAL 0
+#endif
+#ifndef MOBILE_QL_FORCE_LQ_REFLECTIONS
+#define MOBILE_QL_FORCE_LQ_REFLECTIONS 0
+#endif
+#ifndef MOBILE_QL_DISABLE_MATERIAL_NORMAL
+#define MOBILE_QL_DISABLE_MATERIAL_NORMAL 0
+#endif
+
+#define FULLY_ROUGH (MATERIAL_FULLY_ROUGH || MOBILE_QL_FORCE_FULLY_ROUGH)
+#define NONMETAL (MATERIAL_NONMETAL || MOBILE_QL_FORCE_NONMETAL)
+#define HQ_REFLECTIONS (MATERIAL_HQ_FORWARD_REFLECTIONS && !MOBILE_QL_FORCE_LQ_REFLECTIONS)
+#define FORCE_VERTEX_NORMAL (MOBILE_QL_DISABLE_MATERIAL_NORMAL)
+#define SUPPORT_SPOTLIGHTS_SHADOW (MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS_SHADOW
+#define DEFERRED_SHADING_PATH (MOBILE_DEFERRED_SHADING && ((MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER))
+
+#define ALLOW_CUBE_REFLECTIONS HQ_REFLECTIONS
+
+#include "SHCommon.ush"
+#include "MobileBasePassCommon.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+#include "ReflectionEnvironmentShared.ush"
+#include "LightmapCommon.ush"  
+#include "MobileShadingModels.ush"
+#include "DynamicLightingCommon.ush"
+#include "PlanarReflectionShared.ush"
+
+#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	#include "SingleLayerWaterShading.ush"
+#endif
+
+/** Prenormalized capture of the scene that's closest to the object being rendered. */
+#if !FULLY_ROUGH
+	#if HQ_REFLECTIONS
+	#define MAX_HQ_REFLECTIONS 3
+	TextureCube ReflectionCubemap0;
+	SamplerState ReflectionCubemapSampler0;
+	TextureCube ReflectionCubemap1;
+	SamplerState ReflectionCubemapSampler1;
+	TextureCube ReflectionCubemap2;
+	SamplerState ReflectionCubemapSampler2;
+	// x,y,z - inverted average brightness for 0, 1, 2; w - sky cube texture max mips.
+	float4 ReflectionAverageBrigtness;
+	float4 ReflectanceMaxValueRGBM;
+	float4 ReflectionPositionsAndRadii[MAX_HQ_REFLECTIONS];
+		#if ALLOW_CUBE_REFLECTIONS
+		float4x4 CaptureBoxTransformArray[MAX_HQ_REFLECTIONS];
+		float4 CaptureBoxScalesArray[MAX_HQ_REFLECTIONS];
+		#endif
+	#endif
+#endif
+
+#if !FULLY_ROUGH
+half4 GetPlanarReflection(float3 WorldPosition, half3 WorldNormal, half Roughness)
+{
+	half4 PlanarReflection = ComputePlanarReflections(WorldPosition, WorldNormal, Roughness, PlanarReflectionStruct.PlanarReflectionSampler);
+#if OUTPUT_GAMMA_SPACE
+	// the capture will also be in gamma space, convert to linear:
+	PlanarReflection.rgb *= PlanarReflection.rgb;
+#endif
+
+	return PlanarReflection;
+}
+
+// Half precision version for mobile's high quality reflection
+half MobileComputeMixingWeight(half IndirectIrradiance, half AverageBrightness, half Roughness)
+{
+	// Mirror surfaces should have no mixing, so they match reflections from other sources (SSR, planar reflections)
+	half MixingAlpha = smoothstep(0, 1, saturate(Roughness * View.ReflectionEnvironmentRoughnessMixingScaleBiasAndLargestWeight.x + View.ReflectionEnvironmentRoughnessMixingScaleBiasAndLargestWeight.y));
+
+	// We have high frequency directional data but low frequency spatial data in the envmap.
+	// We have high frequency spatial data but low frequency directional data in the lightmap.
+	// So, we combine the two for the best of both. This is done by removing the low spatial frequencies from the envmap and replacing them with the lightmap data.
+	// This is only done with luma so as to not get odd color shifting.
+	half MixingWeight = IndirectIrradiance / max(AverageBrightness, .0001f);
+
+	MixingWeight = min(MixingWeight, View.ReflectionEnvironmentRoughnessMixingScaleBiasAndLargestWeight.z);
+
+	return lerp(1.0f, MixingWeight, MixingAlpha);
+}
+
+half3 GetLookupVectorForBoxCaptureMobile(half3 ReflectionVector, half3 WorldPosition, half4 BoxCapturePositionAndRadius, half4x4 BoxTransform, half4 BoxScales, half3 LocalCaptureOffset, out half DistanceAlpha)
+{
+	// Transform the ray into the local space of the box, where it is an AABB with mins at -1 and maxs at 1
+	half3 LocalRayStart = mul(half4(WorldPosition, 1), BoxTransform).xyz;
+	half3 LocalRayDirection = mul(half4(ReflectionVector, 0), BoxTransform).xyz;
+
+	half3 InvRayDir = rcp(LocalRayDirection);
+
+	//find the ray intersection with each of the 3 planes defined by the minimum extrema.
+	half3 FirstPlaneIntersections = -InvRayDir - LocalRayStart * InvRayDir;
+	//find the ray intersection with each of the 3 planes defined by the maximum extrema.
+	half3 SecondPlaneIntersections = InvRayDir - LocalRayStart * InvRayDir;
+	//get the furthest of these intersections along the ray
+	half3 FurthestPlaneIntersections = max(FirstPlaneIntersections, SecondPlaneIntersections);
+
+	//clamp the intersections to be between RayOrigin and RayEnd on the ray
+	half Intersection = min(FurthestPlaneIntersections.x, min(FurthestPlaneIntersections.y, FurthestPlaneIntersections.z));
+
+	// Compute the reprojected vector
+	half3 IntersectPosition = WorldPosition + Intersection * ReflectionVector;
+	half3 ProjectedCaptureVector = IntersectPosition - (BoxCapturePositionAndRadius.xyz + LocalCaptureOffset);
+
+	// Compute the distance from the receiving pixel to the box for masking
+	// Apply local to world scale to take scale into account without transforming back to world space
+	// Shrink the box by the transition distance (BoxScales.w) so that the fade happens inside the box influence area	
+	half BoxDistance = ComputeDistanceFromBoxToPoint(-(BoxScales.xyz - .5f * BoxScales.w), BoxScales.xyz - .5f * BoxScales.w, LocalRayStart * BoxScales.xyz);
+
+	// Setup a fade based on receiver distance to the box, hides the box influence shape
+	DistanceAlpha = 1.0 - smoothstep(0, .7f * BoxScales.w, BoxDistance);
+
+	return ProjectedCaptureVector;
+}
+
+half3 GetLookupVectorForSphereCaptureMobile(half3 ReflectionVector, half3 WorldPosition, half4 SphereCapturePositionAndRadius, half NormalizedDistanceToCapture, half3 LocalCaptureOffset, inout half DistanceAlpha)
+{
+	half3 ProjectedCaptureVector = ReflectionVector;
+	half ProjectionSphereRadius = SphereCapturePositionAndRadius.w;
+	half SphereRadiusSquared = ProjectionSphereRadius * ProjectionSphereRadius;
+
+	half3 LocalPosition = WorldPosition - SphereCapturePositionAndRadius.xyz;
+	half LocalPositionSqr = dot(LocalPosition, LocalPosition);
+
+	// Find the intersection between the ray along the reflection vector and the capture's sphere
+	half3 QuadraticCoef;
+	QuadraticCoef.x = 1;
+	QuadraticCoef.y = dot(ReflectionVector, LocalPosition);
+	QuadraticCoef.z = LocalPositionSqr - SphereRadiusSquared;
+
+	half Determinant = QuadraticCoef.y * QuadraticCoef.y - QuadraticCoef.z;
+
+	// Only continue if the ray intersects the sphere
+	FLATTEN
+		if (Determinant >= 0)
+		{
+			half FarIntersection = sqrt(Determinant) - QuadraticCoef.y;
+
+			half3 LocalIntersectionPosition = LocalPosition + FarIntersection * ReflectionVector;
+			ProjectedCaptureVector = LocalIntersectionPosition - LocalCaptureOffset;
+			// Note: some compilers don't handle smoothstep min > max (this was 1, .6)
+			//DistanceAlpha = 1.0 - smoothstep(.6, 1, NormalizedDistanceToCapture);
+
+			half x = saturate(2.5 * NormalizedDistanceToCapture - 1.5);
+			DistanceAlpha = 1 - x * x*(3 - 2 * x);
+		}
+	return ProjectedCaptureVector;
+}
+
+void GatherSpecularIBL(FMaterialPixelParameters MaterialParameters
+	, TextureCube ReflectionCube
+	, SamplerState ReflectionSampler
+	, half Roughness
+	, half IndirectIrradiance
+	, half MaxValue
+	, inout half4 ImageBasedReflections
+#if HQ_REFLECTIONS
+	, int ReflectionIndex
+	, inout half3 ExtraIndirectSpecular
+	, inout half2 CompositedAverageBrightness
+#endif
+)
+{
+	half3 ProjectedCaptureVector = MaterialParameters.ReflectionVector;
+
+#if HQ_REFLECTIONS
+	half DistanceAlpha = 0.0;
+
+	half3 CaptureVector = MaterialParameters.AbsoluteWorldPosition - ReflectionPositionsAndRadii[ReflectionIndex].xyz;
+	half CaptureVectorLength = sqrt(dot(CaptureVector, CaptureVector));
+	half NormalizedDistanceToCapture = saturate(CaptureVectorLength / ReflectionPositionsAndRadii[ReflectionIndex].w);
+
+	if (CaptureVectorLength < ReflectionPositionsAndRadii[ReflectionIndex].w || ReflectionPositionsAndRadii[ReflectionIndex].w <= 0)
+	{
+#if ALLOW_CUBE_REFLECTIONS
+		if (CaptureBoxScalesArray[ReflectionIndex].w > 0)
+		{
+			ProjectedCaptureVector = GetLookupVectorForBoxCaptureMobile(MaterialParameters.ReflectionVector, MaterialParameters.AbsoluteWorldPosition, ReflectionPositionsAndRadii[ReflectionIndex], CaptureBoxTransformArray[ReflectionIndex], CaptureBoxScalesArray[ReflectionIndex], half3(0.0f, 0.0f, 0.0f), DistanceAlpha);
+		}
+		else
+#endif
+		{
+			ProjectedCaptureVector = GetLookupVectorForSphereCaptureMobile(MaterialParameters.ReflectionVector, MaterialParameters.AbsoluteWorldPosition, ReflectionPositionsAndRadii[ReflectionIndex], NormalizedDistanceToCapture, half3(0.0f, 0.0f, 0.0f), DistanceAlpha);
+		}
+	}
+	half UsingSkyReflection = ReflectionPositionsAndRadii[ReflectionIndex].w <= 0.0f;
+
+#else
+	half UsingSkyReflection = MobileReflectionCapture.Params.y > 0.0f;
+#endif
+
+	// Fetch from cubemap and convert to linear HDR
+	half3 SpecularIBL = 0.0f;
+
+
+	if (UsingSkyReflection)
+	{
+		// Apply sky colour if the reflection map is the sky.
+#if HQ_REFLECTIONS
+		half AbsoluteSpecularMip = ComputeReflectionCaptureMipFromRoughness(Roughness, ReflectionAverageBrigtness.w);
+		half4 SpecularIBLSample = ReflectionCube.SampleLevel(ReflectionSampler, ProjectedCaptureVector, AbsoluteSpecularMip);
+		ExtraIndirectSpecular = SpecularIBLSample.rgb * ResolvedView.SkyLightColor.rgb;
+#else
+		half AbsoluteSpecularMip = ComputeReflectionCaptureMipFromRoughness(Roughness, MobileReflectionCapture.Params.y);
+		half4 SpecularIBLSample = ReflectionCube.SampleLevel(ReflectionSampler, ProjectedCaptureVector, AbsoluteSpecularMip);
+		ImageBasedReflections.rgb = SpecularIBLSample.rgb * ResolvedView.SkyLightColor.rgb * ImageBasedReflections.a;
+#endif
+	}
+	else
+	{
+		half AbsoluteSpecularMip = ComputeReflectionCaptureMipFromRoughness(Roughness, ResolvedView.ReflectionCubemapMaxMip);
+		half4 SpecularIBLSample = ReflectionCube.SampleLevel(ReflectionSampler, ProjectedCaptureVector, AbsoluteSpecularMip);
+
+		SpecularIBL = RGBMDecode(SpecularIBLSample, MaxValue);
+		SpecularIBL = SpecularIBL * SpecularIBL;
+#if HQ_REFLECTIONS
+		SpecularIBL *= DistanceAlpha;
+
+		// Under operator (back to front)
+		ImageBasedReflections.rgb += SpecularIBL * ImageBasedReflections.a;
+		ImageBasedReflections.a *= 1 - DistanceAlpha;
+
+		half AverageBrightness = ReflectionAverageBrigtness[ReflectionIndex];
+		CompositedAverageBrightness.x += AverageBrightness * DistanceAlpha * CompositedAverageBrightness.y;
+		CompositedAverageBrightness.y *= 1 - DistanceAlpha;
+#else
+		ImageBasedReflections.rgb = SpecularIBL * ImageBasedReflections.a;
+#if ALLOW_STATIC_LIGHTING
+		//To keep ImageBasedReflectionLighting conherence with PC, use ComputeMixingWeight instead of InvReflectionAverageBrightness to calulate the IBL constribution
+		ImageBasedReflections.rgb *= MobileComputeMixingWeight(IndirectIrradiance, MobileReflectionCapture.Params.x, Roughness);
+#endif
+		ImageBasedReflections.rgb *= View.IndirectLightingColorScale;
+#endif
+	}
+}
+
+#if HQ_REFLECTIONS
+void BlendReflectionCaptures(FMaterialPixelParameters MaterialParameters, half Roughness, half IndirectIrradiance, inout half4 ImageBasedReflections)
+{
+	half2 CompositedAverageBrightness = half2(0.0f, 1.0f);
+	half3 ExtraIndirectSpecular = 0.0f;
+
+	GatherSpecularIBL(MaterialParameters, ReflectionCubemap0, ReflectionCubemapSampler0, Roughness, IndirectIrradiance, ReflectanceMaxValueRGBM.x, ImageBasedReflections, 0, ExtraIndirectSpecular, CompositedAverageBrightness);
+	GatherSpecularIBL(MaterialParameters, ReflectionCubemap1, ReflectionCubemapSampler1, Roughness, IndirectIrradiance, ReflectanceMaxValueRGBM.y, ImageBasedReflections, 1, ExtraIndirectSpecular, CompositedAverageBrightness);
+	GatherSpecularIBL(MaterialParameters, ReflectionCubemap2, ReflectionCubemapSampler2, Roughness, IndirectIrradiance, ReflectanceMaxValueRGBM.z, ImageBasedReflections, 2, ExtraIndirectSpecular, CompositedAverageBrightness);
+
+	ImageBasedReflections.rgb *= View.IndirectLightingColorScale;
+	CompositedAverageBrightness.x *= Luminance(View.IndirectLightingColorScale);
+
+#if ALLOW_STATIC_LIGHTING
+	ImageBasedReflections.rgb *= ComputeMixingWeight(IndirectIrradiance, CompositedAverageBrightness.x, Roughness);
+#endif
+
+	ImageBasedReflections.rgb += ImageBasedReflections.a * ExtraIndirectSpecular;
+}
+#endif // HQ_REFLECTIONS
+
+half3 GetImageBasedReflectionLighting(FMaterialPixelParameters MaterialParameters, half Roughness, half IndirectIrradiance, half CompositeAlpha)
+{
+	half4 ImageBasedReflections = half4(0, 0, 0, CompositeAlpha);
+
+#if HQ_REFLECTIONS
+	BlendReflectionCaptures(MaterialParameters, Roughness, IndirectIrradiance, ImageBasedReflections);
+#else
+	GatherSpecularIBL(MaterialParameters, MobileReflectionCapture.Texture, MobileReflectionCapture.TextureSampler, Roughness, IndirectIrradiance, MobileReflectionCapture.Params.z, ImageBasedReflections);
+#endif
+
+#if WEBGL
+	// need a rgb swizzle instead of the existing rgba swizzle, we should add it if another use case comes up. 
+	return ImageBasedReflections.bgr;
+#else
+	return ImageBasedReflections.rgb;
+#endif
+}
+#endif //!FULLY_ROUGH
+
+half3 FrameBufferBlendOp(half4 Source)
+{
+	half4 Dest = half4 (0,0,0,0);
+
+#if MATERIALBLENDING_SOLID
+	return Source.rgb;
+#elif MATERIALBLENDING_MASKED
+	return Source.rgb;
+// AlphaComposite will set both MATERIALBLENDING_TRANSLUCENT and MATERIALBLENDING_ALPHACOMPOSITE defines
+// so ensure  MATERIALBLENDING_ALPHACOMPOSITE gets first in line
+#elif MATERIALBLENDING_ALPHACOMPOSITE
+	return Source.rgb + (Dest.rgb*(1.0 - Source.a));
+// AlphaHoldout will set both MATERIALBLENDING_TRANSLUCENT and MATERIALBLENDING_ALPHAHOLDOUT defines
+// so ensure  MATERIALBLENDING_ALPHAHOLDOUT gets first in line
+#elif MATERIALBLENDING_ALPHAHOLDOUT
+	return (Dest.rgb*(1.0 - Source.a));
+#elif MATERIALBLENDING_TRANSLUCENT
+	return (Source.rgb*Source.a) + (Dest.rgb*(1.0 - Source.a));
+#elif MATERIALBLENDING_ADDITIVE
+	return Source.rgb + Dest.rgb;
+#elif MATERIALBLENDING_MODULATE
+	return Source.rgb * Dest.rgb;
+#endif
+}
+
+void ApplyPixelDepthOffsetForMobileBasePass(inout FMaterialPixelParameters MaterialParameters, FPixelMaterialInputs PixelMaterialInputs, out float OutDepth)
+{
+    float PixelDepthOffset = ApplyPixelDepthOffsetToMaterialParameters(MaterialParameters, PixelMaterialInputs, OutDepth);
+}
+
+#if MAX_DYNAMIC_POINT_LIGHTS > 0
+void AccumulateLightingOfDynamicPointLight(
+FMaterialPixelParameters MaterialParameters, 
+FMobileShadingModelContext ShadingModelContext,
+FGBufferData GBuffer,
+float4 LightPositionAndInvRadius, 
+float4 LightColorAndFalloffExponent, 
+float4 SpotLightDirectionAndSpecularScale, 
+float4 SpotLightAnglesAndSoftTransitionScaleAndLightShadowType, 
+#if SUPPORT_SPOTLIGHTS_SHADOW
+FPCFSamplerSettings Settings,
+float4 SpotLightShadowSharpenAndShadowFadeFraction,
+float4 SpotLightShadowmapMinMax,
+float4x4 SpotLightShadowWorldToShadowMatrix,
+#endif
+inout half3 Color)
+{
+	uint LightShadowType = SpotLightAnglesAndSoftTransitionScaleAndLightShadowType.w;
+
+	float FadedShadow = 1.0f;
+
+#if SUPPORT_SPOTLIGHTS_SHADOW
+		if ((LightShadowType & LightShadowType_Shadow) == LightShadowType_Shadow)
+		{
+
+			float4 HomogeneousShadowPosition = mul(float4(MaterialParameters.AbsoluteWorldPosition, 1), SpotLightShadowWorldToShadowMatrix);
+			float2 ShadowUVs = HomogeneousShadowPosition.xy / HomogeneousShadowPosition.w;
+			if (all(ShadowUVs >= SpotLightShadowmapMinMax.xy && ShadowUVs <= SpotLightShadowmapMinMax.zw))
+			{
+				// Clamp pixel depth in light space for shadowing opaque, because areas of the shadow depth buffer that weren't rendered to will have been cleared to 1
+				// We want to force the shadow comparison to result in 'unshadowed' in that case, regardless of whether the pixel being shaded is in front or behind that plane
+				float LightSpacePixelDepthForOpaque = min(HomogeneousShadowPosition.z, 0.99999f);
+				Settings.SceneDepth = LightSpacePixelDepthForOpaque;
+				Settings.TransitionScale = SpotLightAnglesAndSoftTransitionScaleAndLightShadowType.z;
+
+				half Shadow = MobileShadowPCF(ShadowUVs, Settings);
+
+				Shadow = saturate((Shadow - 0.5) * SpotLightShadowSharpenAndShadowFadeFraction.x + 0.5);
+
+				FadedShadow = lerp(1.0f, Square(Shadow), SpotLightShadowSharpenAndShadowFadeFraction.y);
+			}
+		}
+#endif
+
+	if ((LightShadowType & ValidLightType) != 0)
+	{
+		float3 ToLight = LightPositionAndInvRadius.xyz - MaterialParameters.AbsoluteWorldPosition;
+		float DistanceSqr = dot(ToLight, ToLight);
+		float3 L = ToLight * rsqrt(DistanceSqr);
+		half3 PointH = normalize(MaterialParameters.CameraVector + L);
+
+		half PointNoL = max(0, dot(MaterialParameters.WorldNormal, L));
+		half PointNoH = max(0, dot(MaterialParameters.WorldNormal, PointH));
+
+		float Attenuation;
+
+		if (LightColorAndFalloffExponent.w == 0)
+		{
+			// Sphere falloff (technically just 1/d2 but this avoids inf)
+			Attenuation = 1 / (DistanceSqr + 1);
+
+			float LightRadiusMask = Square(saturate(1 - Square(DistanceSqr * (LightPositionAndInvRadius.w * LightPositionAndInvRadius.w))));
+			Attenuation *= LightRadiusMask;
+		}
+		else
+		{
+			Attenuation = RadialAttenuation(ToLight * LightPositionAndInvRadius.w, LightColorAndFalloffExponent.w);
+		}
+
+#if PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHTS
+		if ((LightShadowType & LightShadowType_SpotLight) == LightShadowType_SpotLight)
+		{
+			Attenuation *= SpotAttenuation(L, -SpotLightDirectionAndSpecularScale.xyz, SpotLightAnglesAndSoftTransitionScaleAndLightShadowType.xy) * FadedShadow;
+		}
+#endif
+
+#if !FULLY_ROUGH
+		FMobileDirectLighting Lighting = MobileIntegrateBxDF(ShadingModelContext, GBuffer, PointNoL, MaterialParameters.CameraVector, PointH, PointNoH);
+		Color += min(65000.0, (Attenuation) * LightColorAndFalloffExponent.rgb * (1.0 / PI) * (Lighting.Diffuse + Lighting.Specular * SpotLightDirectionAndSpecularScale.w));
+#else
+		Color += (Attenuation * PointNoL) * LightColorAndFalloffExponent.rgb * (1.0 / PI) * ShadingModelContext.DiffuseColor;
+#endif
+	}
+}
+#endif
+
+// Force early depth_stencil for non-masked material that use VT feedback
+#if (NUM_VIRTUALTEXTURE_SAMPLES || LIGHTMAP_VT_ENABLED) && !(MATERIALBLENDING_MASKED || USE_DITHERED_LOD_TRANSITION || OUTPUT_PIXEL_DEPTH_OFFSET)
+	#define PIXELSHADER_EARLYDEPTHSTENCIL EARLYDEPTHSTENCIL	
+#else
+	#define PIXELSHADER_EARLYDEPTHSTENCIL 	
+#endif
+
+half ComputeIndirect(FVertexFactoryInterpolantsVSToPS Interpolants, float3 DiffuseDir, FMobileShadingModelContext ShadingModelContext, out half IndirectIrradiance, out half3 Color)
+{
+	//To keep IndirectLightingCache conherence with PC, initialize the IndirectIrradiance to zero.
+	IndirectIrradiance = 0;
+	Color = 0;
+
+	// Indirect Diffuse
+#if LQ_TEXTURE_LIGHTMAP
+	float2 LightmapUV0, LightmapUV1;
+	uint LightmapDataIndex;
+	GetLightMapCoordinates(Interpolants, LightmapUV0, LightmapUV1, LightmapDataIndex);
+
+	half4 LightmapColor = GetLightMapColorLQ(LightmapUV0, LightmapUV1, LightmapDataIndex, DiffuseDir);
+	Color += LightmapColor.rgb * ShadingModelContext.DiffuseColor * View.IndirectLightingColorScale;
+	IndirectIrradiance = LightmapColor.a;
+#elif CACHED_POINT_INDIRECT_LIGHTING
+	#if MATERIALBLENDING_MASKED || MATERIALBLENDING_SOLID
+		// Take the normal into account for opaque
+		FThreeBandSHVectorRGB PointIndirectLighting;
+		PointIndirectLighting.R.V0 = IndirectLightingCache.IndirectLightingSHCoefficients0[0];
+		PointIndirectLighting.R.V1 = IndirectLightingCache.IndirectLightingSHCoefficients1[0];
+		PointIndirectLighting.R.V2 = IndirectLightingCache.IndirectLightingSHCoefficients2[0];
+
+		PointIndirectLighting.G.V0 = IndirectLightingCache.IndirectLightingSHCoefficients0[1];
+		PointIndirectLighting.G.V1 = IndirectLightingCache.IndirectLightingSHCoefficients1[1];
+		PointIndirectLighting.G.V2 = IndirectLightingCache.IndirectLightingSHCoefficients2[1];
+
+		PointIndirectLighting.B.V0 = IndirectLightingCache.IndirectLightingSHCoefficients0[2];
+		PointIndirectLighting.B.V1 = IndirectLightingCache.IndirectLightingSHCoefficients1[2];
+		PointIndirectLighting.B.V2 = IndirectLightingCache.IndirectLightingSHCoefficients2[2];
+
+		FThreeBandSHVector DiffuseTransferSH = CalcDiffuseTransferSH3(DiffuseDir, 1);
+
+		// Compute diffuse lighting which takes the normal into account
+		half3 DiffuseGI = max(half3(0, 0, 0), DotSH3(PointIndirectLighting, DiffuseTransferSH));
+
+		IndirectIrradiance = Luminance(DiffuseGI);
+		Color += ShadingModelContext.DiffuseColor * DiffuseGI * View.IndirectLightingColorScale;
+	#else 
+		// Non-directional for translucency
+		// Ambient terms packed in xyz
+		// Already divided by PI and SH ambient on CPU
+		half3 PointIndirectLighting = IndirectLightingCache.IndirectLightingSHSingleCoefficient.rgb;
+		half3 DiffuseGI = PointIndirectLighting;
+
+		IndirectIrradiance = Luminance(DiffuseGI);
+		Color += ShadingModelContext.DiffuseColor * DiffuseGI * View.IndirectLightingColorScale;
+	#endif
+#endif
+
+	return IndirectIrradiance;
+}
+
+PIXELSHADER_EARLYDEPTHSTENCIL
+void Main( 
+	FVertexFactoryInterpolantsVSToPS Interpolants
+	, FMobileBasePassInterpolantsVSToPS BasePassInterpolants
+	, in float4 SvPosition : SV_Position
+	OPTIONAL_IsFrontFace
+	, out half4 OutColor	: SV_Target0
+#if DEFERRED_SHADING_PATH
+	, out half4 OutGBufferA	: SV_Target1
+	, out half4 OutGBufferB	: SV_Target2
+	, out half4 OutGBufferC	: SV_Target3
+	, out float OutSceneDepthAux : SV_Target4
+	// MALI supports only up to 4 input attachements (GBufferA,GBufferB,GBufferC + SceneDepth)
+	// will have to change GBuffer format to fit GBufferD into this limit
+	//, out half4 OutGBufferD	: SV_Target5
+#endif
+#if OUTPUT_PIXEL_DEPTH_OFFSET
+    , out float OutDepth : SV_Depth
+#endif
+	)
+{
+#if MOBILE_MULTI_VIEW
+	ResolvedView = ResolveView(uint(BasePassInterpolants.MultiViewId));
+#else
+	ResolvedView = ResolveView();
+#endif
+
+#if USE_PS_CLIP_PLANE
+	clip(BasePassInterpolants.OutClipDistance);
+#endif
+
+#if PACK_INTERPOLANTS
+	float4 PackedInterpolants[NUM_VF_PACKED_INTERPOLANTS];
+	VertexFactoryUnpackInterpolants(Interpolants, PackedInterpolants);
+#endif
+
+#if COMPILER_GLSL_ES3_1 && !OUTPUT_MOBILE_HDR && !MOBILE_EMULATION
+	// LDR Mobile needs screen vertical flipped
+	SvPosition.y = ResolvedView.BufferSizeAndInvSize.y - SvPosition.y - 1;
+#endif
+
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs;
+	{
+		float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 WorldPosition = BasePassInterpolants.PixelPosition.xyz;
+		float3 WorldPositionExcludingWPO = BasePassInterpolants.PixelPosition.xyz;
+		#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+			WorldPositionExcludingWPO = BasePassInterpolants.PixelPositionExcludingWPO;
+		#endif
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, ScreenPosition, bIsFrontFace, WorldPosition, WorldPositionExcludingWPO);
+
+#if FORCE_VERTEX_NORMAL
+		// Quality level override of material's normal calculation, can be used to avoid normal map reads etc.
+		MaterialParameters.WorldNormal = MaterialParameters.TangentToWorld[2];
+		MaterialParameters.ReflectionVector = ReflectionAboutCustomWorldNormal(MaterialParameters, MaterialParameters.WorldNormal, false);
+#endif
+	}
+
+#if OUTPUT_PIXEL_DEPTH_OFFSET
+	ApplyPixelDepthOffsetForMobileBasePass(MaterialParameters, PixelMaterialInputs, OutDepth);
+#endif
+	  
+#if !EARLY_Z_PASS_ONLY_MATERIAL_MASKING
+	//Clip if the blend mode requires it.
+	GetMaterialCoverageAndClipping(MaterialParameters, PixelMaterialInputs);
+#endif
+
+	// Store the results in local variables and reuse instead of calling the functions multiple times.
+	FGBufferData GBuffer = (FGBufferData)0;
+	GBuffer.WorldNormal = MaterialParameters.WorldNormal;
+	GBuffer.BaseColor = GetMaterialBaseColor(PixelMaterialInputs);
+	GBuffer.Metallic = GetMaterialMetallic(PixelMaterialInputs);
+	GBuffer.Specular = GetMaterialSpecular(PixelMaterialInputs);
+	GBuffer.Roughness = GetMaterialRoughness(PixelMaterialInputs);
+	GBuffer.ShadingModelID = GetMaterialShadingModel(PixelMaterialInputs);
+	half MaterialAO = GetMaterialAmbientOcclusion(PixelMaterialInputs);
+
+#if (MATERIALBLENDING_MASKED || MATERIALBLENDING_SOLID) && ENABLE_AMBIENT_OCCLUSION && !MATERIAL_SHADINGMODEL_UNLIT
+
+	half4 GatheredAmbientOcclusion = Texture2DSample(AmbientOcclusionTexture, AmbientOcclusionSampler, SvPositionToBufferUV(SvPosition));
+	half DynamicAmbientOcclusion = lerp(1.0f, GatheredAmbientOcclusion.r, AmbientOcclusionStaticFraction);
+
+	MaterialAO *= DynamicAmbientOcclusion;
+#endif
+
+	GBuffer.GBufferAO = MaterialAO;
+	// The smallest normalized value that can be represented in IEEE 754 (FP16) is 2^-24 = 5.96e-8.
+	// The code will make the following computation involving roughness: 1.0 / Roughness^4.
+	// Therefore to prevent division by zero on devices that do not support denormals, Roughness^4
+	// must be >= 5.96e-8. We will clamp to 0.015625 because 0.015625^4 = 5.96e-8.
+	//
+	// Note that we also clamp to 1.0 to match the deferred renderer on PC where the roughness is 
+	// stored in an 8-bit value and thus automatically clamped at 1.0.
+	GBuffer.Roughness = max(0.015625, GetMaterialRoughness(PixelMaterialInputs));
+	
+	FMobileShadingModelContext ShadingModelContext = (FMobileShadingModelContext)0;
+	ShadingModelContext.Opacity = GetMaterialOpacity(PixelMaterialInputs);
+
+#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
+	float TopMaterialCoverage = ShadingModelContext.Opacity;
+
+	// Adjust Opacity
+	{
+		float3 TransmittanceColor = GetThinTranslucentMaterialOutput0(MaterialParameters);
+		float Transmittance = dot(TransmittanceColor, float3(1.0f,1.0f,1.0f)/3.0f);
+
+		// We can't use the NoV from the shading models because it uses saturate(), whereas we are using abs().
+		// The length through the surface is the same for both front and back faces.
+		float NoV = abs(dot(MaterialParameters.WorldNormal, MaterialParameters.CameraVector));
+		float PathLength = rcp(max(NoV, 1e-5f));
+		float NegativeAbsorptionCoefficient = log(Transmittance);
+		
+		// Material Modulation is how much of the background light goes through the surface
+		float MaterialModulation = exp(NegativeAbsorptionCoefficient * PathLength);
+
+		// The alpha of the material in translucent mode is one minus the amount that it is modulating the background by.
+		float MaterialOpacity = 1.0f - MaterialModulation;
+		
+		ShadingModelContext.Opacity = 1.0f - (1.0f - TopMaterialCoverage) * (1.0f - MaterialOpacity);
+	}
+
+	GBuffer.BaseColor *= TopMaterialCoverage;
+#endif
+
+	half3 Color = 0;
+
+	half CustomData0 = GetMaterialCustomData0(MaterialParameters);
+	half CustomData1 = GetMaterialCustomData1(MaterialParameters);
+	InitShadingModelContext(ShadingModelContext, GBuffer, MaterialParameters.SvPosition, MaterialParameters.CameraVector, CustomData0, CustomData1);
+	float3 DiffuseDir = MaterialParameters.WorldNormal;
+
+#if MATERIAL_SHADINGMODEL_HAIR
+	FHairTransmittanceData TransmittanceData = InitHairTransmittanceData(true);
+	float3 N = MaterialParameters.WorldNormal;
+	float3 V = MaterialParameters.CameraVector;
+	float3 L = normalize(V - N * dot(V, N));
+	DiffuseDir = L;
+	ShadingModelContext.DiffuseColor = 2 * PI * HairShading(GBuffer, L, V, N, 1, TransmittanceData, 0, 0.2, uint2(0, 0));
+#endif
+	half IndirectIrradiance;
+	half3 IndirectColor;
+	ComputeIndirect(Interpolants, DiffuseDir, ShadingModelContext, IndirectIrradiance, IndirectColor);
+	Color += IndirectColor;
+
+#if DEFERRED_SHADING_PATH
+	float4 OutGBufferD;
+	float4 OutGBufferE;
+	float4 OutGBufferF;
+	float4 OutGBufferVelocity = 0;
+
+	GBuffer.IndirectIrradiance = IndirectIrradiance;
+	GBuffer.PrecomputedShadowFactors.r = GetPrimaryPrecomputedShadowMask(Interpolants).r;
+
+	EncodeGBuffer(GBuffer, OutGBufferA, OutGBufferB, OutGBufferC, OutGBufferD, OutGBufferE, OutGBufferF, OutGBufferVelocity);
+	OutSceneDepthAux = SvPosition.z;
+#else
+
+#if !MATERIAL_SHADINGMODEL_UNLIT
+
+#if ENABLE_SKY_LIGHT
+		half3 SkyDiffuseLighting = GetSkySHDiffuseSimple(MaterialParameters.WorldNormal);
+		half3 DiffuseLookup = SkyDiffuseLighting * ResolvedView.SkyLightColor.rgb;
+		IndirectIrradiance += Luminance(DiffuseLookup);
+#endif
+			
+	Color *= MaterialAO;
+	IndirectIrradiance *= MaterialAO;
+
+	// Shadow
+	half Shadow = GetPrimaryPrecomputedShadowMask(Interpolants).r;
+#if DIRECTIONAL_LIGHT_CSM && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	// Cascaded Shadow Map
+	if(MobileBasePass.UseCSM)
+	{
+		half ShadowMap = MobileDirectionalLightCSM(MaterialParameters.ScreenPosition.xy, MaterialParameters.ScreenPosition.w);
+	#if MOVABLE_DIRECTIONAL_LIGHT
+		Shadow = ShadowMap;
+	#else
+		Shadow = min(ShadowMap, Shadow);
+	#endif
+	}
+#endif /* DIRECTIONAL_LIGHT_CSM */
+
+	half NoL = max(0, dot(MaterialParameters.WorldNormal, MobileDirectionalLight.DirectionalLightDirectionAndShadowTransition.xyz));
+	half3 H = normalize(MaterialParameters.CameraVector + MobileDirectionalLight.DirectionalLightDirectionAndShadowTransition.xyz);
+	half NoH = max(0, dot(MaterialParameters.WorldNormal, H));
+
+	// Direct Lighting (Directional light) + IBL
+#if FULLY_ROUGH
+	Color += (Shadow * NoL) * MobileDirectionalLight.DirectionalLightColor.rgb * ShadingModelContext.DiffuseColor;
+#else
+	FMobileDirectLighting Lighting = MobileIntegrateBxDF(ShadingModelContext, GBuffer, NoL, MaterialParameters.CameraVector, H, NoH);
+	// MobileDirectionalLight.DirectionalLightDistanceFadeMADAndSpecularScale.z saves SpecularScale for direction light.
+	Color += (Shadow) * MobileDirectionalLight.DirectionalLightColor.rgb * (Lighting.Diffuse + Lighting.Specular * MobileDirectionalLight.DirectionalLightDistanceFadeMADAndSpecularScale.z);
+
+#if	!(MATERIAL_SINGLE_SHADINGMODEL && MATERIAL_SHADINGMODEL_HAIR)
+	// Environment map has been prenormalized, scale by lightmap luminance
+	half3 SpecularIBL = GetImageBasedReflectionLighting(MaterialParameters, GBuffer.Roughness, IndirectIrradiance, 1.0f);
+	#if MATERIAL_PLANAR_FORWARD_REFLECTIONS
+		BRANCH
+		if (abs(dot(PlanarReflectionStruct.ReflectionPlane.xyz, 1)) > .0001f)
+		{
+			half4 PlanarReflection = GetPlanarReflection(MaterialParameters.AbsoluteWorldPosition, MaterialParameters.WorldNormal, GBuffer.Roughness);
+			// Planar reflections win over reflection environment
+			SpecularIBL = lerp(SpecularIBL, PlanarReflection.rgb, PlanarReflection.a);
+		}
+	#endif
+	#if MATERIAL_SHADINGMODEL_CLEAR_COAT
+		half F = GetEnvBRDF(0.04, ShadingModelContext.ClearCoatRoughness, ShadingModelContext.NoV).x;
+		F *= ShadingModelContext.ClearCoat;
+		half LayerAttenuation = (1 - F);
+
+		// Fc * Vis
+		#if FORWARDSHADING_USE_HQ_ENV_BRDF
+			half2 AB = PreIntegratedGF.SampleLevel(PreIntegratedGFSampler, float2(ShadingModelContext.NoV, GBuffer.Roughness), 0).rg;
+		#else
+			half3 Fc = (ShadingModelContext.SpecularColor - ShadingModelContext.SpecPreEnvBrdf) * rcp(saturate(50 * ShadingModelContext.SpecPreEnvBrdf.g) - ShadingModelContext.SpecPreEnvBrdf);
+			half2 AB = half2(1 - Fc.x, Fc.x);
+		#endif
+		Color += SpecularIBL * LayerAttenuation * (ShadingModelContext.SpecPreEnvBrdf * AB.x + AB.y * saturate(50 * ShadingModelContext.SpecPreEnvBrdf.g) * (1 - ShadingModelContext.ClearCoat));
+
+		SpecularIBL = GetImageBasedReflectionLighting(MaterialParameters, ShadingModelContext.ClearCoatRoughness, IndirectIrradiance, F);
+		Color += SpecularIBL;
+
+	#else
+		Color += SpecularIBL * ShadingModelContext.SpecularColor;
+	#endif
+#endif
+#endif /* FULLY_ROUGH */
+
+	// Local lights
+#if MAX_DYNAMIC_POINT_LIGHTS > 0 && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+
+	#if SUPPORT_SPOTLIGHTS_SHADOW
+		FPCFSamplerSettings Settings;
+		Settings.ShadowDepthTexture = DynamicSpotLightShadowTexture;
+		Settings.ShadowDepthTextureSampler = DynamicSpotLightShadowSampler;
+		Settings.ShadowBufferSize = DynamicSpotLightShadowBufferSize;
+		Settings.bSubsurface = false;
+		Settings.bTreatMaxDepthUnshadowed = false;
+		Settings.DensityMulConstant = 0;
+		Settings.ProjectionDepthBiasParameters = 0;
+	#endif
+
+		AccumulateLightingOfDynamicPointLight(MaterialParameters, 
+												ShadingModelContext,
+												GBuffer,
+												MobileMovablePointLight0.LightPositionAndInvRadius, 
+												MobileMovablePointLight0.LightColorAndFalloffExponent, 
+												MobileMovablePointLight0.SpotLightDirectionAndSpecularScale, 
+												MobileMovablePointLight0.SpotLightAnglesAndSoftTransitionScaleAndLightShadowType, 
+												#if SUPPORT_SPOTLIGHTS_SHADOW
+												Settings,
+												MobileMovablePointLight0.SpotLightShadowSharpenAndShadowFadeFraction,
+												MobileMovablePointLight0.SpotLightShadowmapMinMax,
+												MobileMovablePointLight0.SpotLightShadowWorldToShadowMatrix,
+												#endif
+												Color);
+
+		if (NumDynamicPointLights > 1)
+		{
+			AccumulateLightingOfDynamicPointLight(MaterialParameters, 
+													ShadingModelContext,
+													GBuffer,
+													MobileMovablePointLight1.LightPositionAndInvRadius, 
+													MobileMovablePointLight1.LightColorAndFalloffExponent, 
+													MobileMovablePointLight1.SpotLightDirectionAndSpecularScale, 
+													MobileMovablePointLight1.SpotLightAnglesAndSoftTransitionScaleAndLightShadowType, 
+													#if SUPPORT_SPOTLIGHTS_SHADOW
+													Settings,
+													MobileMovablePointLight1.SpotLightShadowSharpenAndShadowFadeFraction,
+													MobileMovablePointLight1.SpotLightShadowmapMinMax,
+													MobileMovablePointLight1.SpotLightShadowWorldToShadowMatrix,
+													#endif
+													Color);
+
+			if (NumDynamicPointLights > 2)
+			{
+				AccumulateLightingOfDynamicPointLight(MaterialParameters, 
+														ShadingModelContext,
+														GBuffer,
+														MobileMovablePointLight2.LightPositionAndInvRadius, 
+														MobileMovablePointLight2.LightColorAndFalloffExponent, 
+														MobileMovablePointLight2.SpotLightDirectionAndSpecularScale, 
+														MobileMovablePointLight2.SpotLightAnglesAndSoftTransitionScaleAndLightShadowType, 
+														#if SUPPORT_SPOTLIGHTS_SHADOW
+														Settings,
+														MobileMovablePointLight2.SpotLightShadowSharpenAndShadowFadeFraction,
+														MobileMovablePointLight2.SpotLightShadowmapMinMax,
+														MobileMovablePointLight2.SpotLightShadowWorldToShadowMatrix,
+														#endif
+														Color);
+
+				if (NumDynamicPointLights > 3)
+				{
+					AccumulateLightingOfDynamicPointLight(MaterialParameters, 
+															ShadingModelContext,
+															GBuffer,
+															MobileMovablePointLight3.LightPositionAndInvRadius, 
+															MobileMovablePointLight3.LightColorAndFalloffExponent, 
+															MobileMovablePointLight3.SpotLightDirectionAndSpecularScale, 
+															MobileMovablePointLight3.SpotLightAnglesAndSoftTransitionScaleAndLightShadowType, 
+															#if SUPPORT_SPOTLIGHTS_SHADOW
+															Settings,
+															MobileMovablePointLight3.SpotLightShadowSharpenAndShadowFadeFraction,
+															MobileMovablePointLight3.SpotLightShadowmapMinMax,
+															MobileMovablePointLight3.SpotLightShadowWorldToShadowMatrix,
+															#endif
+															Color);
+				}
+			}
+		}
+
+#endif
+
+	// Skylight
+#if ENABLE_SKY_LIGHT
+	//@mw todo
+	// TODO: Also need to do specular.
+	#if MATERIAL_TWOSIDED && LQ_TEXTURE_LIGHTMAP
+	if (NoL == 0)
+	{
+	#endif
+
+	#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+		ShadingModelContext.WaterDiffuseIndirectLuminance += SkyDiffuseLighting;
+	#endif
+		Color += SkyDiffuseLighting * half3(ResolvedView.SkyLightColor.rgb) * ShadingModelContext.DiffuseColor * MaterialAO;
+	#if MATERIAL_TWOSIDED && LQ_TEXTURE_LIGHTMAP
+	}
+	#endif
+#endif
+
+#endif /* !MATERIAL_SHADINGMODEL_UNLIT */
+
+#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	{
+		const bool CameraIsUnderWater = false;	// Fade out the material contribution over to water contribution according to material opacity.
+		const float3 SunIlluminance = ResolvedView.DirectionalLightColor.rgb * PI;			// times PI because it is divided by PI on CPU (=luminance) and we want illuminance here. 
+		const float3 WaterDiffuseIndirectIlluminance = ShadingModelContext.WaterDiffuseIndirectLuminance * PI;	// DiffuseIndirectLighting is luminance. So we need to multiply by PI to get illuminance.
+		const float3 EnvBrdf = ShadingModelContext.SpecularColor; // SpecularColor is not F0 as in BasePassPixelShader, it is EnvBRDF.
+		const uint EyeIndex = 0;
+
+		const float4 NullDistortionParams = 1.0f;
+		WaterVolumeLightingOutput WaterLighting = EvaluateWaterVolumeLighting(
+			MaterialParameters, PixelMaterialInputs, ResolvedView,
+			Shadow, GBuffer.Specular, NullDistortionParams,
+			SunIlluminance, WaterDiffuseIndirectIlluminance, EnvBrdf,
+			CameraIsUnderWater, ShadingModelContext.WaterVisibility, EyeIndex);
+
+		// Accumulate luminance and occlude the background according to transmittance to view and mean transmittance to lights.
+		Color += WaterLighting.Luminance;
+		ShadingModelContext.Opacity = 1.0 - ((1.0 - ShadingModelContext.Opacity) * dot(WaterLighting.WaterToSceneToLightTransmittance, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)));
+	}
+#endif // MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+
+#endif// DEFERRED_SHADING_PATH
+
+	half4 VertexFog = half4(0, 0, 0, 1);
+
+#if USE_VERTEX_FOG
+#if PACK_INTERPOLANTS
+	VertexFog = PackedInterpolants[0];
+#else
+	VertexFog = BasePassInterpolants.VertexFog;
+#endif
+#endif
+	// NEEDS_BASEPASS_PIXEL_FOGGING is not allowed on mobile for the sake of performance.
+				 
+	half3 Emissive = GetMaterialEmissive(PixelMaterialInputs);
+#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
+	Emissive *= TopMaterialCoverage;
+#endif
+	Color += Emissive;
+
+#if !MATERIAL_SHADINGMODEL_UNLIT && MOBILE_EMULATION
+	Color = lerp(Color, ShadingModelContext.DiffuseColor, ResolvedView.UnlitViewmodeMask);
+#endif
+
+	// On mobile, water (an opaque material) is rendered as trnaslucent with forced premultiplied alpha blending (see MobileBasePass::SetTranslucentRenderState)
+	#if MATERIALBLENDING_ALPHACOMPOSITE || MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+		OutColor = half4(Color * VertexFog.a + VertexFog.rgb * ShadingModelContext.Opacity, ShadingModelContext.Opacity);
+	#elif MATERIALBLENDING_ALPHAHOLDOUT
+		// not implemented for holdout
+		OutColor = half4(Color * VertexFog.a + VertexFog.rgb * ShadingModelContext.Opacity, ShadingModelContext.Opacity);
+	#elif MATERIALBLENDING_TRANSLUCENT
+		OutColor = half4(Color * VertexFog.a + VertexFog.rgb, ShadingModelContext.Opacity);
+	#elif MATERIALBLENDING_ADDITIVE
+		OutColor = half4(Color * (VertexFog.a * ShadingModelContext.Opacity.x), 0.0f);
+	#elif MATERIALBLENDING_MODULATE
+		half3 FoggedColor = lerp(half3(1, 1, 1), Color, VertexFog.aaa * VertexFog.aaa);
+		OutColor = half4(FoggedColor, ShadingModelContext.Opacity);
+	#else
+		OutColor.rgb = Color * VertexFog.a + VertexFog.rgb;
+
+		#if !MATERIAL_USE_ALPHA_TO_COVERAGE
+			// Scene color alpha is not used yet so we set it to 1
+			OutColor.a = 1.0;
+
+			#if OUTPUT_MOBILE_HDR 
+				// Store depth in FP16 alpha. This depth value can be fetched during translucency or sampled in post-processing
+				OutColor.a = SvPosition.z;
+			#endif
+		#else
+			half MaterialOpacityMask = GetMaterialMaskInputRaw(PixelMaterialInputs);
+			OutColor.a = GetMaterialMask(PixelMaterialInputs) / max(abs(ddx(MaterialOpacityMask)) + abs(ddy(MaterialOpacityMask)), 0.0001f) + 0.5f;
+		#endif
+	#endif
+
+	#if !MATERIALBLENDING_MODULATE && USE_PREEXPOSURE
+		OutColor.rgb *= ResolvedView.PreExposure;
+	#endif
+
+	#if MATERIAL_IS_SKY
+		// Sky materials can result in high luminance values, e.g. the sun disk. 
+		// This is so we make sure to at least stay within the boundaries of fp10 and not cause NaN on some platforms.
+		// We also half that range to also make sure we have room for other additive elements such as bloom, clouds or particle visual effects.
+		OutColor.rgb = min(OutColor.rgb, Max10BitsFloat.xxx * 0.5f);
+	#endif
+
+#if USE_EDITOR_COMPOSITING && (MOBILE_EMULATION)
+	// Editor primitive depth testing
+	OutColor.a = 1.0;
+	#if MATERIALBLENDING_MASKED
+		// some material might have an opacity value
+		OutColor.a = GetMaterialMaskInputRaw(PixelMaterialInputs);
+	#endif
+	clip(OutColor.a - GetMaterialOpacityMaskClipValue());
+#else
+	#if OUTPUT_GAMMA_SPACE
+		OutColor.rgb = sqrt(OutColor.rgb);
+	#endif
+#endif
+
+#if NUM_VIRTUALTEXTURE_SAMPLES || LIGHTMAP_VT_ENABLED
+	FinalizeVirtualTextureFeedback(
+		MaterialParameters.VirtualTextureFeedback,
+		MaterialParameters.SvPosition,
+		ShadingModelContext.Opacity,
+		View.FrameNumber,
+		View.VTFeedbackBuffer
+	);
+#endif
+}

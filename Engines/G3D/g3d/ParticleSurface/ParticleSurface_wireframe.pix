@@ -1,0 +1,16 @@
+#version 410 or 460
+/**
+  \file data-files/shader/ParticleSurface/ParticleSurface_wireframe.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+uniform vec4 wireframeColor;
+out vec4 finalColor;
+
+void main() {
+    finalColor = wireframeColor;
+}

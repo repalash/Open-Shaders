@@ -1,0 +1,45 @@
+#version 410
+/**
+  \file data-files/shader/VoxelSurface/VoxelSurface_depthPeel.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#extension GL_ARB_conservative_depth : enable
+#include <compatibility.glsl>
+#include <depthPeel.glsl>
+#include "VoxelSurface_pixel.glsl"
+    
+layout (depth_greater) out float gl_FragDepth;
+
+/** Need not be at the same resolution as the current depth buffer. 
+    For samples to be written, they must be at greater gl_FragCoord.z values
+    than those in this buffer.*/
+uniform sampler2D previousDepthBuffer;
+
+/**
+ textureSize(previousDepthBuffer) / textureSize(currentDepthBuffer)
+ */
+uniform float2    currentToPreviousScale;
+
+/** Minimum z distance that new faces 
+    must be beyond previousDepthBuffer to be written. */
+uniform float     minZSeparation;
+
+uniform float3    clipInfo;
+
+void main() {
+    
+    Point3 posIgnore;
+    Vector3 normIgnore;
+
+    float fragDepth;
+    if (! computeHitAndDepth(gl_FragCoord, posIgnore, normIgnore,fragDepth) ||
+        isDepthPeeled(previousDepthBuffer, currentToPreviousScale, minZSeparation, vec3(gl_FragCoord.xy, gl_FragDepth), clipInfo)) {
+        discard;
+    }
+
+    gl_FragDepth = fragDepth;
+}

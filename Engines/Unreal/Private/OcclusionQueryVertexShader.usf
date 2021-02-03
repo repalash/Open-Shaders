@@ -1,0 +1,44 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	OcclusionQueryVertexShader.usf: Vertex shader for drawing occlusion queries.
+=============================================================================*/
+
+#include "Common.ush"
+
+float4 StencilingGeometryPosAndScale;
+
+#if MOBILE_MULTI_VIEW
+	uint ViewId;
+#endif
+
+void Main(
+	in float4 InPosition : ATTRIBUTE0,
+	out float4 OutPosition : SV_POSITION
+#if MOBILE_MULTI_VIEW && !INSTANCED_STEREO
+	, in uint InViewId : SV_ViewID
+	, out uint OutViewId : VIEW_ID
+#endif
+	)
+{
+#if MOBILE_MULTI_VIEW && !INSTANCED_STEREO
+	OutViewId = InViewId;
+
+	// Make the triangles degenerate if we're not targeting this view.
+	// We don't need to resolve the view info, since we already set the
+	// primary view with the data for the view we're interested in.
+	// TODO: Support targetting a single view properly.
+	if (InViewId != ViewId)
+	{
+		OutPosition = float4(0, 0, 0, 1);
+		return;
+	}
+#endif
+
+	float3 TransformedPosition = InPosition.xyz * StencilingGeometryPosAndScale.w + StencilingGeometryPosAndScale.xyz;
+	OutPosition = mul(float4(TransformedPosition, 1), View.TranslatedWorldToClip);
+
+#if !OUTPUT_MOBILE_HDR && COMPILER_GLSL_ES3_1
+	OutPosition.y *= -1;
+#endif
+}

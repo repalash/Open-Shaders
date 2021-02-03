@@ -1,0 +1,41 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+bool GenerateDiskLightOcclusionRay(
+	FLightShaderParameters LightParameters,
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax
+)
+{
+	RayOrigin = WorldPosition;
+	RayDirection = float3(0,0,0);
+	RayTMin = 0.01;
+	RayTMax = RayTMin;
+
+	// Sample disk of SourceRadius
+	float2 UV = UniformSampleDiskConcentric(RandSample);
+	float3 P_Local = float3(UV, 0.0) * LightParameters.SourceRadius;
+	float3 BiTangent = cross(LightParameters.Direction, LightParameters.Tangent);
+	float3 P_World = LightParameters.Position + P_Local.x * LightParameters.Tangent + P_Local.y * BiTangent;
+
+	// Construct light direction according to sample
+	float3 LightDirection = P_World - WorldPosition;
+	float RayLength = length(LightDirection);
+	LightDirection *= rcp(RayLength);
+
+	// Apply normal culling
+	float NoL = dot(LightDirection, LightParameters.Direction);
+	bool IsVisible = NoL > 0.0;
+	if (IsVisible)
+	{
+		RayDirection = LightDirection;
+		RayTMax = RayLength;
+	}
+	return IsVisible;
+}

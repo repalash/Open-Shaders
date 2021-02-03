@@ -1,0 +1,16 @@
+#version 150
+/**
+  \file data-files/shader/SVO/SVO_visualizeFragments.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+in vec3 color;
+
+void main() {
+    gl_FragColor.rgb = color;
+    gl_FragColor.a = 1;
+}

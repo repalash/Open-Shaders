@@ -1,0 +1,85 @@
+#version 120 // -*- c++ -*-
+#include <compatibility.glsl>
+/**
+     \file UniversalSurface_depthOnly.vrt
+     \author Michael Mara, http://www.illuminationcodified.com
+     \created 2012-10-06
+     \edited  2012-11-19
+ */
+
+#expect HAS_ALPHA
+#expect USE_PARALLAX_MAPPING
+#expect USE_BONES
+
+attribute vec4 g3d_Vertex;
+
+#if HAS_ALPHA != 0
+    attribute vec2 g3d_TexCoord0;
+
+#   if (USE_BONES == 0)
+        varying vec2 texCoord;
+#   endif
+#endif
+
+#if (USE_PARALLAX_MAPPING != 0)
+    attribute vec3 g3d_Normal;
+    attribute vec4 g3d_PackedTangent;
+
+    /** Vector to the eye in tangent space (needed for parallax) */
+    varying vec3 _tsE;
+
+    /** Tangent space to world space.
+    Note that this will be linearly interpolated across the polygon. */
+    varying vec3 tan_X, tan_Y;
+
+    varying vec3 tan_Z; 
+    
+    varying vec3 wsPosition;
+#endif
+
+#if (USE_BONES != 0)
+    attribute vec4      g3d_BoneWeights;
+    attribute ivec4     g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+#   include <UniversalSurface/UniversalSurface_vertex.glsl>
+#endif
+    
+
+void main() {
+    vec4 vertex = g3d_Vertex;
+#   if (USE_BONES != 0)
+#       if (USE_PARALLAX_MAPPING == 1)
+            UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, vertex, g3d_Normal, g3d_PackedTangent);
+#       else
+            mat4 boneMatrix = UniversalSurface_getFullBoneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture);
+            vertex = boneMatrix * vertex;
+#       endif
+#   endif
+
+#   if (USE_PARALLAX_MAPPING != 0)
+        wsPosition = (g3d_ObjectToWorldMatrix * vertex).xyz;
+
+        tan_Z = g3d_ObjectToWorldNormalMatrix * g3d_Normal.xyz;
+    
+        tan_X = (g3d_ObjectToWorldMatrix * vec4(g3d_PackedTangent.xyz, 0)).xyz;
+
+        // T and N are guaranteed perpendicular, so B is normalized.  Its facing 
+	    // direction is stored in the texcoord w component.
+	    tan_Y = cross(tan_Z, tan_X) * g3d_PackedTangent.w;
+
+
+        // Compute the tangent space eye vector (ATI does not support the transpose operator)
+        mat3 worldToTangent = mat3(tan_X.x, tan_Y.x, tan_Z.x,
+                                           tan_X.y, tan_Y.y, tan_Z.y,
+                                           tan_X.z, tan_Y.z, tan_Z.z);
+
+        vec3 wsEyePos = g3d_CameraToWorldMatrix[3].xyz;
+        _tsE             = worldToTangent * (wsEyePos - wsPosition);
+#   endif
+
+#   if (HAS_ALPHA != 0)
+        texCoord      = g3d_TexCoord0;
+#   endif
+    gl_Position   = vertex * gl_ModelViewProjectionMatrixTranspose;
+    gl_ClipVertex = vertex * gl_ModelViewMatrixTranspose;
+}

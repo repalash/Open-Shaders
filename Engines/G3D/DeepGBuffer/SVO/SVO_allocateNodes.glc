@@ -1,0 +1,56 @@
+#version 420 or 430 // -*- c++ -*-
+/**
+  Requires WORK_GROUP_SIZE_X, WORK_GROUP_SIZE_Y
+*/
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = 1) in;
+
+layout(r32ui) uniform uimageBuffer   childIndexBuffer;
+layout(r32ui) uniform uimageBuffer   parentIndexBuffer;
+layout(r32ui) uniform uimageBuffer   levelIndexBuffer;
+
+/** Number of nodes allocated; indices are number * 8 */
+layout(r32ui) uniform uimageBuffer   numberOfAllocatedNodes;
+
+uniform int                          level;
+
+/** Used for reading the total thread count from the fourth element */
+layout(r32ui) uniform uimageBuffer   dispatchIndirectLevelBuffer;
+
+#define NULL                         (0)
+const uint                           POPULATED = 0xFFFFFFFF;
+
+void main() {
+    uint threadIndex = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * (WORK_GROUP_SIZE_X * WORK_GROUP_SIZE_Y) + gl_LocalInvocationID.x + gl_LocalInvocationID.y * WORK_GROUP_SIZE_X;
+
+    uint numThreads = imageLoad(dispatchIndirectLevelBuffer, 3).r;
+    if (threadIndex >= numThreads) { return; }
+
+    uint nodeIndex = threadIndex + imageLoad(levelIndexBuffer, level - 1).r;
+
+
+    // See if this node has children; if not, leave the pointer at NULL
+    if (imageLoad(childIndexBuffer, int(nodeIndex)).r == POPULATED) 
+	{
+        // Allocate in blocks of 8
+        uint childIndex = imageAtomicAdd(numberOfAllocatedNodes, 0, 1U) * 8U;
+
+        // Store my child index
+        imageStore(childIndexBuffer, int(nodeIndex), uvec4(childIndex));
+
+		// Store parent index
+        imageStore(parentIndexBuffer, int(childIndex/8U), uvec4(nodeIndex));
+
+        // Zero the pointers to my grandchildren
+        for (int i = 0; i < 8; ++i) {
+            imageStore(childIndexBuffer, int(childIndex + i), uvec4(NULL));
+        }
+
+    }
+}

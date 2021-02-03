@@ -1,0 +1,173 @@
+#version 430 // -*- c++ -*-
+#ifdef GL_ARB_compute_variable_group_size
+#extension GL_ARB_compute_variable_group_size : enable
+#endif
+
+#extension GL_NV_shader_buffer_load : enable
+#extension GL_NV_shader_buffer_store : enable
+
+#include <g3dmath.glsl>
+#include <Texture/Texture.glsl>
+#include "../DDGIVolume/DDGIVolume.glsl"
+
+layout(local_size_variable) in;
+
+#expect RAYS_PER_PROBE "int"
+#expect ADJUST_OFFSETS "bool"
+
+uniform DDGIVolume  ddgiVolume;
+uniform float       maxDistance;
+uniform float       distanceScale;
+uniform mat3        randomOrientation;
+uniform Texture2D   rayHitLocations;
+
+uniform int     offset;
+
+layout(std430, binding = 2) restrict readonly buffer RayBlockIndexOffsetSSBO {
+    int rayBlockOffset[];
+};
+
+void main() {
+
+    ivec2 C = ivec2(gl_GlobalInvocationID.xy);
+
+    Vector4 currentOffset =
+#if FIRST_FRAME
+        vec4(vec3(0), 6) // Probes start uninitialized.
+#else
+        readProbeOffset(ddgiVolume, C);
+#endif
+    ;
+
+    int probeIdx = C.x + C.y * ddgiVolume.probeCounts.x * ddgiVolume.probeCounts.y;
+
+    int closestBackfaceIndex = -1;
+    float closestBackfaceDistance = inf;
+
+    int closestFrontfaceIndex = -1;
+    float closestFrontfaceDistance = inf;
+
+    int farthestFrontfaceIndex = -1;
+    float farthestFrontfaceDistance = 0;
+
+    int backfaceCount = 0;
+
+	// Worst case, view and normal contribute in the same direction, so need 2x self-shadow bias.
+	vec3 outerBounds = normalize(ddgiVolume.probeSpacing) * (length(ddgiVolume.probeSpacing) + (2.0f * ddgiVolume.selfShadowBias));
+	int flag = (int)currentOffset.w; // Assume normal probe: initially awake, not sleepless or tombstoned.
+    
+    int rayOffset = rayBlockOffset[probeIdx];
+
+    if (rayOffset == -1) {
+        // These rays were not traced.
+        return;
+    }
+
+    int probeOffsetInAbsoluteRays = offset + (probeIdx - rayOffset) * RAYS_PER_PROBE;
+
+    for (int i = 0; i < RAYS_PER_PROBE; ++i) {
+
+        int offsetIdx = probeOffsetInAbsoluteRays + i;
+        ivec2 rayTexCoord = ivec2(offsetIdx % RAYS_PER_PROBE, offsetIdx / RAYS_PER_PROBE);
+
+        // Distance is negative if we hit a backface
+        float d_front = sampleTextureFetch(rayHitLocations, rayTexCoord, 0).w;
+        float d_back = -d_front;
+
+        //Backface test backface -> position.w < 0.0f
+        if (d_back > 0.0f) {
+            backfaceCount += 1;
+            if (d_back < closestBackfaceDistance) {
+                // This distance is negative on a backface hit
+                closestBackfaceDistance = d_back;
+                // Recompute ray direction
+                closestBackfaceIndex = i;
+            }
+        }
+
+        if (d_front > 0.0f) {
+			// Need to check all frontfaces to see if any are wihtin shading range.
+			vec3 frontFaceDirection = d_front * normalize(randomOrientation * sphericalFibonacci(i, RAYS_PER_PROBE));
+			if (all(lessThan(abs(frontFaceDirection), outerBounds))) {
+				// There is a static surface being shaded by this probe. Make it "just vigilant".
+				flag = 4;
+			}
+            if (d_front < closestFrontfaceDistance) {
+                closestFrontfaceDistance = d_front;
+				closestFrontfaceIndex = i;
+            } else if (d_front > farthestFrontfaceDistance) {
+                farthestFrontfaceDistance = d_front;
+                farthestFrontfaceIndex = i;
+            }
+        }
+    }
+
+    Vector3 fullOffset = vec3(inf);
+	Vector3 offsetLimit = ddgiVolume.probeOffsetLimit * ddgiVolume.probeSpacing;
+
+	// If there's a close backface AND you see more than 25% backfaces, assume you're inside something.
+    if (closestBackfaceIndex != -1 && (float(backfaceCount) / RAYS_PER_PROBE) > 0.25f) {
+		// At this point, we were just in a wall, so set probe to "Off".
+		flag = 0;
+        // We hit a backface
+        Vector3 closestBackfaceDirection = closestBackfaceDistance * normalize(randomOrientation * sphericalFibonacci(closestBackfaceIndex, RAYS_PER_PROBE));
+        
+        // Solve for the maximum scaling possible on each axis.
+        Vector3 positiveOffset = (-currentOffset.xyz + offsetLimit) / closestBackfaceDirection;
+        Vector3 negativeOffset = (-currentOffset.xyz - offsetLimit) / closestBackfaceDirection;
+        Vector3 combinedOffset = Vector3(max(positiveOffset.x, negativeOffset.x), max(positiveOffset.y, negativeOffset.y), max(positiveOffset.z, negativeOffset.z));
+
+        // Slightly bias this point to ensure we stay within bounds.
+        const float epsilon = 1e-3; // Millimeter scale
+        float scaleFactor = (min(min(combinedOffset.x, combinedOffset.y), combinedOffset.z) - epsilon);
+
+        // If we can't move through the backface, don't move at all.
+        fullOffset = currentOffset.xyz + closestBackfaceDirection * ((scaleFactor <= 1.0f) ? 0.0f : scaleFactor);
+	}
+	else if (closestFrontfaceIndex == -1) {
+		// Probe sees only backfaces and sky, so set probe to "Off".
+		flag = 0;
+	}
+    else if (closestFrontfaceDistance < 0.05f) {
+        // We hit no backfaces and a close frontface (within 2 cm). Set to "Newly Vigilant".
+		flag = 4;
+
+        // Ensure that we never move through the farthest frontface
+        // Move minimum distance to ensure not moving on a future iteration.
+        vec3 farthestDirection = min(0.2f, farthestFrontfaceDistance) * normalize(randomOrientation * sphericalFibonacci(farthestFrontfaceIndex, RAYS_PER_PROBE));
+        
+        // The farthest frontface may also be the closest if the probe can only 
+        // see one surface. If this is the case, don't move the probe.
+        if (!(dot(farthestDirection, randomOrientation * sphericalFibonacci(closestFrontfaceIndex, RAYS_PER_PROBE)) > 0.5f)) {
+            fullOffset = currentOffset.xyz + farthestDirection;
+        }
+	} 
+
+
+    // If we are adjusting offsets, add the offset.
+    // Otherwise, just record the flag below.
+#if ADJUST_OFFSETS
+    // Absolute maximum distance probe could be moved is 0.5 * probeSpacing
+    // Clamp maximum distance we're willing to move to ddgiVolume.probeOffsetLimit to avoid degenerate cases.
+    if (all(lessThan(abs(fullOffset), offsetLimit))) {
+
+        //const float offsetWeight = 0.6f;
+        //Vector3 averagesNormalized = (offsetWeight * abs(fullOffset) + (1.0f - offsetWeight) * offsetLimit) / abs(fullOffset);
+        //
+        //fullOffset *= min(averagesNormalized.z, min(averagesNormalized.x, averagesNormalized.y));
+
+		// We are going to move, and therefore should be uninitialized
+		flag = 6;
+		currentOffset.xyz = fullOffset;
+    }
+#else
+    if (flag == 6) {
+        // Probe is still uninitialized: all flag setting 
+        // conditions failed, probe should sleep.
+        flag = 1;
+    }
+#endif
+
+	currentOffset.w = flag;
+    writeProbeOffset(ddgiVolume, C, currentOffset);
+}

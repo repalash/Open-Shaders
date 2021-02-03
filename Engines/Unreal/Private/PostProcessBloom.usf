@@ -1,0 +1,91 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	PostProcessBloom.usf: PostProcessing bloom
+=============================================================================*/
+
+#define EYE_ADAPTATION_LOOSE_PARAMETERS 1
+
+#include "Common.ush"
+#include "PostProcessCommon.ush"
+#include "EyeAdaptationCommon.ush"
+#include "ScreenPass.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+
+Texture2D InputTexture;
+
+SamplerState InputSampler;
+
+float BloomThreshold;
+
+void BloomSetupVS(
+	float4 InPosition : ATTRIBUTE0,
+	float2 InTexCoord : ATTRIBUTE1,
+	out noperspective float4 OutUVAndScreenPos : TEXCOORD0,
+	out nointerpolation float OutExposureScale : TEXCOORD1,
+	out float4 OutPosition : SV_POSITION)
+{
+	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUVAndScreenPos);
+
+	OutExposureScale = EyeAdaptationLookup();
+}
+
+float4 BloomSetupCommon(float2 UV, float ExposureScale)
+{
+#if USE_PREEXPOSURE
+	const float OneOverPreExposure = View.OneOverPreExposure;
+	const float PreExposure = View.PreExposure;
+#else
+	const float OneOverPreExposure = 1.0f;
+	const float PreExposure = View.PreExposure;
+#endif
+
+	float4 SceneColor = Texture2DSample(InputTexture, InputSampler, UV) * OneOverPreExposure; 
+
+	// clamp to avoid artifacts from exceeding fp16 through framebuffer blending of multiple very bright lights
+	SceneColor.rgb = min(float3(256 * 256, 256 * 256, 256 * 256), SceneColor.rgb);
+
+	half3 LinearColor = SceneColor.rgb;
+
+	half TotalLuminance = Luminance(LinearColor) * ExposureScale;
+	half BloomLuminance = TotalLuminance - BloomThreshold;
+	half BloomAmount = saturate(BloomLuminance * 0.5f);
+
+	return float4(BloomAmount * LinearColor, 0) * PreExposure;
+}
+
+void BloomSetupPS(
+	noperspective float4 UVAndScreenPos : TEXCOORD0,
+	nointerpolation float InExposureScale : TEXCOORD1,
+	out float4 OutColor : SV_Target0)
+{
+	float2 UV = UVAndScreenPos.xy;
+
+	OutColor = BloomSetupCommon(UV, InExposureScale);
+}
+
+#if COMPUTESHADER
+
+RWTexture2D<float4> RWOutputTexture;
+
+[numthreads(THREADGROUP_SIZEX, THREADGROUP_SIZEY, 1)]
+void BloomSetupCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	float2 UV = ((float2)DispatchThreadId + (float2)Input_ViewportMin + 0.5f) * Input_ExtentInverse;
+
+	if (IsComputeUVOutOfBounds(UV))
+	{
+		return;
+	}
+
+	float ExposureScale = EyeAdaptationLookup();
+
+	float4 OutColor = BloomSetupCommon(UV, ExposureScale);
+
+	uint2 PixelPos = DispatchThreadId + Input_ViewportMin;
+
+	RWOutputTexture[PixelPos] = OutColor;
+}
+
+#endif

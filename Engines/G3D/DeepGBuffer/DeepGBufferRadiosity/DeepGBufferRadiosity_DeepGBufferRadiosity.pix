@@ -1,0 +1,427 @@
+#version 120 // -*- c++ -*-
+#extension GL_EXT_gpu_shader4 : require
+#extension GL_ARB_gpu_shader5 : enable
+#include <reconstructFromDepth.glsl>
+#include <g3dmath.glsl>
+
+#expect NUM_SAMPLES "Integer number of samples to take at each pixel"
+#expect NUM_SPIRAL_TURNS "Integer number of turns around the circle that the spiral pattern makes. The DeepGBufferRadiosity class provides a discrepancy-minimizing value of NUM_SPIRAL_TURNS for each value of NUM_SAMPLES."
+#expect USE_MIPMAPS "1 to enable, 0 to disable"
+#expect USE_DEPTH_PEEL "1 to enable, 0 to disable"
+#expect COMPUTE_PEELED_LAYER "1 to enable, 0 to disable"
+#expect USE_TAP_NORMAL "1 to enable, 0 to disable"
+#expect MIN_MIP_LEVEL "non-negative integer"
+#expect USE_OCT16 "1 to enable, 0 to disable"
+#if (!USE_DEPTH_PEEL) && COMPUTE_PEELED_LAYER 
+#error "If computing a peeled layer, must be using depth peel!"
+#endif
+
+/** Used only if ray tracing */
+uniform vec3        clipInfo;
+
+uniform mat4        projectionMatrix;
+
+#include <DeepGBufferRadiosity/DeepGBufferRadiosity_constants.glsl>
+
+//////////////////////////////////////////////////
+
+/** The height in pixels of a 1m object if viewed from 1m away.  
+    You can compute it from your projection matrix.  The actual value is just
+    a scale factor on radius; you can simply hardcode this to a constant (~500)
+    and make your radius value unitless (...but resolution dependent.)  */
+uniform float           projScale;
+
+/** Negative, "linear" values in world-space units */
+uniform sampler2D       CS_Z_buffer;
+
+
+#ifdef normal_notNull
+    /** Same size as result buffer, do not offset by guard band when reading from it */
+    uniform sampler2D       normal_buffer;
+    uniform vec4            normal_readMultiplyFirst;
+    uniform vec4            normal_readAddSecond;
+
+#if USE_OCT16
+#include <oct.glsl>
+#endif
+#endif
+
+/** World-space AO radius in scene units (r).  e.g., 1.0m */
+uniform float           radius;
+
+/** Bias to avoid AO in smooth corners, e.g., 0.01m */
+uniform float           bias;
+
+uniform vec4            projInfo;
+
+uniform sampler2D       colorBuffer;
+uniform vec4            g3d_sz2D_colorBuffer;
+
+
+#if USE_DEPTH_PEEL
+    uniform sampler2D       peeledColorBuffer;
+    uniform sampler2D       peeledNormalBuffer;
+#endif
+
+uniform float           indirectMultiplier;
+
+
+// Compatibility with future versions of GLSL: the shader still works if you change the 
+// version line at the top to something like #version 330 compatibility.
+#if __VERSION__ == 120
+#   define texelFetch   texelFetch2D
+#   define textureSize  textureSize2D
+#   define result gl_FragData[0]
+#   else
+    out vec4            result;
+#endif
+
+#if COMPUTE_PEELED_LAYER
+#   if __VERSION__ == 120
+#       define peeledResult gl_FragData[1]
+#   else
+        out vec4       peeledResult;
+#   endif
+#   define indirectPeeledResult  peeledResult.rgb
+#   define peeledVisibility      peeledResult.a
+#endif
+
+#define indirectResult  result.rgb
+#define visibility      result.a
+
+/////////////////////////////////////////////////////////
+
+vec3 sampleNormal(sampler2D normalBuffer, ivec2 ssC, int mipLevel) {
+    #if USE_OCT16
+        return decode16(texelFetch(normalBuffer, ssC, mipLevel).xy * 2.0 - 1.0);
+#   else
+        return texelFetch(normalBuffer, ssC, mipLevel).xyz * 2.0 - 1.0;
+#   endif
+}
+
+void sampleBothNormals(sampler2D normalBuffer, ivec2 ssC, int mipLevel, out vec3 n_tap0, out vec3 n_tap1) {
+    vec4 encodedNormals = texelFetch(normalBuffer, ssC, mipLevel) * 2.0 - 1.0;
+    n_tap0 = decode16(encodedNormals.xy);
+    n_tap1 = decode16(encodedNormals.zw);
+}
+
+/** Returns a unit vector and a screen-space radius for the tap on a unit disk (the caller should scale by the actual disk radius) */
+vec2 tapLocation(int sampleNumber, float spinAngle, float radialJitter, out float ssR){
+    // Radius relative to ssR
+    float alpha = float(sampleNumber + radialJitter) * (1.0 / NUM_SAMPLES);
+    float angle = alpha * (NUM_SPIRAL_TURNS * 6.28) + spinAngle;
+
+    ssR = alpha;
+    return vec2(cos(angle), sin(angle));
+}
+
+ 
+/** Read the camera-space position of the point at screen-space pixel ssP */
+vec3 getPosition(ivec2 ssP, sampler2D cszBuffer) {
+    vec3 P;
+    P.z = texelFetch(cszBuffer, ssP, 0).r;
+
+    // Offset to pixel center
+    P = reconstructCSPosition(vec2(ssP) + vec2(0.5), P.z, projInfo);
+    return P;
+}
+
+
+void getPositions(ivec2 ssP, sampler2D cszBuffer, out vec3 P0, out vec3 P1) {
+    vec2 Zs = texelFetch(cszBuffer, ssP, 0).rg;
+
+    // Offset to pixel center
+    P0 = reconstructCSPosition(vec2(ssP) + vec2(0.5), Zs.x, projInfo);
+    P1 = reconstructCSPosition(vec2(ssP) + vec2(0.5), Zs.y, projInfo);
+}
+
+  
+void computeMipInfo(float ssR, ivec2 ssP, sampler2D cszBuffer, out int mipLevel, out ivec2 mipP) {
+    // Derivation:
+    //  mipLevel = floor(log(ssR / MAX_OFFSET));
+#   ifdef GL_EXT_gpu_shader5
+        mipLevel = clamp(findMSB(int(ssR)) - LOG_MAX_OFFSET,        MIN_MIP_LEVEL, MAX_MIP_LEVEL);
+#   else
+        mipLevel = clamp(int(floor(log2(ssR))) - LOG_MAX_OFFSET,    MIN_MIP_LEVEL, MAX_MIP_LEVEL);
+#   endif
+
+    // We need to divide by 2^mipLevel to read the appropriately scaled coordinate from a MIP-map.  
+    // Manually clamp to the texture size because texelFetch bypasses the texture unit
+    mipP = ssP >> mipLevel;//clamp(ssP >> mipLevel, ivec2(0), textureSize(CS_Z_buffer, mipLevel) - ivec2(1));
+}
+
+
+/** Read the camera-space position of the point at screen-space pixel ssP + unitOffset * ssR.  Assumes length(unitOffset) == 1.
+    Use cszBufferScale if reading from the peeled depth buffer, which has been scaled by (1 / invCszBufferScale) from the original */
+vec3 getOffsetPosition(ivec2 ssC, vec2 unitOffset, float ssR, sampler2D cszBuffer, float invCszBufferScale) {
+    ivec2 ssP = clamp(ivec2(ssR * unitOffset) + ssC, ivec2(0), ivec2(g3d_sz2D_colorBuffer.xy-1));
+
+    int mipLevel;
+    ivec2 mipP;
+    computeMipInfo(ssR, ssP, cszBuffer, mipLevel, mipP);
+    
+    vec3 P;
+
+    P.z = texelFetch(cszBuffer, mipP, mipLevel).r;
+
+    // Offset to pixel center
+    P = reconstructCSPosition((vec2(ssP) + vec2(0.5)) * invCszBufferScale, P.z, projInfo);
+
+    return P;
+}
+
+
+/** Read the camera-space position of the points at screen-space pixel ssP + unitOffset * ssR in both channels of the packed csz buffer.  Assumes length(unitOffset) == 1. */
+void getOffsetPositions(ivec2 ssC, vec2 unitOffset, float ssR, sampler2D cszBuffer, out Point3 P0, out Point3 P1) { 
+    ivec2 ssP = clamp(ivec2(ssR * unitOffset) + ssC, ivec2(0), ivec2(g3d_sz2D_colorBuffer.xy-1));
+
+    int mipLevel;
+    ivec2 mipP;
+    computeMipInfo(ssR, ssP, cszBuffer, mipLevel, mipP);
+
+    vec2 Zs = texelFetch(cszBuffer, mipP, mipLevel).rg;
+
+    // Offset to pixel center
+    P0 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.x, projInfo);
+    P1 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.y, projInfo);
+}
+
+
+void getOffsetPositionNormalAndLambertian
+  (ivec2            ssP, 
+   float            ssR, 
+   sampler2D        cszBuffer, 
+   sampler2D        bounceBuffer, 
+   sampler2D        normalBuffer, 
+   out Point3       Q,
+   out Color3       lambertian_tap, 
+   out Vector3      n_tap) {
+
+#   if USE_MIPMAPS
+        int mipLevel;
+        ivec2 texel;
+        computeMipInfo(ssR, ssP, cszBuffer, mipLevel, texel);
+#   else
+        int mipLevel = 0;
+        ivec2 texel = ssP;
+#   endif
+
+    float z = texelFetch(cszBuffer, texel, mipLevel).r;
+    Vector3 n = sampleNormal(normalBuffer, texel, mipLevel);
+    n_tap = n;
+    lambertian_tap = texelFetch(bounceBuffer, texel, mipLevel).rgb;
+
+    // Offset to pixel center
+    Q = reconstructCSPosition((vec2(ssP) + vec2(0.5)), z, projInfo);
+}
+
+
+void getOffsetPositionsNormalsAndLambertians
+   (ivec2           ssP, 
+    float           ssR, 
+    sampler2D       cszBuffer, 
+    sampler2D       bounceBuffer, 
+    sampler2D       peeledBounceBuffer,
+    sampler2D       normalBuffer, 
+    sampler2D       peeledNormalBuffer, 
+    out Point3      Q0, 
+    out Point3      Q1, 
+    out Color3      lambertian_tap0, 
+    out Color3      lambertian_tap1, 
+    out Vector3     n_tap0, 
+    out Vector3     n_tap1) {
+    
+#if USE_MIPMAPS
+    int mipLevel;
+    ivec2 texel;
+    computeMipInfo(ssR, ssP, cszBuffer, mipLevel, texel);
+#else
+    int mipLevel = 0;
+    ivec2 texel = ssP;
+#endif
+
+    vec2 Zs = texelFetch(cszBuffer, texel, mipLevel).rg;
+#if USE_OCT16
+    sampleBothNormals(normalBuffer, texel, mipLevel, n_tap0, n_tap1);
+#else
+    n_tap0 = sampleNormal(normalBuffer, texel, mipLevel);
+    n_tap1 = sampleNormal(peeledNormalBuffer, texel, mipLevel);
+#endif
+    
+    lambertian_tap0 = texelFetch(bounceBuffer, texel, mipLevel).rgb;
+    lambertian_tap1 = texelFetch(peeledBounceBuffer, texel, mipLevel).rgb;
+
+    // Offset to pixel center
+    Q0 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.x, projInfo);
+    Q1 = reconstructCSPosition((vec2(ssP) + vec2(0.5)), Zs.y, projInfo);
+}
+
+
+float radius2 = square(radius);
+
+#define PI 3.141592653589
+
+void iiValueFromPositionsAndNormalsAndLambertian(ivec2 ssP, Point3 X, Vector3 n_X, Point3 Y, Vector3 n_Y, Radiosity3 radiosity_Y, out Irradiance3 E, out float weight_Y, out float visibilityWeight_Y) {
+   
+    Vector3 YminusX = Y - X;
+    Vector3 w_i = normalize(YminusX);
+    weight_Y = ((dot(w_i, n_X) > 0.0) 
+#   if USE_TAP_NORMAL
+        && (dot(-w_i, n_Y) > 0.01)
+#   endif
+        ) ? 1.0 : 0.0; // Backface check
+
+    // E = radiosity_Y * dot(w_i, n_X) * weight_Y * float(dot(YminusX, YminusX) < radius2);    
+
+    if ((dot(YminusX, YminusX) < radius2) && // Radius check
+        (weight_Y > 0)) { 
+        E = radiosity_Y * dot(w_i, n_X);
+    } else {
+#       if USE_TAP_NORMAL == 0
+            weight_Y = 0;
+#       endif
+        E = vec3(0);
+    }
+}
+
+
+/** Compute the occlusion due to sample with index \a i about the pixel at \a ssC that corresponds
+    to camera-space point \a C with unit normal \a n_C, using maximum screen-space sampling radius \a ssDiskRadius 
+
+    When sampling from the peeled depth buffer, make sure ssDiskRadius has been premultiplied by cszBufferScale
+*/
+void sampleIndirectLight
+   (in ivec2            ssC, 
+    in Point3           C, 
+    in Vector3          n_C, 
+    in Point3           C_peeled, 
+    in Vector3          n_C_peeled, 
+    in float            ssDiskRadius, 
+    in int              tapIndex, 
+    in float            randomPatternRotationAngle, 
+    in float            radialJitter, 
+    in sampler2D        cszBuffer, 
+    in sampler2D        nBuffer, 
+    in sampler2D        bounceBuffer, 
+    inout Irradiance3   irradianceSum, 
+    inout float         numSamplesUsed, 
+    inout Irradiance3   iiPeeled, 
+    inout float         weightSumPeeled) {
+
+    // Not used yet, quality optimization in progress...
+    float visibilityWeightPeeled0, visibilityWeightPeeled1;
+
+    // Offset on the unit disk, spun for this pixel
+    float ssR;
+    vec2 unitOffset = tapLocation(tapIndex, randomPatternRotationAngle, radialJitter, ssR);
+    ssR *= ssDiskRadius;
+    ivec2 ssP = ivec2(ssR * unitOffset) + ssC;
+
+#   if USE_DEPTH_PEEL
+        vec3 E, ii_tap0, ii_tap1;
+        float weight, weight0, weight1;
+        float visibilityWeight0, visibilityWeight1;
+        // The occluding point in camera space
+        vec3 Q0, lambertian_tap0, n_tap0, Q1, lambertian_tap1, n_tap1;
+        getOffsetPositionsNormalsAndLambertians(ssP, ssR, cszBuffer, bounceBuffer, peeledColorBuffer, nBuffer, peeledNormalBuffer, Q0, Q1, lambertian_tap0, lambertian_tap1, n_tap0, n_tap1);
+        iiValueFromPositionsAndNormalsAndLambertian(ssP, C, n_C, Q0, n_tap0, lambertian_tap0, ii_tap0, weight0, visibilityWeight0);
+        float adjustedWeight0 = weight0 * dot(ii_tap0, ii_tap0) + weight0;
+
+        iiValueFromPositionsAndNormalsAndLambertian(ssP, C, n_C, Q1, n_tap1, lambertian_tap1, ii_tap1, weight1, visibilityWeight1);
+        float adjustedWeight1 = weight1 * dot(ii_tap1, ii_tap1) + weight1;
+
+        weight = (adjustedWeight0 > adjustedWeight1) ? weight0 : weight1;
+        E = (adjustedWeight0 > adjustedWeight1) ? ii_tap0 : ii_tap1;
+
+#       if COMPUTE_PEELED_LAYER
+
+            float weightPeeled0, weightPeeled1;
+            vec3 ii_tapPeeled0, ii_tapPeeled1;
+            iiValueFromPositionsAndNormalsAndLambertian(ssP, C_peeled, n_C_peeled, Q0, n_tap0, lambertian_tap0, ii_tapPeeled0, weightPeeled0, visibilityWeightPeeled0);
+            iiValueFromPositionsAndNormalsAndLambertian(ssP, C_peeled, n_C_peeled, Q1, n_tap1, lambertian_tap1, ii_tapPeeled1, weightPeeled1, visibilityWeightPeeled1);
+
+            float iiMag0 = dot(ii_tapPeeled0, ii_tapPeeled0);
+            float iiMag1 = dot(ii_tapPeeled1, ii_tapPeeled1);
+            weightSumPeeled += iiMag0 > iiMag1 ? weightPeeled0 : weightPeeled1;
+            iiPeeled        += iiMag0 > iiMag1 ? ii_tapPeeled0 : ii_tapPeeled1;  
+
+#       endif
+
+        numSamplesUsed += weight;
+
+#   else
+
+        Irradiance3 E;
+        float visibilityWeight;
+        float weight_Y;
+        // The occluding point in camera space
+        vec3 Q, lambertian_tap, n_tap;
+        getOffsetPositionNormalAndLambertian(ssP, ssR, cszBuffer, bounceBuffer, nBuffer, Q, lambertian_tap, n_tap);
+        iiValueFromPositionsAndNormalsAndLambertian(ssP, C, n_C, Q, n_tap, lambertian_tap, E, weight_Y, visibilityWeight);
+        numSamplesUsed += weight_Y;
+#   endif
+
+    irradianceSum           += E;
+    
+}
+
+
+void main() {
+
+    // Pixel being shaded 
+    ivec2 ssC = ivec2(gl_FragCoord.xy);
+
+#   if COMPUTE_PEELED_LAYER
+        Point3 C, C_peeled;
+        getPositions(ssC, CS_Z_buffer, C, C_peeled);
+        Vector3 n_C_peeled = sampleNormal(peeledNormalBuffer, ssC, 0);
+#   else
+        // World space point being shaded
+        Point3 C = getPosition(ssC, CS_Z_buffer);
+        Point3 C_peeled = vec3(0);
+        Vector3 n_C_peeled = vec3(0);
+#   endif
+
+    Vector3 n_C = sampleNormal(normal_buffer, ssC, 0);
+
+
+    // Choose the screen-space sample radius
+    // proportional to the projected area of the sphere
+    float ssDiskRadius = -projScale * radius / C.z;
+ 
+    // Hash function used in the HPG12 AlchemyAO paper
+    float randomPatternRotationAngle = (3 * ssC.x ^ ssC.y + ssC.x * ssC.y) * 10;
+#   if TEMPORALLY_VARY_TAPS   
+        randomPatternRotationAngle += g3d_SceneTime;
+#   endif
+
+    float radialJitter = fract(sin(gl_FragCoord.x * 1e2 + 
+#       if TEMPORALLY_VARY_TAPS   
+            g3d_SceneTime +
+#       endif
+        gl_FragCoord.y) * 1e5 + sin(gl_FragCoord.y * 1e3) * 1e3) * 0.8 + 0.1;
+    
+    float numSamplesUsed = 0.0;
+    Irradiance3 irradianceSum = Irradiance3(0);
+    Irradiance3 ii_peeled = Irradiance3(0);
+    float peeledSum = 0.0;
+    for (int i = 0; i < NUM_SAMPLES; ++i) {
+        sampleIndirectLight(ssC, C, n_C, C_peeled, n_C_peeled, ssDiskRadius, i, randomPatternRotationAngle, radialJitter, CS_Z_buffer, normal_buffer, colorBuffer, irradianceSum, numSamplesUsed, ii_peeled, peeledSum);
+    }
+
+    const float solidAngleHemisphere = 2 * PI;
+    Irradiance3 E_X = irradianceSum * solidAngleHemisphere / (numSamplesUsed + 0.00001);
+
+    indirectResult = E_X;
+
+    // What is the ambient visibility of this location
+    visibility = 1 - numSamplesUsed / float(NUM_SAMPLES);
+
+#   if COMPUTE_PEELED_LAYER
+        float A_peeled = 1 - peeledSum / float(NUM_SAMPLES);
+        Irradiance3 E_X_peeled = ii_peeled * solidAngleHemisphere / (peeledSum + 0.00001);
+
+        indirectPeeledResult    = E_X_peeled;
+        peeledVisibility        = A_peeled;
+#   endif
+}

@@ -1,0 +1,165 @@
+#version 410 or 420
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_depthOnlyNonOpaque.pix
+
+  For depth only passes with both parallax mapping and alpha components
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+#include <compatibility.glsl>
+#include <AlphaFilter.glsl>
+#include <UniversalMaterial/UniversalMaterial_sample.glsl>
+
+#expect USE_DEPTH_PEEL
+#expect ALPHA_HINT
+#expect HAS_VERTEX_COLOR
+#expect HAS_TRANSMISSIVE
+#expect HAS_ALPHA
+#expect STOCHASTIC "Boolean"
+
+// i.e., Discard if alpha * (1 - transmission) < 1
+#expect DISCARD_IF_NO_TRANSPARENCY "Boolean"
+
+in Point2        texCoord;
+
+/** Weights to apply when converting transmission into average wavelength-independent net transmission or coverage.
+    For a shadow map, this is the light radiance divided by its sum. */
+uniform Color3   transmissionWeight;
+
+uniform UniversalMaterial2D material;
+
+float backside = (gl_FrontFacing == g3d_InvertY) ? 1.0 : -1.0;
+
+#if (HAS_ALPHA == 0) && (HAS_TRANSMISSIVE == 0)
+#   error "This shader is intended for use with transparency"
+#endif
+
+#if HAS_NORMAL_BUMP_MAP
+#   if (PARALLAXSTEPS > 0)
+        /** Un-normalized (interpolated) tangent space eye vector */
+        in vec3     _tsE;
+#   else
+        const vec3  _tsE = vec3(0, 0, 0);
+#   endif
+    in vec3         tan_X, tan_Y;
+#else
+    const vec3 _tsE  = vec3(0, 0, 0);
+    const vec3 tan_X = vec3(0, 0, 0);
+    const vec3 tan_Y = vec3(0, 0, 0);
+#endif
+
+in Vector3 tan_Z;
+
+#if HAS_VERTEX_COLOR
+    in vec4 vertexColor;
+#else
+    const Color4 vertexColor = Color4(0,0,0,0);
+#endif
+
+#if (USE_DEPTH_PEEL != 0)
+#   include <depthPeel.glsl>
+    /** Need not be at the same resolution as the current depth buffer. 
+        For samples to be written, they must be at greater gl_FragCoord.z values
+        than those in this buffer.*/
+    uniform sampler2D previousDepthBuffer;
+
+    /**
+     textureSize(previousDepthBuffer) / textureSize(currentDepthBuffer)
+     */
+    uniform float2    currentToPreviousScale;
+
+    /** Minimum depth buffer value distance (on [0,1]) that new faces 
+        must be beyond previousDepthBuffer to be written. */
+    uniform float     minZSeparation;
+
+    uniform float3    clipInfo;
+#endif
+    
+in Point3 wsPosition;
+
+out Color4 result;
+
+float random(Point3 p) {
+    return frac(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3 + p.z * 1e2) * 1e3);
+}
+
+void main() {
+#   if (USE_DEPTH_PEEL != 0)
+        if (isDepthPeeled(previousDepthBuffer, currentToPreviousScale, minZSeparation, gl_FragCoord.xyz, clipInfo)) {
+            discard;
+        }
+#   endif
+
+    bool discardIfFullCoverage = (! ((HAS_TRANSMISSIVE != 0) && (STOCHASTIC != 0))) && (DISCARD_IF_NO_TRANSPARENCY != 0);
+    bool discardIfZeroCoverage = true;
+    UniversalMaterialSample materialSample = sampleUniversalMaterial2D(material, wsPosition, texCoord, vec2(0), tan_X, tan_Y, tan_Z, normalize(_tsE), backside, discardIfZeroCoverage, discardIfFullCoverage,
+        vertexColor, ALPHA_HINT, PARALLAXSTEPS, bool(HAS_NORMAL_BUMP_MAP), bool(HAS_VERTEX_COLOR), bool(HAS_ALPHA), bool(HAS_TRANSMISSIVE), bool(HAS_EMISSIVE), NUM_LIGHTMAP_DIRECTIONS);
+
+#   if STOCHASTIC
+#       if HAS_TRANSMISSIVE
+        {
+            // Neglect fresnel effects for depth
+            Color3 F = materialSample.fresnelReflectionAtNormalIncidence;
+            Color3 lambertianCoefficient = (1.0 - F) * materialSample.lambertianReflectivity * invPi;
+            Color3 transmissionCoefficient = materialSample.transmissionCoefficient * (Color3(1.0) - F) * (Color3(1.0) - lambertianCoefficient);
+
+            // Reduce everything to "coverage"
+            float absorption = 1.0 - dot(transmissionCoefficient, transmissionWeight);
+   
+            if (material.etaRatio < 1.0) {
+                // Create approximate caustics by decreasing shadowing based on refraction and angle.
+                // The "eye" vector below is the light vector when we're rendering a shadow map.
+                Vector3 wsEye = normalize(g3d_CameraToWorldMatrix[3].xyz - wsPosition);
+
+                // Amount of the caustic effect. amount = 0 is none (eta = 1), amount = 1 is strong.
+                float amount = square((1.0 / material.etaRatio - 1.0) * (1.0 / 2.0));
+
+                // When the normal points into the light, we want much less absorption.
+                // Let incidence = 0 for glancing angles and incidence = 1 for normal incidence.
+                float incidence = abs(dot(materialSample.shadingNormal, wsEye)); 
+
+                // Where incidence is low, make the shadow *darker* (darken > 1). Where incidence 
+                // is high, make the shadow less dark (darken < 1).
+                // The darkness of the caustic is the opposite of the incidence, with 
+                // a lot of contrast.
+                
+                // On the range [0, 2.0]
+                float darken = saturate(1.0 - pow(incidence, 128.0 * amount)) * 2.0;
+                
+                // Increase the effect with index of refraction
+                darken = lerp(1.0, darken, pow(amount, 0.1));
+
+                // As etaRatio increases, we want absorption to become more like k
+                // At etaRatio = 1, absorption is unmodified. At etaRatio = 3,
+                // there should be extreme sensitivity to k, increasing both in contrast
+                // and in rate.
+                absorption *= darken;
+
+                // Don't let coverage ever hit 1.0 due to total internal refraction
+                // because that will trigger DISCARD_IF_NO_TRANSPARENCY to drop it 
+                // from SVSM generation.
+                absorption = min(absorption, 0.999);
+            }
+
+            materialSample.coverage = saturate(materialSample.coverage * absorption);
+        }
+#       endif
+
+        // Selectively kill based on a random number vs. alpha.
+        if ((random(wsPosition.xyz) > materialSample.coverage) ||
+             ((DISCARD_IF_NO_TRANSPARENCY != 0) && (materialSample.coverage == 1.0))) {
+            discard;
+        }
+#   else       
+        if (materialSample.coverage < 1.0) {
+            discard;
+        }
+#   endif
+    result.a = 1.0;
+}
+
+

@@ -1,0 +1,86 @@
+#version 420 or 430
+/**
+  \file data-files/shader/SVO/SVO_allocateNodesTopMipMap.glc
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#if __VERSION__ < 430
+#   extension GL_ARB_compute_shader : enable
+#endif
+
+#include <SVO/SVO_util.glsl>
+
+#expect WORK_GROUP_SIZE_X
+#expect WORK_GROUP_SIZE_Y
+#expect WORK_GROUP_SIZE_Z
+
+layout (local_size_x = WORK_GROUP_SIZE_X, local_size_y = WORK_GROUP_SIZE_Y, local_size_z = WORK_GROUP_SIZE_Z) in;
+
+layout(r32ui) uniform uimageBuffer   childIndexBuffer;
+layout(r32ui) uniform uimageBuffer   parentIndexBuffer;
+layout(r32ui) uniform uimageBuffer   levelIndexBuffer;
+
+/** Number of nodes allocated; indices are number * 8 */
+layout(r32ui) uniform uimageBuffer   numberOfAllocatedNodes;
+
+uniform int                          level;
+
+/** Used for reading the total thread count from the fourth element */
+layout(r32ui) uniform uimageBuffer   dispatchIndirectLevelBuffer;
+
+#define NULL                         (0)
+const uint                           POPULATED = 0xFFFFFFFF;
+
+
+void main() {
+	
+	ivec3 voxelCoord = ivec3(gl_WorkGroupID) * ivec3(WORK_GROUP_SIZE_X ,WORK_GROUP_SIZE_Y, WORK_GROUP_SIZE_Z) + ivec3(gl_LocalInvocationID);
+
+	int levelRes=1<<level;
+	
+
+	if(voxelCoord.x<levelRes && voxelCoord.y<levelRes && voxelCoord.z<levelRes){
+
+		//
+
+		//uint threadIndex = voxelCoord.x+voxelCoord.y*levelRes+voxelCoord.z*levelRes*levelRes;
+		uint threadIndex = uint( svoTopMipMapLevelOffset( voxelCoord, level ) );
+
+		uint nodeIndex = threadIndex + imageLoad(levelIndexBuffer, level - 1).r;
+		
+		/////////////
+		int subLevelRes=1<<(level+1);
+		ivec3 childCoord = voxelCoord*2;
+		//uint childIndex = (childCoord.x+childCoord.y*subLevelRes+childCoord.z*subLevelRes*subLevelRes) + imageLoad(levelIndexBuffer, level).r;
+		uint childIndex = uint(svoTopMipMapLevelOffset( childCoord, level+1 )) + imageLoad(levelIndexBuffer, level).r;
+
+
+		//Allocated 8 subnodes
+		imageAtomicAdd(numberOfAllocatedNodes, 0, 1U) * 8U;	//Only to maintain numberOfAllocatedNodes updated
+
+		// Zero the pointers to my grandchildren
+		for (int i = 0; i < 8; ++i) {
+			imageStore(childIndexBuffer, int(childIndex + i), uvec4(NULL));
+		}
+		///////////
+
+		if( SVO_TOP_MIPMAP_SPARSE_TREE==0 || imageLoad(childIndexBuffer, int(nodeIndex)).r == POPULATED ){
+			// Store my child index
+			imageStore(childIndexBuffer, int(nodeIndex), uvec4(childIndex));
+
+			// Store parent index
+			imageStore(parentIndexBuffer, int(childIndex/8U), uvec4(nodeIndex));
+		}else{
+			// Store my child index
+			imageStore(childIndexBuffer, int(nodeIndex), uvec4(0));
+
+			// Store parent index
+			imageStore(parentIndexBuffer, int(childIndex/8U), uvec4(0));
+		}
+	}
+    
+}

@@ -1,0 +1,46 @@
+#version 410
+/**
+  \file data-files/shader/UniversalSurface/UniversalSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <UniversalSurface/UniversalSurface_vertex.glsl>
+#expect HAS_BONES
+#expect HAS_VERTEX_COLOR "Boolean"
+
+
+#if HAS_VERTEX_COLOR
+    in vec4 g3d_VertexColor;
+#else
+    const vec4 g3d_VertexColor = vec4(1.0);
+#endif
+
+#if HAS_BONES > 0
+    in vec4             g3d_BoneWeights;
+    in ivec4            g3d_BoneIndices;
+    uniform sampler2D   boneMatrixTexture;
+    uniform sampler2D   prevBoneMatrixTexture;
+#endif
+
+out vec2 texcoord1;
+
+void main() {
+    // Temporary variables needed because some drivers do not allow modifying attribute variables directly
+    vec4 osVertex         = g3d_Vertex;
+    vec3 osNormal         = g3d_Normal;
+    vec4 packedTangent  = g3d_PackedTangent;
+    vec2 tex0           = g3d_TexCoord0;
+    vec2 tex1           = g3d_TexCoord1;
+
+    texcoord1 = tex1;
+#   if HAS_BONES > 0
+        UniversalSurface_boneTransform(g3d_BoneWeights, g3d_BoneIndices, boneMatrixTexture, osVertex, osNormal, packedTangent);
+#   endif
+
+    UniversalSurface_customOSVertexTransformation(osVertex, osNormal, packedTangent, tex0, tex1);
+
+    UniversalSurface_transform(osVertex, osNormal, packedTangent, tex0, tex1, g3d_VertexColor);
+}

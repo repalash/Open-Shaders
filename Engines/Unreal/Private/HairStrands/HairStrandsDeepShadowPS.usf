@@ -1,0 +1,164 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "HairStrandsVoxelPageCommonStruct.ush"
+#include "HairStrandsDeepShadowCommonStruct.ush"
+
+#include "../Common.ush"
+
+//#define SceneTexturesStruct VoxelRasterPass.SceneTextures
+
+#include "../SceneTexturesCommon.ush"
+#include "HairStrandsDebugCommon.ush"
+#include "HairStrandsDeepShadowCommon.ush"
+#include "HairStrandsVisibilityCommon.ush"
+#include "HairStrandsVoxelPageCommon.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+
+static const float FixPointMaxValue = 1000;	// 100m @hair_todo: make this camera relative, and expose a CVAR fix changing this value
+static const float FixPointScale	= 100;	// 0.1mm precision
+static const float FixPointRange	= 2 * FixPointMaxValue * FixPointScale;    
+
+#define SUPPORT_OPACITY_MASK 0
+
+void MainDepth(
+	in float4 SvPosition	: SV_Position)
+{
+#if SUPPORT_OPACITY_MASK
+	ResolvedView = ResolveView();
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs;
+	CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+	clip(GetMaterialMask(PixelMaterialInputs));
+#endif
+}
+
+void MainDom(
+	in float4 SvPosition	: SV_Position,
+	in float HairCoverage	: CUSTOM_COVERAGE,
+	out float4 OutColor		: SV_Target0)
+{
+	#if SUPPORT_OPACITY_MASK
+	{
+		ResolvedView = ResolveView();
+		FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+		FPixelMaterialInputs PixelMaterialInputs;
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+		clip(GetMaterialMask(PixelMaterialInputs));
+	}
+	#endif
+
+	const uint2 PixelCoord = uint2(floor(SvPosition.xy));
+	const float FrontDepth = DeepRasterPass.FrontDepthTexture.Load(uint3(PixelCoord, 0));
+	const float DistanceToFrontDepth = GetDomDistanceToFrontDepth(FrontDepth, SvPosition.z);
+
+	OutColor = ComputeDOMWeights(DistanceToFrontDepth, DeepRasterPass.LayerDepths) * HairCoverage;
+}
+
+#define DEBUG_OUTPUT 0
+
+void MainVoxel(
+#if SUPPORT_TANGENT_PROPERTY == 1 || SUPPORT_MATERIAL_PROPERTY == 1 
+	FVertexFactoryInterpolantsVSToPS Interpolants,
+#endif
+	in float4 SvPosition : SV_Position,
+	in float4 WorldPositon_Coverage : TEXCOORD6
+#if DEBUG_OUTPUT
+,	out uint OutColor : SV_Target0 // For debug purpose only
+#endif
+)
+{
+	const float3 WorldPosition = WorldPositon_Coverage.xyz;
+	const float HairCoverage = WorldPositon_Coverage.w;
+
+#if VF_STRAND_HAIR  
+	const FPackedVirtualVoxelNodeDesc PackedNode = VoxelRasterPass.VirtualVoxel.NodeDescBuffer[VoxelRasterPass.MacroGroupId];
+	const FVirtualVoxelNodeDesc NodeDesc = UnpackVoxelNode(PackedNode, VoxelRasterPass.VirtualVoxel.PageResolution);
+
+	const int3 VoxelCoord = PositionToCoord(WorldPosition.xyz, NodeDesc.MinAABB, NodeDesc.MaxAABB, NodeDesc.VirtualResolution);
+	if (VoxelCoord.x >= 0 || VoxelCoord.y >= 0 || VoxelCoord.z >= 0 ||
+		VoxelCoord.x < int(NodeDesc.VirtualResolution.x) || 
+		VoxelCoord.y < int(NodeDesc.VirtualResolution.y) || 
+		VoxelCoord.z < int(NodeDesc.VirtualResolution.z))
+	{
+		const int3 PageIndexCoord		= VoxelCoord / VoxelRasterPass.VirtualVoxel.PageResolution;
+		const uint LinearPageIndexCoord = CoordToIndex(PageIndexCoord, NodeDesc.PageIndexResolution, NodeDesc.PageIndexOffset);
+		const int3 VoxelCoordBase		= PageIndexCoord * VoxelRasterPass.VirtualVoxel.PageResolution;
+		const int3 VoxelCoordOffset		= VoxelCoord - VoxelCoordBase;
+		if (LinearPageIndexCoord < VoxelRasterPass.VirtualVoxel.PageIndexCount)
+		{
+			const uint PageIndex = VoxelRasterPass.VirtualVoxel.PageIndexBuffer[LinearPageIndexCoord];
+			if (PageIndex != INVALID_VOXEL_PAGE_INDEX)
+			{
+				const uint3 PageCoord			= IndexToCoord(PageIndex, VoxelRasterPass.VirtualVoxel.PageCountResolution);
+				const uint3 PageVoxelCoordBase	= PageCoord * VoxelRasterPass.VirtualVoxel.PageResolution;
+				const uint3 PageVoxelCoord		= PageVoxelCoordBase + VoxelCoordOffset;
+
+				const float HairCount			= HairCoverage;
+				const float VoxelFixPointScale	= GetVoxelDensityFixPointScale();
+				InterlockedAdd(VoxelRasterPass.DensityTexture[PageVoxelCoord], HairCount * VoxelFixPointScale);
+
+				#if DEBUG_OUTPUT
+				OutColor = 0xFF;
+				#endif
+				return;
+			}
+			else
+			{
+				#if DEBUG_OUTPUT
+				OutColor = 0x0F;
+				#endif
+				return;
+			}
+		}
+	}
+
+	#if 0 // This code is no longer used, but it is a reference for voxelizing material
+	const int3 VoxelCoord = (WorldPosition.xyz - VoxelRasterPass.VoxelMinAABB) / (VoxelRasterPass.VoxelMaxAABB - VoxelRasterPass.VoxelMinAABB) * VoxelRasterPass.VoxelResolution;
+		 
+	if (VoxelCoord.x >= 0 || VoxelCoord.y >= 0 || VoxelCoord.z >= 0 ||
+		VoxelCoord.x < int(VoxelRasterPass.VoxelResolution.x) || 
+		VoxelCoord.y < int(VoxelRasterPass.VoxelResolution.y) || 
+		VoxelCoord.z < int(VoxelRasterPass.VoxelResolution.z))
+	{
+		const float HairCount = HairCoverage;
+		const float VoxelFixPointScale = GetVoxelDensityFixPointScale();
+		InterlockedAdd(VoxelRasterPass.DensityTexture[VoxelCoord], HairCount * VoxelFixPointScale);
+
+		#if SUPPORT_TANGENT_PROPERTY == 1
+		const half3 Tangent = GetTangentToWorld2(Interpolants).xyz;
+		const uint3 Tangent8bits = QuantizeTo8Bits(Tangent);
+
+		InterlockedAdd(VoxelRasterPass.TangentXTexture[VoxelCoord], Tangent8bits.x);
+		InterlockedAdd(VoxelRasterPass.TangentYTexture[VoxelCoord], Tangent8bits.y);
+		InterlockedAdd(VoxelRasterPass.TangentZTexture[VoxelCoord], Tangent8bits.z);
+		#endif	
+
+		#if SUPPORT_MATERIAL_PROPERTY == 1
+		{
+			ResolvedView = ResolveView();
+
+			FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Interpolants, SvPosition);
+			FPixelMaterialInputs PixelMaterialInputs;
+
+			float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+			float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+			CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, ScreenPosition, true, TranslatedWorldPosition, TranslatedWorldPosition);
+
+			// For material we take the max color / roughness for efficiency resource instead of accumulated differences
+			const float3 BaseColor = GetMaterialBaseColor(PixelMaterialInputs);
+			const float Roughness = GetMaterialRoughness(PixelMaterialInputs);
+			const uint EncodedBaseColorAndRoughness = EncodeBaseColorAndRoughness(BaseColor, Roughness);
+			InterlockedMax(VoxelRasterPass.MaterialTexture[VoxelCoord], EncodedBaseColorAndRoughness);
+		}
+		#endif
+
+	}
+
+	#if DEBUG_OUTPUT
+	OutColor = 0xFF;
+	#endif
+	#endif
+
+#endif
+}

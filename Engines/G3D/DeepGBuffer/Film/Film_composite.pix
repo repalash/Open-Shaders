@@ -1,0 +1,87 @@
+#version 120 or 150 compatibility // -*- c++ -*-
+// This is the final compositing pass
+#include <compatibility.glsl> 
+#include <g3dmath.glsl>
+#include "Film_toneMap.glsl"
+#expect BLOOM "1 or 0"
+
+uniform sampler2D   sourceTexture;
+uniform float4      g3d_sz2D_sourceTexture;
+
+#if (BLOOM != 0)
+    uniform sampler2D bloomTexture;
+    uniform float     bloomStrengthScaled;
+#endif
+
+uniform float       sensitivity;
+
+/* 1.0 / monitorGamma.  Usually about invGamma = 0.45*/
+uniform float       invGamma;
+
+uniform float       vignetteTopStrength;
+uniform float       vignetteBottomStrength;
+uniform float       vignetteSize;
+uniform float       toneCurveStrength;
+
+uniform int2        guardBandSize;
+
+uniform sampler2D   toneCurve;
+
+// From https://www.shadertoy.com/view/4sf3D2
+float hash(vec2 p) {return fract(sin(p.x * 1e2 + p.y) * 1e5 + sin(p.y * 1e3) * 1e3); }
+
+
+float pow4(float x) { return x * x * x * x; }
+void main(void) {
+
+    int2 X = int2(gl_TexCoord[0].st * g3d_FragCoordExtent) + guardBandSize;
+
+    float3 src = texelFetch(sourceTexture, X, 0).rgb;
+
+    src = toneMap(src, sensitivity, toneCurve);
+
+#   if BLOOM == 1
+        // The bloom texture has already been reduced by the guard band size
+        float3 bloom = texture2DLod(bloomTexture, gl_TexCoord[0].st, 0.0).rgb;
+        src += bloom * bloomStrengthScaled;
+#   endif
+        
+    vec2 q = gl_TexCoord[0].st; 
+    float vignette = pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 3.0 * vignetteSize);
+
+    // Scale by parameters
+    vignette = lerp(1.0, vignette, mix(vignetteTopStrength, vignetteBottomStrength, gl_TexCoord[0].y));
+
+    // Add noise to break up the color banding
+    vignette = min(1.0, (hash(gl_FragCoord.xy) * 0.05 + 1.0) * vignette);
+
+    src *= vignette;
+
+    ///////////////////////////////////////////////////////////
+    // Fix out-of-gamut saturation
+    // Maximumum channel:
+    float m = max(max(src.r, src.g), src.b);
+
+    // Normalized color when the maximum channel exceeds 1.0
+    src *= (1.0 / max(1.0, m));
+
+    // Fade towards white when the max is brighter than 1.0 (like a light saber core)
+    src = mix(src, vec3(1.0), min(1.0, square(max(0.0, m - 1.0))));
+    ////////////////////////////////////////////////////////////
+
+    // Invert the gamma curve
+    float3 dst = pow(src, float3(invGamma));
+
+    gl_FragColor.rgb = dst;
+
+	// Output luminance in the alpha channel for FXAA
+	gl_FragColor.a =
+		// Real CIE luminance:
+		dot(float3(0.2126, 0.7152, 0.0722), dst);
+
+		// Average:
+		// dot(float3(1.0 / 3.0), dst);
+
+		// Incorrect luminance from FXAA documentation:
+	    // dot(dst, float3(0.299, 0.587, 0.114));
+}

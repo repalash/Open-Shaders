@@ -1,0 +1,23 @@
+#version 410
+/**
+  \file data-files/shader/VoxelSurface/VoxelSurface_gbuffer.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <g3dmath.glsl>
+//#include <UniversalSurface/UniversalSurface_vertex.glsl>
+//#include "PointSurface_vertex.glsl"
+#include "VoxelSurface_vertex.glsl"
+
+
+// Fix some problems on Intel and AMD GPUs
+#define layout(ignore)
+
+void main() {
+
+    computeVertexShaderOutputs(color, position, voxelRadius, gl_Position, gl_PointSize, voxelLambertian);
+
+}

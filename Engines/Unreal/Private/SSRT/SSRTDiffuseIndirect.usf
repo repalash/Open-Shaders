@@ -1,0 +1,660 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Generate vector truncation warnings to errors.
+#pragma warning(error: 3206)
+
+#define CONFIG_SORT_RAYS 0
+#define CONFIG_SORT_BIN_COUNT 16
+#define CONFIG_EARLY_RETURN 0
+#define CONFIG_COLOR_TILE_CLASSIFICATION 0
+
+#define DEBUG_SSRT 0
+
+#define DEBUG_RAY_COUNT 0
+
+
+#if QUALITY == 1
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 4
+
+	#define TILE_PIXEL_SIZE_X 8
+	#define TILE_PIXEL_SIZE_X_LOG 3
+
+	#define TILE_PIXEL_SIZE_Y 8
+	#define TILE_PIXEL_SIZE_Y_LOG 3
+
+#elif QUALITY == 2
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 8
+
+	#define TILE_PIXEL_SIZE_X 8
+	#define TILE_PIXEL_SIZE_X_LOG 3
+
+	#define TILE_PIXEL_SIZE_Y 4
+	#define TILE_PIXEL_SIZE_Y_LOG 2
+
+#elif QUALITY == 3
+	#define CONFIG_RAY_STEPS 8
+	#define CONFIG_RAY_COUNT 16
+	#define CONFIG_BACKFACE_MODULATION 0
+
+	#define TILE_PIXEL_SIZE_X 4
+	#define TILE_PIXEL_SIZE_X_LOG 2
+
+	#define TILE_PIXEL_SIZE_Y 4
+	#define TILE_PIXEL_SIZE_Y_LOG 2
+
+#elif QUALITY == 4
+	#define CONFIG_RAY_STEPS 12
+	#define CONFIG_RAY_COUNT 32
+	#define CONFIG_BACKFACE_MODULATION 0
+
+	#define TILE_PIXEL_SIZE_X 4
+	#define TILE_PIXEL_SIZE_X_LOG 2
+
+	#define TILE_PIXEL_SIZE_Y 2
+	#define TILE_PIXEL_SIZE_Y_LOG 1
+
+#else
+	#error Unknown Quality.
+
+#endif
+
+
+#ifndef CONFIG_BACKFACE_MODULATION
+	#define CONFIG_BACKFACE_MODULATION 0
+#endif
+
+#define TILE_PIXEL_COUNT (TILE_PIXEL_SIZE_X * TILE_PIXEL_SIZE_Y)
+#define LANE_PER_GROUPS (TILE_PIXEL_COUNT * CONFIG_RAY_COUNT)
+		
+#define IS_SSGI_SHADER 1
+
+#include "SSRTRayCast.ush"
+#include "SSRTTileClassificationBuffer.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../Random.ush"
+#include "../BRDF.ush"
+#include "../MonteCarlo.ush"
+#include "../SceneTextureParameters.ush"
+
+#if LANE_PER_GROUPS == 64 && 0
+	#undef GroupMemoryBarrierWithGroupSync
+	#define GroupMemoryBarrierWithGroupSync()
+#endif
+
+Texture2D FurthestHZBTexture;
+Texture2D ColorTexture;
+
+#if SUPPORTS_INDEPENDENT_SAMPLERS
+
+#define FurthestHZBTextureSampler GlobalPointClampedSampler
+#define ColorTextureSampler GlobalPointClampedSampler
+
+#else
+
+SamplerState FurthestHZBTextureSampler;
+SamplerState ColorTextureSampler;
+
+#endif
+
+float4 HZBUvFactorAndInvFactor;
+float4 ColorBufferScaleBias;
+float2 ReducedColorUVMax;
+
+float PixelPositionToFullResPixel;
+float2 FullResPixelOffset;
+
+RWTexture2D<float4>	IndirectDiffuseOutput;
+RWTexture2D<float>	AmbientOcclusionOutput;
+
+groupshared uint SharedMemory[LANE_PER_GROUPS * 2];
+
+
+uint CompressN(float3 N)
+{
+	// matches 8bits GBuffer A to be lossless.
+	uint3 K = uint3(saturate(N * 0.5 + 0.5) * 255.0);
+	return uint(K.x << 0 | K.y << 8 | K.z << 16);
+}
+
+float3 DecompressN(uint EncodedN)
+{
+	uint3 K;
+	K.x = (EncodedN >>  0) & 0xFF;
+	K.y = (EncodedN >>  8) & 0xFF;
+	K.z = (EncodedN >> 16) & 0xFF;
+
+	return float3(K) * (2.0 / 255.0) - 1.0;
+}
+
+uint2 DecodeGroupPixelOffset(uint GroupPixelId)
+{
+    return uint2(GroupPixelId % TILE_PIXEL_SIZE_X, (GroupPixelId >> TILE_PIXEL_SIZE_X_LOG) % TILE_PIXEL_SIZE_Y);
+}
+
+uint EncodeGroupPixelOffset(uint2 GroupPixelOffset)
+{
+	return GroupPixelOffset.x | (GroupPixelOffset.y << TILE_PIXEL_SIZE_X_LOG);
+}
+
+uint2 ComputePixelPosition(uint2 GroupId, uint2 GroupPixelOffset)
+{
+    return GroupId * uint2(TILE_PIXEL_SIZE_X, TILE_PIXEL_SIZE_Y) + GroupPixelOffset;
+}
+
+void UpdateLane2DCoordinateInformations(
+	uint2 PixelPosition,
+	out float2 BufferUV,
+	out float2 ScreenPos)
+{
+	float2 FullResPixelPosition = PixelPosition * PixelPositionToFullResPixel + FullResPixelOffset;
+
+	// TODO: split screen
+	BufferUV = FullResPixelPosition * View.BufferSizeAndInvSize.zw;
+    ScreenPos = ViewportUVToScreenPos(FullResPixelPosition * View.ViewSizeAndInvSize.zw);
+}
+
+float3 ComputeTranslatedWorldPositions(float2 ScreenPos, float SceneDepth)
+{
+	return mul(float4(ScreenPos * SceneDepth, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+}
+
+uint2 ComputePixelPosition(float3 TranslatedWorldPosition)
+{
+	float4 ClipPosition = mul(float4(TranslatedWorldPosition, 1), View.TranslatedWorldToClip);
+	float2 ScreenPos = ClipPosition.xy * rcp(ClipPosition.w);
+	float2 ViewportUV = ScreenPosToViewportUV(ScreenPos);
+	return uint2(ViewportUV * View.ViewSizeAndInvSize.xy);
+}
+
+float ComputeSceneDepth(float3 TranslatedWorldPosition)
+{
+	// TODO: do everything in view space instead of world space?
+	return mul(float4(TranslatedWorldPosition, 1.0), View.TranslatedWorldToView).z;
+}
+
+uint2 ComputeRandomSeed(uint2 PixelPosition)
+{
+	return Rand3DPCG16(int3(PixelPosition, View.StateFrameIndexMod8)).xy;
+}
+
+float3 ComputeL(float3 N, float2 E)
+{
+	float3x3 TangentBasis = GetTangentBasis(N);
+	
+	float3 L;
+	L.xy = UniformSampleDiskConcentric( E );
+	L.z = sqrt( 1 - dot( L.xy, L.xy ) );
+	L = mul( L, TangentBasis );
+
+	return L;
+
+	float3 TangentL = CosineSampleHemisphere(E).xyz;
+	return mul(TangentL, TangentBasis);
+}
+
+/** Test whether a screen space ray can be discarded or not based on tile information. */
+bool TestRayEarlyReturn(FSSRTTileInfos TileInfos, FSSRTRay Ray)
+#if CONFIG_EARLY_RETURN
+{
+	float2 RayStepPixel = Ray.RayStepScreen.xy * View.ViewSizeAndInvSize.xy;
+
+	// Screen position is vertically flipped from 
+	RayStepPixel.y = -RayStepPixel.y;
+
+	// Compute screen ray direction in [0; 2 PI[
+	float RayDirection = atan2(-RayStepPixel.y, -RayStepPixel.x) + PI;
+	
+	float DeltaU = length(RayStepPixel) * (0.5 * View.ViewSizeAndInvSize.z);
+	float DeltaZ = Ray.RayStepScreen.z;
+	float RayTheta = atan2(DeltaU, -DeltaZ);
+	
+	// Compare RayTheta according to RayDirection against the TileInfos.Directionality stored into SGPR.
+	bool bEarlyReturn;
+	#if DIRECTIONALITY_DIVISION == 8
+	FLATTEN
+	if (RayDirection < (0.5 * 2 * PI / DIRECTIONALITY_DIVISION) || RayDirection > (7.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[0];
+		//bEarlyReturn = true;
+	}
+	else if (RayDirection < (1.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[1];
+		//bEarlyReturn = true;
+	}
+	else if (RayDirection < (2.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[2];
+		//bEarlyReturn = true;
+		//bEarlyReturn = false;
+	}
+	else if (RayDirection < (3.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[3];
+		//bEarlyReturn = true;
+		//bEarlyReturn = false;
+	}
+	else if (RayDirection < (4.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[4];
+		//bEarlyReturn = true;
+	}
+	else if (RayDirection < (5.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[5];
+		//bEarlyReturn = true;
+	}
+	else if (RayDirection < (6.5 * 2 * PI / DIRECTIONALITY_DIVISION))
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[6];
+		//bEarlyReturn = true;
+	}
+	else
+	{
+		bEarlyReturn = RayTheta > TileInfos.Directionality[7];
+		//bEarlyReturn = true;
+	}
+	#else
+		#error Need to update this code.
+	#endif
+
+	return bEarlyReturn;
+}
+#else
+{
+	return false;
+}
+#endif
+
+#if CONFIG_SORT_RAYS
+
+uint SelectDirectionBin(
+	FSSRTTileInfos TileInfos,
+	uint2 GroupId,
+	uint GroupPixelId,
+	uint RaySequenceId,
+	float3 N,
+	float DeviceZ,
+	inout bool bTraceRay)
+{
+	uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+	uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+
+	uint2 RandomSeed = ComputeRandomSeed(PixelPosition);
+
+	float2 E = Hammersley16(RaySequenceId, CONFIG_RAY_COUNT, RandomSeed);
+		
+	float3 L = ComputeL(N, E);
+			
+	float2 BufferUV;
+	float2 ScreenPos;
+	UpdateLane2DCoordinateInformations(PixelPosition, /* out */ BufferUV, /* out */ ScreenPos);
+	
+	FSSRTRay Ray = InitScreenSpaceRay(ScreenPos, DeviceZ, L);
+	
+	// Early out if the tile classification can detect this ray direction is not going to intersect anything.
+	bool bEarlyOut = TestRayEarlyReturn(TileInfos, Ray);
+	
+	// Don't trace a ray if it can be early out by tile classification.
+	bTraceRay = bTraceRay && !bEarlyOut;
+
+	float2 RayStepPixel = Ray.RayStepScreen.xy * View.ViewSizeAndInvSize.xy;
+	float DirectionAngle = atan2(RayStepPixel.x, RayStepPixel.y);
+	
+	uint SelectedBinId = floor(DirectionAngle * ((CONFIG_SORT_BIN_COUNT - 1) * rcp(2 * PI)) + ((CONFIG_SORT_BIN_COUNT - 1) / 2 + 0.5)); 
+	SelectedBinId = clamp(SelectedBinId, 0, CONFIG_SORT_BIN_COUNT - 2);
+
+	return bTraceRay ? SelectedBinId : (CONFIG_SORT_BIN_COUNT - 1);
+} // SelectDirectionBin()
+
+#endif // CONFIG_SORT_RAYS
+
+[numthreads(TILE_PIXEL_SIZE_X, TILE_PIXEL_SIZE_Y, CONFIG_RAY_COUNT)]
+void MainCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadIndex : SV_GroupIndex)
+{
+	// Id of the wave in the group.
+	uint GroupWaveIndex = GroupThreadIndex / 64;
+	
+	FSSRTTileInfos TileInfos;
+	{
+		const uint BinsAddress = TILE_PIXEL_COUNT * 2;
+
+		uint GroupPixelId = GroupThreadIndex % TILE_PIXEL_COUNT;
+		uint RaySequenceId = GroupThreadIndex / TILE_PIXEL_COUNT;
+
+		// Compute TileCoord from GroupId to ensure the compiler understand it is group invariant to use scalar load.
+		uint2 TileCoord = GroupId / uint2(TILE_RES_DIVISOR / TILE_PIXEL_SIZE_X, TILE_RES_DIVISOR / TILE_PIXEL_SIZE_Y);
+		TileInfos = LoadTileInfos(TileCoord);
+
+
+		// Store GBuffer into LDS
+		{
+			BRANCH
+			if (RaySequenceId == 0)
+			{
+				uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+                uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+				
+				float2 BufferUV;
+				float2 ScreenPos;
+				UpdateLane2DCoordinateInformations(PixelPosition, /* out */ BufferUV, /* out */ ScreenPos);
+	
+				FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+				float3 N = mul(float4(GBuffer.WorldNormal, 0), View.TranslatedWorldToView).xyz;
+				float DeviceZ = SampleDeviceZFromSceneTextures(BufferUV);
+
+				bool bTraceRay = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT;// && GBuffer.ShadingModelID != SHADINGMODELID_SUBSURFACE_PROFILE;
+				
+				SharedMemory[TILE_PIXEL_COUNT * 0 | GroupPixelId] = CompressN(N);
+				SharedMemory[TILE_PIXEL_COUNT * 1 | GroupPixelId] = asuint(bTraceRay ? DeviceZ : -1.0);
+			}
+			else if (GroupWaveIndex == 1) // TODO.
+			{
+				// Clears the bins
+				SharedMemory[BinsAddress | GroupPixelId] = 0;
+			}
+		}
+		
+		#if CONFIG_SORT_RAYS
+	
+		// Sorts rays.
+		{
+			// Group sync to acces gbuffer data.
+			GroupMemoryBarrierWithGroupSync();
+
+			// Fetch information from LDS.
+			bool bTraceRay;
+			float3 N;
+			float DeviceZ;
+			{
+				uint Raw0 = SharedMemory[TILE_PIXEL_COUNT * 0 | GroupPixelId];
+				uint Raw1 = SharedMemory[TILE_PIXEL_COUNT * 1 | GroupPixelId];
+
+				N = DecompressN(Raw0);
+				DeviceZ = abs(asfloat(Raw1));
+				bTraceRay = asfloat(Raw1) > 0.0;
+			}
+
+			// Compute the ray's bin.
+			uint SelectedBinId = SelectDirectionBin(
+				TileInfos,
+				GroupId,
+				GroupPixelId,
+				RaySequenceId,
+				N,
+				DeviceZ,
+				/* inout */ bTraceRay);
+		
+			// Count ray in bins
+			uint OffsetInBin = 0;
+			InterlockedAdd(SharedMemory[BinsAddress | SelectedBinId], 1, OffsetInBin);
+			
+			GroupMemoryBarrierWithGroupSync();
+
+			// Compute the starting position of the bin in LDS.
+			// TODO: faster way to do it?
+			uint SelectedBinStartingPos = 0;
+			UNROLL
+			for (uint BinId = 0; BinId < CONFIG_SORT_BIN_COUNT; BinId++)
+			{
+				FLATTEN
+				if (BinId < SelectedBinId)
+				{
+					SelectedBinStartingPos += SharedMemory[BinsAddress | BinId];
+				}
+			}
+			
+			GroupMemoryBarrierWithGroupSync();
+
+			// Store ray informations in LDS.
+			{
+				uint DestPos = SelectedBinStartingPos + OffsetInBin;
+
+				//#if 1 // Uncomment me to measure performance improvement.
+				//	if (View.GeneralPurposeTweak > 0.5)
+				//		DestPos = GroupPixelId + RaySequenceId * TILE_PIXEL_COUNT;
+				//#endif
+		
+				#if LANE_PER_GROUPS > 256
+					#error "LANE_PER_GROUPS needs to be encodable in 8bits."
+				#endif
+
+				// TODO: Encoded N and 24bits and pack EncodedGroupPixelOffset.
+                SharedMemory[LANE_PER_GROUPS * 0 | DestPos] = asuint(CompressN(N) | (GroupPixelId << 24) | (RaySequenceId << (24 + TILE_PIXEL_SIZE_X_LOG + TILE_PIXEL_SIZE_Y_LOG)));
+				SharedMemory[LANE_PER_GROUPS * 1 | DestPos] = asuint(bTraceRay ? DeviceZ : -1.0);
+			}
+		}
+		#endif // CONFIG_SORT_RAYS
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	// Shoot ray
+	{
+		uint GroupPixelId;
+		uint RaySequenceId;
+		uint CompressedN;
+		float DeviceZ;
+		bool bTraceRay;
+		#if CONFIG_SORT_RAYS
+		{
+			uint Raw0 = SharedMemory[LANE_PER_GROUPS * 0 | GroupThreadIndex];
+			uint Raw1 = SharedMemory[LANE_PER_GROUPS * 1 | GroupThreadIndex];
+
+			// Unpack
+			RaySequenceId = Raw0 >> (24 + TILE_PIXEL_SIZE_X_LOG + TILE_PIXEL_SIZE_Y_LOG);
+            GroupPixelId = (Raw0 >> 24) % TILE_PIXEL_COUNT;
+			CompressedN = Raw0;
+			DeviceZ = asfloat(Raw1);
+			bTraceRay = asfloat(Raw1) > 0;
+		}
+		#else // !CONFIG_SORT_RAYS
+		{
+			GroupPixelId = GroupThreadIndex % TILE_PIXEL_COUNT;
+			RaySequenceId = GroupThreadIndex / TILE_PIXEL_COUNT;
+
+			uint Raw0 = SharedMemory[TILE_PIXEL_COUNT * 0 | GroupPixelId];
+			uint Raw1 = SharedMemory[TILE_PIXEL_COUNT * 1 | GroupPixelId];
+
+			CompressedN = Raw0;
+			DeviceZ = asfloat(Raw1);
+			bTraceRay = asfloat(Raw1) > 0;
+		}
+		#endif // !CONFIG_SORT_RAYS
+
+		GroupMemoryBarrierWithGroupSync();
+
+		#if DEBUG_RAY_COUNT
+			float DebugRayCount = 0.0;
+		#endif
+		uint2 CompressedColor;
+
+		BRANCH
+		if (bTraceRay)
+		{
+			uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+			uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+	
+			float2 BufferUV;
+			float2 ScreenPos;
+			UpdateLane2DCoordinateInformations(PixelPosition, /* out */ BufferUV, /* out */ ScreenPos);
+	
+			uint2 RandomSeed = ComputeRandomSeed(PixelPosition);
+			float2 E = Hammersley16(RaySequenceId, CONFIG_RAY_COUNT, RandomSeed);		
+			float3 L = ComputeL(DecompressN(CompressedN), E);
+			
+			float StepOffset = InterleavedGradientNoise(PixelPosition + 0.5, View.StateFrameIndexMod8);
+	
+			#if !SSGI_TRACE_CONE
+				StepOffset -= 0.9;
+			#endif
+
+            bool bDebugPrint = all(PixelPosition == uint2(View.ViewSizeAndInvSize.xy) / 2);
+
+			FSSRTRay Ray = InitScreenSpaceRay(ScreenPos, DeviceZ, L);
+			
+			float Level;
+			float3 HitUVz;
+			bool bHit;
+
+			#if !CONFIG_SORT_RAYS
+			// Early out if the tile classification can detect this ray direction is not going to intersect anything.
+			bool bEarlyOut = TestRayEarlyReturn(TileInfos, Ray);
+			
+			BRANCH
+			if (bEarlyOut)
+			{
+				bHit = false;
+				Level = 0;
+				HitUVz = 0;
+			}
+			else
+			#endif
+			{
+				bHit = CastScreenSpaceRay(
+					FurthestHZBTexture, FurthestHZBTextureSampler,
+					Ray, 1, CONFIG_RAY_STEPS, StepOffset,
+					HZBUvFactorAndInvFactor, bDebugPrint,
+					/* out */ HitUVz,
+					/* out */ Level);
+				
+				#if DEBUG_RAY_COUNT
+					DebugRayCount += 1.0;
+				#endif
+			}
+
+			#if 0 // Backface check
+			if (bHit)
+			{
+				float3 SampleNormal = GetGBufferDataFromSceneTextures(HitUVz.xy).WorldNormal;
+				bHit = dot(SampleNormal, L) < 0;
+			}
+			#endif
+			
+			// if there was a hit
+			BRANCH
+			if (bHit)
+			{
+				float2 ReducedColorUV =  HitUVz.xy * ColorBufferScaleBias.xy + ColorBufferScaleBias.zw;
+				ReducedColorUV = min(ReducedColorUV, ReducedColorUVMax);
+
+				float4 SampleColor = ColorTexture.SampleLevel(ColorTextureSampler, ReducedColorUV, Level);
+				
+				float SampleColorWeight = 1.0;
+
+				// Backface modulation of hit surface
+				#if CONFIG_BACKFACE_MODULATION
+				{
+					float3 SampleNormal = GetGBufferDataFromSceneTextures(HitUVz.xy).WorldNormal;
+					
+					uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+					uint2 PixelPosition = ComputePixelPosition(GroupId, GroupPixelOffset);
+
+					uint2 RandomSeed = ComputeRandomSeed(PixelPosition);
+
+					float2 E = Hammersley16(RaySequenceId, CONFIG_RAY_COUNT, RandomSeed);
+		
+					float3 L = ComputeL(DecompressN(CompressedN), E);
+		
+					SampleColorWeight *= saturate( 1 - dot( SampleNormal, L ) );
+				}
+				#endif
+				
+				#if CONFIG_RAY_COUNT > 1
+					SampleColorWeight *= rcp( 1 + Luminance(SampleColor.rgb) );
+				#endif
+				
+				float3 DiffuseColor = SampleColor.rgb * SampleColorWeight;
+				float AmbientOcclusion = 1.0;
+				
+				#if CONFIG_COLOR_TILE_CLASSIFICATION
+				{
+					float Lumi = Luminance(DiffuseColor.rgb);
+					AmbientOcclusion *= saturate(Lumi / 0.25);
+				}
+				#endif
+
+				CompressedColor.x = asuint(f32tof16(DiffuseColor.r) << 16 | f32tof16(DiffuseColor.g));
+				CompressedColor.y = asuint(f32tof16(DiffuseColor.b) << 16 | f32tof16(AmbientOcclusion));
+			}
+			else
+			{
+				CompressedColor = uint2(0, 0);
+			}
+			
+		}
+		else if (!bTraceRay)
+        {
+            CompressedColor = uint2(0, 0);
+        }
+		
+		// Output debugging info instead of actual intersection.
+		#if DEBUG_RAY_COUNT
+		{
+			CompressedColor.x = asuint(f32tof16(DebugRayCount) << 16);
+			CompressedColor.y = 0;
+		}
+		#endif
+		
+		uint DestPos = GroupPixelId + RaySequenceId * TILE_PIXEL_COUNT;
+			
+		SharedMemory[LANE_PER_GROUPS * 0 | DestPos] = CompressedColor.x;
+		SharedMemory[LANE_PER_GROUPS * 1 | DestPos] = CompressedColor.y;
+    }
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	// Store ray to UAV
+	BRANCH
+	if (GroupThreadIndex < TILE_PIXEL_COUNT)
+	{
+		const uint GroupPixelId = GroupThreadIndex;
+	
+		float3 DiffuseColor = 0;
+		float AmbientOcclusion = 0;
+
+		UNROLL
+		for (uint RaySequenceId = 0; RaySequenceId < CONFIG_RAY_COUNT; RaySequenceId++)
+		{
+			uint SrcPos = GroupPixelId + RaySequenceId * TILE_PIXEL_COUNT;
+
+			uint Row0 = SharedMemory[LANE_PER_GROUPS * 0 | SrcPos];
+			uint Row1 = SharedMemory[LANE_PER_GROUPS * 1 | SrcPos];
+
+			DiffuseColor.r += f16tof32(Row0 >> 16);
+			DiffuseColor.g += f16tof32(Row0 >>  0);
+			DiffuseColor.b += f16tof32(Row1 >> 16);
+			AmbientOcclusion += f16tof32(Row1 >> 0);
+		}
+
+		#if CONFIG_RAY_COUNT > 1
+		{
+			DiffuseColor *= rcp(float(CONFIG_RAY_COUNT));
+			AmbientOcclusion *= rcp(float(CONFIG_RAY_COUNT));
+
+			DiffuseColor *= rcp( 1 - Luminance(DiffuseColor) );
+		}	
+		#endif
+
+		DiffuseColor *= View.IndirectLightingColorScale;
+
+		AmbientOcclusion = 1 - AmbientOcclusion;
+
+		//AmbientOcclusion = 1;
+
+		// Output.
+		{
+			uint2 GroupPixelOffset = DecodeGroupPixelOffset(GroupPixelId);
+			uint2 OutputPixelCoordinate = ComputePixelPosition(GroupId, GroupPixelOffset);
+
+			IndirectDiffuseOutput[OutputPixelCoordinate] = float4(DiffuseColor, 1.0);
+			AmbientOcclusionOutput[OutputPixelCoordinate] = AmbientOcclusion;
+			
+			//IndirectDiffuseOutput[OutputPixelCoordinate] = float4(TileInfos.Directionality[2] / PI, 0.0, 0.0, 0.0);
+		}
+	} // if (GroupThreadIndex < TILE_PIXEL_COUNT)
+} // MainCS()

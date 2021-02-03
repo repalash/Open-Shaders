@@ -1,0 +1,8 @@
+#version 120
+varying vec3 direction;
+attribute vec4 g3d_Vertex;
+
+void main() {
+    direction = g3d_Vertex.xyz;
+    gl_Position = gl_ModelViewProjectionMatrix * g3d_Vertex;
+}

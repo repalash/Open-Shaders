@@ -1,0 +1,139 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingTwoSidedFoliage.usf: Path tracing BRDF model for two-sided foliage material
+===============================================================================================*/
+
+#pragma once
+
+#include "PathTracingDefaultLit.ush"
+
+float3 TwoSidedFoliage_CalcTransmission(
+	float3 IncomingDirection,
+	FMaterialClosestHitPayload Payload
+)
+{
+	// Transmission throughput is governed by the amount of energy left after being reflected
+	float NoV = saturate(dot(-GetWorldNormal(Payload), IncomingDirection));
+	float3 Fresnel = F_Schlick(GetSpecularColor(Payload), NoV);
+	float3 DiffuseColor = GetDiffuseColor(Payload);
+	float3 ReflectedEnergy = Fresnel + DiffuseColor;
+	float3 Transmission = saturate(1.0 - ReflectedEnergy);
+	return Transmission;
+}
+
+float CalcTransmissionSelectionPdf(
+	float3 IncomingDirection,
+	FMaterialClosestHitPayload Payload
+)
+{
+	// TODO: Combined energy is reflected diffuse + transmitted diffuse..
+	float SubsurfaceLuminance = Luminance(GetSubsurfaceColor(Payload));
+	float DiffuseLuminance = Luminance(GetDiffuseColor(Payload));
+	//float DiffuseLuminance = Luminance(TwoSidedFoliage_CalcTransmission(IncomingDirection, Payload));
+
+	return SubsurfaceLuminance / (SubsurfaceLuminance + DiffuseLuminance);
+}
+
+float TwoSidedFoliage_PdfMaterial(
+	float3 IncomingDirection,
+	float3 OutgoingDirection,
+	FMaterialClosestHitPayload Payload
+)
+{
+	float TransmissionSelectionPdf = CalcTransmissionSelectionPdf(IncomingDirection, Payload);
+	float3 N = GetWorldNormal(Payload);
+	float3 L = OutgoingDirection;
+	float NoL = dot(N, L);
+	if (NoL < 0.0)
+	{
+		// Diffuse transmission
+		// TODO: Provide rough transmission as in ShadingModels.ush (Roughness = 0.6)
+		float LambertPdf = -NoL / PI;
+		return TransmissionSelectionPdf * LambertPdf;
+	}
+	else
+	{
+		// Default Lit
+		float Ior1 = 1.0;
+		return (1.0 - TransmissionSelectionPdf) * DefaultLit_PdfMaterial(IncomingDirection, OutgoingDirection, Payload, Ior1);
+	}
+}
+
+void TwoSidedFoliage_SampleMaterial(
+	float3 RayDirection,
+	FMaterialClosestHitPayload Payload,
+	float4 RandSample,
+	out float3 OutDirection,
+	out float3 OutThroughput,
+	out float OutPdf,
+	out float OutPositionBiasSign
+)
+{
+	float TransmissionSelectionPdf = CalcTransmissionSelectionPdf(RayDirection, Payload);
+	if (RandSample.x < TransmissionSelectionPdf)
+	{
+		RandSample.x /= TransmissionSelectionPdf;
+
+		float3 N = GetWorldNormal(Payload);
+		float V = -RayDirection;
+		float3 Transmission = TwoSidedFoliage_CalcTransmission(RayDirection, Payload);
+		float3 SubsurfaceColor = GetSubsurfaceColor(Payload);
+
+		// Diffuse transmission
+		// TODO: Provide rough transmission as in ShadingModels.ush (Roughness = 0.6)
+		float4 SampledValue = CosineSampleHemisphere(RandSample.yz);
+		OutDirection = TangentToWorld(SampledValue.xyz, -N);
+
+		float LambertPdf = SampledValue.w; // SampledValue.w = NoL / PI
+		float3 LambertThroughput = SubsurfaceColor * LambertPdf;
+		OutThroughput = Transmission * LambertThroughput;
+		OutPdf = TransmissionSelectionPdf * LambertPdf;
+
+		OutPositionBiasSign = -1.0;
+	}
+	else
+	{
+		RandSample.x -= TransmissionSelectionPdf;
+		RandSample.x /= (1.0 - TransmissionSelectionPdf);
+
+		float Ior1 = 1.0;
+		DefaultLit_SampleMaterial(RayDirection, Payload, Ior1, RandSample, OutDirection, OutThroughput, OutPdf);
+		OutPdf *= 1.0 - TransmissionSelectionPdf;
+		OutPositionBiasSign = 1.0;
+	}
+}
+
+void TwoSidedFoliage_EvalMaterial(
+	float3 IncomingDirection,
+	float3 OutgoingDirection,
+	FMaterialClosestHitPayload Payload,
+	out float3 OutThroughput,
+	out float OutPdf
+)
+{
+	float TransmissionSelectionPdf = CalcTransmissionSelectionPdf(IncomingDirection, Payload);
+
+	float3 N = GetWorldNormal(Payload);
+	float NoL = dot(N, OutgoingDirection);
+	if (NoL < 0.0)
+	{
+		// Diffuse transmission
+		// TODO: Provide rough transmission as in ShadingModels.ush (Roughness = 0.6)
+		NoL = -NoL;
+
+		float3 Transmission = TwoSidedFoliage_CalcTransmission(IncomingDirection, Payload);
+		float3 SubsurfaceColor = GetSubsurfaceColor(Payload);
+
+		float LambertPdf = NoL / PI;
+		float3 LambertThroughput = SubsurfaceColor * LambertPdf;
+		OutThroughput = Transmission * LambertThroughput;
+		OutPdf = TransmissionSelectionPdf * LambertPdf;
+	}
+	else
+	{
+		float Ior1 = 1.0;
+		DefaultLit_EvalMaterial(IncomingDirection, OutgoingDirection, Payload, Ior1, OutThroughput, OutPdf);
+		OutPdf *= 1.0 - TransmissionSelectionPdf;
+	}
+}

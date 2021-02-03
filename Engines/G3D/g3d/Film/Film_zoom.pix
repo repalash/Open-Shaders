@@ -1,0 +1,24 @@
+#version 330
+/**
+  \file data-files/shader/Film/Film_zoom.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+
+uniform sampler2D  source;
+uniform int2       offset;
+uniform vec2       dstOffset;
+uniform int        scale;
+
+// For inverting the y-axis
+uniform int        yOffset, ySign;
+
+out vec4 result;
+
+void main(void) {
+    result = texelFetch(source, int2(gl_FragCoord.x - dstOffset.x, yOffset + (ySign * gl_FragCoord.y - dstOffset.y)) / scale + offset, 0);
+}

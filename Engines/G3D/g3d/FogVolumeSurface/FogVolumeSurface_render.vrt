@@ -1,0 +1,19 @@
+#version 410
+/**
+  \file data-files/shader/FogVolumeSurface/FogVolumeSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+// This is a full-screen quad
+
+in vec4 g3d_Vertex;
+
+//uniform mat4 g3d_ObjectToScreenMatrixTranspose;
+
+void main() {
+    gl_Position = g3d_Vertex * g3d_ObjectToScreenMatrixTranspose;
+}

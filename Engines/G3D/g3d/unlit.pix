@@ -1,0 +1,41 @@
+#version 410 or 460
+/**
+  \file data-files/shader/unlit.pix
+
+  Apply a color and texture.
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+#include <compatibility.glsl>
+#include <g3dmath.glsl>
+#expect HAS_TEXTURE "1 or 0"
+
+uniform vec4      color;
+#if HAS_TEXTURE
+    in vec2      texCoord;
+    uniform sampler2D textureMap;
+    uniform float gammaAdjust;
+#endif
+
+in vec3 csPosition;
+
+#ifdef WRITE_PIXEL_FILENAME
+#   include WRITE_PIXEL_FILENAME
+#else
+    out float4 _result; void writePixel(Radiance3 premultipliedReflectionAndEmission, float coverage, Color3 transmissionCoefficient, float smoothness, float etaRatio, Point3 csPosition, Vector3 csNormal) { _result = vec4(premultipliedReflectionAndEmission, coverage); }
+#endif
+
+void main(void) {
+#   if HAS_TEXTURE
+        vec4 tex = texture(textureMap, texCoord);
+        tex.rgb = pow(tex.rgb, vec3(gammaAdjust));
+#   else
+        const vec4 tex = vec4(1.0);
+#   endif
+    vec4 r = tex * color;
+
+    writePixel(r.rgb * r.a, r.a, vec3(0), 1, 1, csPosition, vec3(0, 0, 1));
+}

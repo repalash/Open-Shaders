@@ -1,0 +1,15 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+struct FDeepShadowViewInfo
+{
+	float4x4 WorldToClip;
+	float3   ViewForward;
+	float    MinRadiusAtDepth1;
+};
+
+struct FDeepShadowTransform
+{
+	float4x4 WorldToClip; // Store the transform into a struct to avoid the matrix to be loaded as transposed
+};

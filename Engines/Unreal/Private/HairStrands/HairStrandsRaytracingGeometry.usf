@@ -1,0 +1,124 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush" 
+
+uint VertexCount;
+uint DispatchCountX;
+
+float3 StrandHairWorldOffset;
+float StrandHairRadius;
+
+Buffer<uint4> 	 PositionBuffer;
+RWBuffer<float4> OutputPositionBuffer;
+
+#if PERMUTATION_GROUP_SIZE == 0
+	#define GROUP_SIZE 64
+#elif PERMUTATION_GROUP_SIZE == 1
+	#define GROUP_SIZE 32
+#else
+	#error Unknown group size	
+#endif
+
+
+struct FControlPoint
+{
+	float3 Position;
+	float PointType;
+	float WorldRadius;
+};
+
+FControlPoint GetControlPoint(uint Index)
+{
+	FControlPoint Out = (FControlPoint)0;
+
+	if (Index < VertexCount)
+	{
+		const uint4 PackedData = PositionBuffer[Index];
+		const uint PackedAlpha = asuint(PackedData.a);
+
+		Out.Position 	= f16tof32(PackedData.xyz) + StrandHairWorldOffset;
+		Out.PointType 	= PackedAlpha & 0x3;
+		Out.WorldRadius	= StrandHairRadius * float((PackedAlpha & 0x00FC) >> 2) / 63.0f;
+	}
+
+	return Out;
+}
+
+
+float4 PackNormal(float3 V, uint A)
+{
+	return float4(clamp(V,float(-1).xxx,float(1).xxx), 1.0f);
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void MainCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int IndexCurr = DispatchThreadId.x + DispatchThreadId.y * DispatchCountX * GROUP_SIZE;
+	const int MaxVertexCount = int(VertexCount);
+	const uint BaseOutIndex = IndexCurr*12;
+
+	FControlPoint P0 = GetControlPoint(IndexCurr);
+
+	// Point at the end of a strand is filled with invalid position. The positions/triangle are 
+	// ignored by DXR during BVH building
+	if (P0.PointType == 2)
+	{
+		const float NaN = sqrt(-1);
+		const float4 InvalidPoint = float4(NaN, NaN, NaN, NaN);
+
+		OutputPositionBuffer[BaseOutIndex  ]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+1]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+2]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+3]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+4]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+5]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+6]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+7]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+8]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+9]  = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+10] = InvalidPoint;
+		OutputPositionBuffer[BaseOutIndex+11] = InvalidPoint;
+		return;
+	}
+
+	FControlPoint P1 = GetControlPoint(IndexCurr+1);
+
+	const float3 Tangent = normalize(P1.Position - P0.Position);
+	float3 B = float3(0,0,-1);
+	if (abs(dot(Tangent,B)) > 0.95f)
+	{
+		B = float3(0,1,0);
+	}	
+	float3 N = normalize(cross(Tangent, B));
+	B = normalize(cross(N, Tangent));
+
+	{
+		const float3 P00 = P0.Position - N * P0.WorldRadius;
+		const float3 P01 = P0.Position + N * P0.WorldRadius;
+		const float3 P10 = P1.Position - N * P1.WorldRadius;
+		const float3 P11 = P1.Position + N * P1.WorldRadius;
+		
+		OutputPositionBuffer[BaseOutIndex  ] = float4(P00, 1);
+		OutputPositionBuffer[BaseOutIndex+1] = float4(P01, 1);
+		OutputPositionBuffer[BaseOutIndex+2] = float4(P11, 1);
+
+		OutputPositionBuffer[BaseOutIndex+3] = float4(P00, 1);
+		OutputPositionBuffer[BaseOutIndex+4] = float4(P11, 1);
+		OutputPositionBuffer[BaseOutIndex+5] = float4(P10, 1);
+	}
+	
+	{
+		const float3 P00 = P0.Position - B * P0.WorldRadius;
+		const float3 P01 = P0.Position + B * P0.WorldRadius;
+		const float3 P10 = P1.Position - B * P1.WorldRadius;
+		const float3 P11 = P1.Position + B * P1.WorldRadius;
+
+		OutputPositionBuffer[BaseOutIndex+6] = float4(P00, 1);
+		OutputPositionBuffer[BaseOutIndex+7] = float4(P01, 1);
+		OutputPositionBuffer[BaseOutIndex+8] = float4(P11, 1);
+
+		OutputPositionBuffer[BaseOutIndex+9]  = float4(P00, 1);
+		OutputPositionBuffer[BaseOutIndex+10] = float4(P11, 1);
+		OutputPositionBuffer[BaseOutIndex+11] = float4(P10, 1);
+	}
+}

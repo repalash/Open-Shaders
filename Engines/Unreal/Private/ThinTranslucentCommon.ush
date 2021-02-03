@@ -1,0 +1,78 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "ShadingCommon.ush"
+
+#pragma once
+
+#define THIN_TRANSLUCENT_USE_DOTNV_THICKNESS 1
+
+#define THIN_TRANSLUCENT_ACCURATE_FRESNEL 1
+
+#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
+void AccumulateThinTranslucentModel(inout float3 DualBlendColorAdd,
+								inout float3 DualBlendColorMul,
+								FMaterialPixelParameters MaterialParams,
+								FGBufferData GBuffer,
+								float3 DiffuseColor,
+								float3 SpecularColor,
+								float3 EmissiveColor,
+								float TopMaterialCoverage)
+{
+	const float3 N = MaterialParams.WorldNormal;
+	const float3 V = MaterialParams.CameraVector;
+
+	const float NoV = saturate( abs( dot(N, V) ) + 1e-5 );
+
+	// how much to multiply the background color by
+	float3 Transmittance = float3(1.0,1.0,1.0);
+
+	// how much to add for foreground color
+	float3 SurfaceColor = float3(0.0f,0.0f,0.0f);
+
+	float3 TransmittanceColor = GetThinTranslucentMaterialOutput0(MaterialParams);
+	
+	// color is for normalized thickness
+#if THIN_TRANSLUCENT_USE_DOTNV_THICKNESS
+	float PathLength = 1.0f/NoV;
+#else
+	float PathLength = 1.0f;
+#endif	
+	float3 NegativeAbsorptionCoefficient = log(TransmittanceColor);
+	float3 ColorTopMaterialCoverage = exp(NegativeAbsorptionCoefficient * PathLength);
+
+	// Light goes from background -> solid surface -> camera, and we need fresnel at both interactions.
+	const float3 FresnelRatio = F_Schlick(GBuffer.SpecularColor, NoV);
+
+	// FresnelRatio light is reflected back into the background, and the rest refracts into the surface.
+	Transmittance = Transmittance * (1-FresnelRatio);
+
+	// Light gets lost from absorption through the surface
+	Transmittance = Transmittance * ColorTopMaterialCoverage;
+
+	// Exiting the surface, FresnelRatio light is reflected back into the surface, and the rest refracts out of the surface.
+#if THIN_TRANSLUCENT_ACCURATE_FRESNEL
+	// Accurate calculation
+	const float F0 = dot(float3(1.0f,1.0f,1.0f)/3.0f,GBuffer.SpecularColor.rgb); // air to glass F0
+	const float NIor = DielectricF0ToIor(F0);
+	const float ReverseNIor = 1.0/NIor; // glass to air IOR
+	const float ReverseF0 = DielectricIorToF0(ReverseNIor); // glass to air F0
+	const float3 ReverseFresnelRatio = F_Schlick(ReverseF0, NoV);
+	Transmittance = Transmittance * (1-ReverseFresnelRatio);
+#else
+	// Approximation, assumes same amount refracts from air->material as material->air.
+	Transmittance = Transmittance * (1-FresnelRatio);
+#endif
+	// We are treating the BaseColor and Emissive color as a layer on top of the absorbing media, but below specular layer.
+	float3 DefaultLitColor = DiffuseColor + EmissiveColor;
+
+	SurfaceColor += DefaultLitColor * TopMaterialCoverage;
+	Transmittance *= (1.0f - TopMaterialCoverage);
+
+	SurfaceColor += SpecularColor;
+
+	DualBlendColorAdd = SurfaceColor;
+	DualBlendColorMul = Transmittance;
+}
+#endif
+
+

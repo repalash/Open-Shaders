@@ -1,0 +1,392 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ReflectionEnvironmentComputeShaders - functionality to apply local cubemaps.
+=============================================================================*/
+  
+#include "Common.ush"
+#include "DeferredShadingCommon.ush"  
+#include "BRDF.ush"
+#include "ReflectionEnvironmentShared.ush"
+#include "SkyLightingShared.ush"
+#include "DistanceFieldAOShared.ush"
+#include "ShadingModels.ush"
+#include "LightGridCommon.ush"
+#include "SceneTextureParameters.ush"
+
+#define REFLECTION_COMPOSITE_USE_BLENDED_REFLECTION_CAPTURES 1
+#define REFLECTION_COMPOSITE_SUPPORT_SKYLIGHT_BLEND 1
+#include "ReflectionEnvironmentComposite.ush"
+
+float3 GatherRadiance(float CompositeAlpha, float3 WorldPosition, float3 RayDirection, float Roughness, float3 BentNormal, float IndirectIrradiance, uint ShadingModelID, uint NumCulledReflectionCaptures, uint CaptureDataStartIndex)
+{
+	// Indirect occlusion from DFAO, which should be applied to reflection captures and skylight specular, but not SSR
+	float IndirectSpecularOcclusion = 1.0f;
+	float3 ExtraIndirectSpecular = 0;
+
+#if SUPPORT_DFAO_INDIRECT_OCCLUSION
+	float IndirectDiffuseOcclusion;
+	GetDistanceFieldAOSpecularOcclusion(BentNormal, RayDirection, Roughness, ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE, IndirectSpecularOcclusion, IndirectDiffuseOcclusion, ExtraIndirectSpecular);
+	// Apply DFAO to IndirectIrradiance before mixing with indirect specular
+	IndirectIrradiance *= IndirectDiffuseOcclusion;
+#endif
+
+	const bool bCompositeSkylight = true;
+	return CompositeReflectionCapturesAndSkylight(
+		CompositeAlpha, 
+		WorldPosition, 
+		RayDirection, 
+		Roughness, 
+		IndirectIrradiance, 
+		IndirectSpecularOcclusion, 
+		ExtraIndirectSpecular, 
+		NumCulledReflectionCaptures, 
+		CaptureDataStartIndex, 
+		0,
+		bCompositeSkylight);
+}
+
+
+Texture2D ScreenSpaceReflectionsTexture;
+SamplerState ScreenSpaceReflectionsSampler;
+
+#if ENABLE_DYNAMIC_SKY_LIGHT
+#include "VolumetricCloudCommon.ush"
+Texture2D<float3> CloudSkyAOTexture;
+SamplerState CloudSkyAOSampler;
+float4x4 CloudSkyAOWorldToLightClipMatrix;
+float CloudSkyAOFarDepthKm;
+int CloudSkyAOEnabled;
+#endif
+
+Texture2D AmbientOcclusionTexture;
+SamplerState AmbientOcclusionSampler;
+
+
+float3 ContrastAndNormalizeMulAdd;
+float OcclusionExponent;
+float OcclusionCombineMode;
+
+void RemapClearCoatDiffuseAndSpecularColor(FGBufferData GBuffer, float2 ScreenPosition, inout float3 DiffuseColor, inout float3 SpecularColor)
+{
+	if (GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT)
+	{
+		// Attenuate base color and recompute diffuse color
+		float3 WorldPosition = mul(float4(ScreenPosition * GBuffer.Depth, GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+		float3 CameraToPixel = normalize(WorldPosition - View.WorldCameraOrigin);
+		float3 V = -CameraToPixel;
+		float NoV = saturate(dot(GBuffer.WorldNormal, V));
+		float RefractionScale = ((NoV * 0.5 + 0.5) * NoV - 1) * saturate(1.25 - 1.25 * GBuffer.Roughness) + 1;
+
+		float MetalSpec = 0.9;
+		float3 AbsorptionColor = GBuffer.BaseColor * (1 / MetalSpec);
+		float3 Absorption = AbsorptionColor * ((NoV - 1) * 0.85 * (1 - lerp(AbsorptionColor, Square(AbsorptionColor), -0.78)) + 1);
+
+		float F0 = 0.04;
+		float Fc = Pow5(1 - NoV);
+		float F = Fc + (1 - Fc) * F0;
+		float ClearCoat = GBuffer.CustomData.x;
+		float LayerAttenuation = lerp(1, (1 - F), ClearCoat);
+
+		float3 BaseColor = lerp(GBuffer.BaseColor * LayerAttenuation, MetalSpec * Absorption * RefractionScale, GBuffer.Metallic * ClearCoat);
+		//BaseColor += Dither / 255.f;
+		DiffuseColor = BaseColor - BaseColor * GBuffer.Metallic;
+
+		float Specular = lerp(GBuffer.Specular, RefractionScale, ClearCoat);
+		SpecularColor = ComputeF0(Specular, BaseColor, GBuffer.Metallic);
+	}
+}
+
+float3 SkyLightDiffuse(FGBufferData GBuffer, float AmbientOcclusion, float2 BufferUV, float2 ScreenPosition, float3 BentNormal, float3 DiffuseColor)
+{
+	float2 UV = BufferUV;
+	float3 Lighting = 0;
+
+	float SkyVisibility = 1;
+	float DotProductFactor = 1;
+	float3 SkyLightingNormal = GBuffer.WorldNormal;
+	BRANCH if( GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT && CLEAR_COAT_BOTTOM_NORMAL)
+	{
+		const float2 oct1 = ((float2(GBuffer.CustomData.a, GBuffer.CustomData.z) * 2) - (256.0/255.0)) + UnitVectorToOctahedron(GBuffer.WorldNormal);
+		SkyLightingNormal = OctahedronToUnitVector(oct1);			
+	}
+	
+#if APPLY_SKY_SHADOWING
+#define USE_DIRECTIONAL_OCCLUSION_ON_SKY_DIFFUSE 1
+
+#if USE_DIRECTIONAL_OCCLUSION_ON_SKY_DIFFUSE
+	{
+		SkyVisibility = length(BentNormal);
+		float3 NormalizedBentNormal = BentNormal / (max(SkyVisibility, .00001f));
+
+		// Use more bent normal in corners
+		float BentNormalWeightFactor = SkyVisibility;
+
+		SkyLightingNormal = lerp(NormalizedBentNormal, GBuffer.WorldNormal, BentNormalWeightFactor);
+		DotProductFactor = lerp(dot(NormalizedBentNormal, GBuffer.WorldNormal), 1, BentNormalWeightFactor);
+	}
+#else
+	{
+		SkyVisibility = length(BentNormal);
+	}
+#endif
+
+	float ContrastCurve = 1 / (1 + exp(-ContrastAndNormalizeMulAdd.x * (SkyVisibility * 10 - 5)));
+	SkyVisibility = saturate(ContrastCurve * ContrastAndNormalizeMulAdd.y + ContrastAndNormalizeMulAdd.z);
+
+#endif
+
+	// Apply DFAO controls
+	SkyVisibility = pow(SkyVisibility, OcclusionExponent);
+	SkyVisibility = lerp(SkyVisibility, 1, OcclusionTintAndMinOcclusion.w);
+
+	// Combine with other AO sources
+	if (OcclusionCombineMode == 0)
+	{
+		// Combine with min which nicely avoids over-occlusion in cases where strong DFAO is present along with strong SSAO (distant trees)
+		SkyVisibility = min(SkyVisibility, min(GBuffer.GBufferAO, AmbientOcclusion));
+	}
+	else
+	{
+		// Combine with mul, which continues to add SSAO depth even indoors.  SSAO will need to be tweaked to be less strong.
+		SkyVisibility = SkyVisibility * min(GBuffer.GBufferAO, AmbientOcclusion);
+	}
+
+	float ScalarFactors = SkyVisibility;
+
+	BRANCH
+	if (GBuffer.ShadingModelID == SHADINGMODELID_TWOSIDED_FOLIAGE)
+	{
+		float3 SubsurfaceLookup = GetSkySHDiffuse(-GBuffer.WorldNormal) * View.SkyLightColor.rgb;
+		float3 SubsurfaceColor = ExtractSubsurfaceColor(GBuffer);
+		Lighting += ScalarFactors * SubsurfaceLookup * SubsurfaceColor;
+	}
+
+	if (GBuffer.ShadingModelID == SHADINGMODELID_SUBSURFACE || GBuffer.ShadingModelID == SHADINGMODELID_PREINTEGRATED_SKIN)
+	{
+		float3 SubsurfaceColor = ExtractSubsurfaceColor(GBuffer);
+		// Add subsurface energy to diffuse
+		DiffuseColor += SubsurfaceColor;
+	}
+
+	BRANCH
+	if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+	{
+		float3 N = GBuffer.WorldNormal;
+		float3 V = -normalize(mul(float4(ScreenPosition, 1, 0), View.ScreenToWorld).xyz);
+		float3 L = normalize(V - N * dot(V, N));
+		SkyLightingNormal = L;
+		FHairTransmittanceData TransmittanceData = InitHairTransmittanceData(true);
+		DiffuseColor = PI * HairShading(GBuffer, L, V, N, 1, TransmittanceData, 0, 0.2, uint2(0, 0));
+	}
+
+	if (GBuffer.ShadingModelID == SHADINGMODELID_CLOTH)
+	{
+		float3 ClothFuzz = ExtractSubsurfaceColor(GBuffer);
+		DiffuseColor += ClothFuzz * GBuffer.CustomData.a;
+	}
+
+	// Compute the preconvolved incoming lighting with the bent normal direction
+	float3 DiffuseLookup = GetSkySHDiffuse(SkyLightingNormal) * View.SkyLightColor.rgb;
+
+	// Apply AO to the sky diffuse and account for darkening due to the geometry term
+	// apply the Diffuse color to the lighting (including OcclusionTintAndMinOcclusion as it's considered another light, that fixes SubsurfaceProfile being too dark)
+	Lighting += ((ScalarFactors * DotProductFactor) * DiffuseLookup + (1 - SkyVisibility) * OcclusionTintAndMinOcclusion.xyz) * DiffuseColor;
+
+#if USE_PREEXPOSURE
+	Lighting *= View.PreExposure;
+#endif
+
+	//Lighting = (Texture2DSampleLevel(BentNormalAOTexture, BentNormalAOSampler, UV, 0).xyz);
+
+	return Lighting;
+}
+
+float3 ReflectionEnvironment(FGBufferData GBuffer, float AmbientOcclusion, float2 BufferUV, float2 ScreenPosition, float4 SvPosition, float3 BentNormal, float3 SpecularColor)
+{
+#if USE_PREEXPOSURE
+	const float PreExposure = View.PreExposure;
+#else
+	const float PreExposure = 1.f;
+#endif
+	
+	float4 Color = float4(0, 0, 0, 1);
+
+	float3 WorldPosition = mul(float4(ScreenPosition * GBuffer.Depth, GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+	float3 CameraToPixel = normalize(WorldPosition - View.WorldCameraOrigin);
+	float3 ReflectionVector = reflect(CameraToPixel, GBuffer.WorldNormal);
+	float IndirectIrradiance = GBuffer.IndirectIrradiance;
+	
+#if ENABLE_SKY_LIGHT && ALLOW_STATIC_LIGHTING
+	BRANCH
+	// Add in diffuse contribution from dynamic skylights so reflection captures will have something to mix with
+	if (ReflectionStruct.SkyLightParameters.y > 0 && ReflectionStruct.SkyLightParameters.z > 0)
+	{
+		IndirectIrradiance += GetDynamicSkyIndirectIrradiance(BentNormal, GBuffer.WorldNormal);
+	}
+#endif
+
+	float3 N = GBuffer.WorldNormal;
+	float3 V = -CameraToPixel;
+
+	ModifyGGXAnisotropicNormalRoughness(GBuffer.WorldTangent, GBuffer.Anisotropy, GBuffer.Roughness, N, V);
+
+	float3 R = 2 * dot( V, N ) * N - V;
+	float NoV = saturate( dot( N, V ) );
+
+	// Point lobe in off-specular peak direction
+	R = GetOffSpecularPeakReflectionDir(N, R, GBuffer.Roughness);
+
+#if 1
+	// Note: this texture may also contain planar reflections
+	float4 SSR = Texture2DSample(ScreenSpaceReflectionsTexture, ScreenSpaceReflectionsSampler, BufferUV);
+	Color.rgb = SSR.rgb;
+	Color.a = 1 - SSR.a;
+#endif
+
+#if RAY_TRACED_REFLECTIONS
+	float4 SavedColor = Color;	// When a clear coat material is encountered, we save the reflection buffer color for it to not be affected by operations.
+#endif
+	if(GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT )
+	{
+#if RAY_TRACED_REFLECTIONS
+		Color = float4(0, 0, 0, 1); // Clear coat reflection is expected to be computed on a black background
+#endif
+		const float ClearCoat = GBuffer.CustomData.x;
+		Color = lerp( Color, float4(0,0,0,1), ClearCoat );
+
+#if CLEAR_COAT_BOTTOM_NORMAL
+		const float2 oct1 = ((float2(GBuffer.CustomData.a, GBuffer.CustomData.z) * 2) - (256.0/255.0)) + UnitVectorToOctahedron(GBuffer.WorldNormal);
+		const float3 ClearCoatUnderNormal = OctahedronToUnitVector(oct1);
+
+		const float3 BottomEffectiveNormal = ClearCoatUnderNormal;			
+		R = 2 * dot( V, ClearCoatUnderNormal ) * ClearCoatUnderNormal - V;
+#endif
+	}
+
+	float AO = GBuffer.GBufferAO * AmbientOcclusion;
+	float RoughnessSq = GBuffer.Roughness * GBuffer.Roughness;
+	float SpecularOcclusion = GetSpecularOcclusion(NoV, RoughnessSq, AO);
+	Color.a *= SpecularOcclusion;
+
+#if FEATURE_LEVEL >= FEATURE_LEVEL_SM5
+	float2 LocalPosition = SvPosition.xy - View.ViewRectMin.xy;
+
+	uint GridIndex = ComputeLightGridCellIndex(uint2(LocalPosition.x, LocalPosition.y), GBuffer.Depth);
+	uint NumCulledEntryIndex = (ForwardLightData.NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE;
+	uint NumCulledReflectionCaptures = min(ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 0], ForwardLightData.NumReflectionCaptures);
+	uint DataStartIndex = ForwardLightData.NumCulledLightsGrid[NumCulledEntryIndex + 1];
+#else
+	uint DataStartIndex = 0;
+	uint NumCulledReflectionCaptures = 0;
+#endif
+
+	//Top of regular reflection or bottom layer of clear coat.
+	Color.rgb += PreExposure * GatherRadiance(Color.a, WorldPosition, R, GBuffer.Roughness, BentNormal, IndirectIrradiance, GBuffer.ShadingModelID, NumCulledReflectionCaptures, DataStartIndex);
+
+	BRANCH
+	if( GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT)
+	{
+		const float ClearCoat			= GBuffer.CustomData.x;
+		const float ClearCoatRoughness	= GBuffer.CustomData.y;
+
+		// TODO EnvBRDF should have a mask param
+		float2 AB = PreIntegratedGF.SampleLevel( PreIntegratedGFSampler, float2( NoV, GBuffer.Roughness ), 0 ).rg;
+		Color.rgb *= SpecularColor * AB.x + AB.y * saturate( 50 * SpecularColor.g ) * (1 - ClearCoat);
+		
+		// F_Schlick
+		float F = EnvBRDF( 0.04, ClearCoatRoughness, NoV ).x;
+		
+		F *= ClearCoat;
+			
+		float LayerAttenuation = (1 - F);		
+		Color.rgb *= LayerAttenuation;
+		Color.a = F;
+		
+#if !RAY_TRACED_REFLECTIONS	
+		Color.rgb += SSR.rgb * F;
+		Color.a *= 1 - SSR.a;
+#endif
+			
+		Color.a *= SpecularOcclusion;
+
+		float3 TopLayerR = 2 * dot( V, N ) * N - V;
+		Color.rgb += PreExposure * GatherRadiance(Color.a, WorldPosition, TopLayerR, ClearCoatRoughness, BentNormal, IndirectIrradiance, GBuffer.ShadingModelID, NumCulledReflectionCaptures, DataStartIndex);
+
+	#if RAY_TRACED_REFLECTIONS
+		Color.rgb = SavedColor.rgb +  Color.rgb * SavedColor.a; // Compose default clear coat reflection over regular refelction (using Premultiplied alpha where SaveColor.a=transmittance)
+	#endif
+	}
+	else
+	{
+		Color.rgb *= EnvBRDF( SpecularColor, GBuffer.Roughness, NoV );
+	}
+
+	// Transform NaNs to black, transform negative colors to black.
+	return -min(-Color.rgb, 0.0);
+}
+
+void ReflectionEnvironmentSkyLighting(
+	in float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 BufferUV = SvPositionToBufferUV(SvPosition);
+	float2 ScreenPosition = SvPositionToScreenPosition(SvPosition).xy;
+
+	// Sample scene textures.
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	float3 SpecularColor = GBuffer.SpecularColor;
+	RemapClearCoatDiffuseAndSpecularColor(GBuffer, ScreenPosition, DiffuseColor, SpecularColor);
+
+	// Sample the ambient occlusion that is dynamically generated every frame.
+	float AmbientOcclusion = AmbientOcclusionTexture.SampleLevel(AmbientOcclusionSampler, BufferUV, 0).r;
+	
+	uint ShadingModelID = GBuffer.ShadingModelID;
+	float3 BentNormal = GBuffer.WorldNormal;
+	#if APPLY_SKY_SHADOWING
+	{
+		BentNormal = UpsampleDFAO(BufferUV, GBuffer.Depth, GBuffer.WorldNormal);
+	}
+	#endif
+	
+	OutColor = 0.0f;
+
+	#if ENABLE_DYNAMIC_SKY_LIGHT
+	BRANCH
+	// Only light pixels marked as lit
+	if (ShadingModelID != SHADINGMODELID_UNLIT)
+	{
+		float CloudAmbientOcclusion = 1.0f;
+		// Ideally we would compute spatially how much of the sky+cloud is visible for each point in the world. But we evaluate the sky light only once at the sky light component position as of today.
+		// To add some spatial variation, we can affect the sky light diffuse contribution according to cloud occlusion from above.
+		// This is an approximation because clouds are also occluding the sky in the sky light capture (a bit of a double contribution then). but it does help by adding spatially varying details.
+#if 0	// DISABLED for now because it has artefact with specular not being affected (and thus looking too bright which can be confusing for users).
+		if (CloudSkyAOEnabled)
+		{
+			float3 WorldPosition = mul(float4(ScreenPosition * GBuffer.Depth, GBuffer.Depth, 1), View.ScreenToWorld).xyz;
+			float OutOpticalDepth = 0.0f;
+			CloudAmbientOcclusion = GetCloudVolumetricShadow(WorldPosition, CloudSkyAOWorldToLightClipMatrix, CloudSkyAOFarDepthKm, CloudSkyAOTexture, CloudSkyAOSampler, OutOpticalDepth);
+		}
+#endif
+
+		float3 SkyLighting = SkyLightDiffuse(GBuffer, AmbientOcclusion, BufferUV, ScreenPosition, BentNormal, DiffuseColor) * CloudAmbientOcclusion;
+
+		// Scene color alpha is used for ScreenSpaceSubsurfaceScattering (if that is not needed it can be disabled with SUBSURFACE_CHANNEL_MODE)
+		FLightAccumulator LightAccumulator = (FLightAccumulator)0;
+
+		const bool bNeedsSeparateSubsurfaceLightAccumulation = UseSubsurfaceProfile(ShadingModelID);
+
+		LightAccumulator_Add(LightAccumulator, SkyLighting, SkyLighting, 1.0f, bNeedsSeparateSubsurfaceLightAccumulation);
+		OutColor = LightAccumulator_GetResult(LightAccumulator);
+	}
+	#endif
+
+	BRANCH
+	if (ShadingModelID != SHADINGMODELID_UNLIT && ShadingModelID != SHADINGMODELID_HAIR)
+	{
+		OutColor.xyz += ReflectionEnvironment(GBuffer, AmbientOcclusion, BufferUV, ScreenPosition, SvPosition, BentNormal, SpecularColor);
+	}
+}
+

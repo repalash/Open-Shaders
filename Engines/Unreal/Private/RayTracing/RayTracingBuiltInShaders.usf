@@ -1,0 +1,122 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#ifdef OVERRIDE_RAYTRACINGBUILTINSHADERS_USH
+#include "/Platform/Private/RayTracingBuiltInShaders.usf"
+#else // OVERRIDE_RAYTRACINGBUILTINSHADERS_USH
+
+#include "../Common.ush"
+#include "RayTracingCommon.ush"
+
+#define RT_CONCATENATE2(a, b) a##b
+#define RT_CONCATENATE(a, b) RT_CONCATENATE2(a, b)
+#define RT_REGISTER(InType, InIndex, InSpace) register(RT_CONCATENATE(InType, InIndex), RT_CONCATENATE(space, InSpace))
+
+RaytracingAccelerationStructure               TLAS               : RT_REGISTER(t, 0, RAY_TRACING_REGISTER_SPACE_GLOBAL);
+StructuredBuffer<FBasicRayData>               Rays               : RT_REGISTER(t, 1, RAY_TRACING_REGISTER_SPACE_GLOBAL);
+RWStructuredBuffer<uint>                      OcclusionOutput    : RT_REGISTER(u, 0, RAY_TRACING_REGISTER_SPACE_GLOBAL);
+RWStructuredBuffer<FIntersectionPayload>      IntersectionOutput : RT_REGISTER(u, 1, RAY_TRACING_REGISTER_SPACE_GLOBAL);
+
+#undef RT_REGISTER
+#undef RT_CONCATENATE
+#undef RT_CONCATENATE2
+
+RAY_TRACING_ENTRY_RAYGEN(OcclusionMainRG)
+{
+	const uint RayIndex = DispatchRaysIndex().x;
+	FBasicRayData InputRay = Rays[RayIndex];
+
+	RayDesc Ray;
+	Ray.Origin = InputRay.Origin;
+	Ray.Direction = InputRay.Direction;
+	Ray.TMin = 0.0f;
+	Ray.TMax = InputRay.TFar;
+
+	uint RayFlags = 0
+	              | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH // terminate immediately upon detecting primitive intersection
+	              | RAY_FLAG_FORCE_OPAQUE                    // don't run anyhit shader
+	              | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;        // don't run closesthit shader
+	const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+	FDefaultPayload Payload = (FDefaultPayload)0;
+
+	TraceRay(
+		TLAS,   // AccelerationStructure
+		RayFlags,
+		InstanceInclusionMask,
+		RAY_TRACING_SHADER_SLOT_MATERIAL, // RayContributionToHitGroupIndex
+		RAY_TRACING_NUM_SHADER_SLOTS,     // MultiplierForGeometryContributionToShaderIndex
+		0,      // MissShaderIndex
+		Ray,    // RayDesc
+		Payload // Payload
+	);
+
+	OcclusionOutput[RayIndex] = Payload.IsHit() ? ~0 : 0;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(IntersectionMainRG)
+{
+	const uint RayIndex = DispatchRaysIndex().x;
+	FBasicRayData InputRay = Rays[RayIndex];
+
+	RayDesc Ray;
+	Ray.Origin = InputRay.Origin;
+	Ray.Direction = InputRay.Direction;
+	Ray.TMin = 0.0f;
+	Ray.TMax = InputRay.TFar;
+
+	uint RayFlags = RAY_FLAG_FORCE_OPAQUE; // don't run anyhit shader
+
+	FDefaultPayload Payload = (FDefaultPayload)0;
+
+	TraceRay(
+		TLAS,   // AccelerationStructure
+		RayFlags,
+		RAY_TRACING_MASK_OPAQUE,          // InstanceInclusionMask
+		RAY_TRACING_SHADER_SLOT_MATERIAL, // RayContributionToHitGroupIndex
+		RAY_TRACING_NUM_SHADER_SLOTS,     // MultiplierForGeometryContributionToShaderIndex
+		0,      // MissShaderIndex
+		Ray,    // RayDesc
+		Payload // Payload
+	);
+
+	IntersectionOutput[RayIndex] = Payload;
+}
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(IntersectionMainCHS,
+	FDefaultPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+	Payload.HitT = RayTCurrent();
+	Payload.Barycentrics = Attributes.Barycentrics;
+	Payload.InstanceIndex = InstanceIndex();
+	Payload.PrimitiveIndex = PrimitiveIndex();
+}
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(DefaultMainCHS,
+	FDefaultPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+	Payload.Barycentrics = Attributes.Barycentrics;
+	Payload.InstanceID = InstanceID();
+	Payload.InstanceIndex = InstanceIndex();
+	Payload.PrimitiveIndex = PrimitiveIndex();
+	Payload.HitT = RayTCurrent();
+}
+
+RAY_TRACING_ENTRY_ANY_HIT(DefaultOpaqueAHS,
+	FDefaultPayload, Payload,
+	FDefaultAttributes, Attributes)
+{
+}
+
+RAY_TRACING_ENTRY_MISS(DefaultPayloadMS, FDefaultPayload, Payload)
+{
+	Payload.SetMiss();
+}
+
+RAY_TRACING_ENTRY_MISS(PackedMaterialClosestHitPayloadMS, FPackedMaterialClosestHitPayload, Payload)
+{
+	Payload.SetMiss();
+}
+
+#endif // PLATFORM_RAY_TRACING_BUILTIN_SHADERS_USH

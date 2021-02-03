@@ -1,0 +1,16 @@
+#version 330
+/**
+  \file data-files/shader/SkyboxSurface/SkyboxSurface_render.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+out vec3 direction;
+in vec4 g3d_Vertex;
+
+void main() {
+    direction = g3d_Vertex.xyz;
+    gl_Position = vec4(g3d_Vertex.xyz, 0.0) * g3d_ObjectToScreenMatrixTranspose;
+}

@@ -1,0 +1,145 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MobileBasePassVertexShader.usf: Base pass vertex shader used with forward shading
+=============================================================================*/
+
+#define IS_MOBILE_BASEPASS_VERTEX_SHADER 1
+
+// @todo urban: branch was: #define FORCE_FLOATS 1
+#ifndef FORCE_FLOATS
+#define FORCE_FLOATS (COMPILER_METAL)
+#endif
+
+#include "Common.ush"
+
+// Reroute MobileSceneTextures uniform buffer references to the base pass uniform buffer
+#define MobileSceneTextures MobileBasePass.SceneTextures
+
+#include "MobileBasePassCommon.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+#include "HeightFogCommon.ush"
+
+#if USE_VERTEX_FOG && PROJECT_SUPPORT_SKY_ATMOSPHERE
+#include "SkyAtmosphereCommon.ush"
+#endif
+
+struct FMobileShadingBasePassVSToPS
+{
+	FVertexFactoryInterpolantsVSToPS FactoryInterpolants;
+	FMobileBasePassInterpolantsVSToPS BasePassInterpolants;
+	float4 Position : SV_POSITION;
+};
+
+#define FMobileShadingBasePassVSOutput FMobileShadingBasePassVSToPS
+#define VertexFactoryGetInterpolants VertexFactoryGetInterpolantsVSToPS
+
+/** Entry point for the base pass vertex shader. */
+void Main(
+	FVertexFactoryInput Input
+	, out FMobileShadingBasePassVSOutput Output
+#if INSTANCED_STEREO
+	, uint InstanceId : SV_InstanceID
+	, out uint LayerIndex : SV_RenderTargetArrayIndex
+#elif MOBILE_MULTI_VIEW
+	, in uint ViewId : SV_ViewID
+#endif
+	)
+{
+#if INSTANCED_STEREO
+	const uint EyeIndex = GetEyeIndex(InstanceId);
+	ResolvedView = ResolveView(EyeIndex);
+	LayerIndex = EyeIndex;
+	Output.BasePassInterpolants.MultiViewId = float(EyeIndex);
+#elif MOBILE_MULTI_VIEW
+#if COMPILER_GLSL_ES3_1
+	const int MultiViewId = int(ViewId);
+	ResolvedView = ResolveView(uint(MultiViewId));
+	Output.BasePassInterpolants.MultiViewId = float(MultiViewId);
+#else
+	ResolvedView = ResolveView(ViewId);
+	Output.BasePassInterpolants.MultiViewId = float(ViewId);
+#endif
+#else
+	ResolvedView = ResolveView();
+#endif
+
+#if PACK_INTERPOLANTS
+	float4 PackedInterps[NUM_VF_PACKED_INTERPOLANTS];
+	UNROLL 
+	for(int i = 0; i < NUM_VF_PACKED_INTERPOLANTS; ++i)
+	{
+		PackedInterps[i] = 0;
+	}
+#endif
+
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+	float4 WorldPositionExcludingWPO = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+	float4 WorldPosition = WorldPositionExcludingWPO;
+
+	half3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);	
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPosition.xyz, TangentToLocal);
+
+	half3 WorldPositionOffset = GetMaterialWorldPositionOffset(VertexParameters);
+	
+	WorldPosition.xyz += WorldPositionOffset;
+
+	float4 RasterizedWorldPosition = VertexFactoryGetRasterizedWorldPosition(Input, VFIntermediates, WorldPosition);
+	Output.Position = mul(RasterizedWorldPosition, ResolvedView.TranslatedWorldToClip);
+	Output.BasePassInterpolants.PixelPosition = WorldPosition;
+
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+	Output.BasePassInterpolants.PixelPositionExcludingWPO = WorldPositionExcludingWPO.xyz;
+#endif
+
+#if USE_PS_CLIP_PLANE
+	Output.BasePassInterpolants.OutClipDistance = dot(ResolvedView.GlobalClippingPlane, float4(WorldPosition.xyz - ResolvedView.PreViewTranslation.xyz, 1));
+#endif
+
+#if USE_VERTEX_FOG
+	float4 VertexFog = CalculateHeightFog(WorldPosition.xyz - ResolvedView.TranslatedWorldCameraOrigin);
+
+#if PROJECT_SUPPORT_SKY_ATMOSPHERE && MATERIAL_IS_SKY==0 // Do not apply aerial perpsective on sky materials
+	if (ResolvedView.SkyAtmosphereApplyCameraAerialPerspectiveVolume > 0.0f)
+	{
+		const float OneOverPreExposure = USE_PREEXPOSURE ? ResolvedView.OneOverPreExposure : 1.0f;
+		// Sample the aerial perspective (AP). It is also blended under the VertexFog parameter.
+		VertexFog = GetAerialPerspectiveLuminanceTransmittanceWithFogOver(
+			ResolvedView.RealTimeReflectionCapture, ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeSizeAndInvSize,
+			Output.Position, WorldPosition.xyz*CM_TO_SKY_UNIT, ResolvedView.TranslatedWorldCameraOrigin*CM_TO_SKY_UNIT,
+			View.CameraAerialPerspectiveVolume, View.CameraAerialPerspectiveVolumeSampler,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolutionInv,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthResolution,
+			ResolvedView.SkyAtmosphereAerialPerspectiveStartDepthKm,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKm,
+			ResolvedView.SkyAtmosphereCameraAerialPerspectiveVolumeDepthSliceLengthKmInv,
+			OneOverPreExposure, VertexFog);
+	}
+#endif
+
+#if PACK_INTERPOLANTS
+	PackedInterps[0] = VertexFog;
+#else
+	Output.BasePassInterpolants.VertexFog = VertexFog;
+#endif // PACK_INTERPOLANTS
+#endif
+
+#if LANDSCAPE_BUG_WORKAROUND
+	Output.BasePassInterpolants.DummyInterp = 0;
+#endif
+
+
+
+	Output.FactoryInterpolants = VertexFactoryGetInterpolants(Input, VFIntermediates, VertexParameters);
+
+	Output.BasePassInterpolants.PixelPosition.w = Output.Position.w;
+
+#if PACK_INTERPOLANTS
+	VertexFactoryPackInterpolants(Output.FactoryInterpolants, PackedInterps);
+#endif // PACK_INTERPOLANTS
+
+#if !OUTPUT_MOBILE_HDR && COMPILER_GLSL_ES3_1
+	Output.Position.y *= -1;
+#endif
+}

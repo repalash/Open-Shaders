@@ -1,0 +1,76 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+
+// Mirrors FLightShaderParameters on C++ side.
+struct FLightShaderParameters
+{
+	float3 Position;
+	float  InvRadius;
+	float3 Color;
+	float  FalloffExponent;
+	float3 Direction;
+	float3 Tangent;
+	float2 SpotAngles;
+	float  SpecularScale;
+	float  SourceRadius;
+	float  SoftSourceRadius;
+	float  SourceLength;
+	float  RectLightBarnCosAngle;
+	float  RectLightBarnLength;
+	Texture2D SourceTexture;
+};
+
+
+/** Returns the full width and height of the rect light */
+float2 GetRectLightDimensions(FLightShaderParameters LightParameters)
+{
+	return 2.0 * float2(LightParameters.SourceRadius, LightParameters.SourceLength);
+}
+
+/** Returns the tangents to use respectively for GetRectLightDimensions() X and Y. */
+void GetRectLightTangents(FLightShaderParameters LightParameters, out float3 Tangent, out float3 BiTangent)
+{
+	Tangent = cross(LightParameters.Tangent, LightParameters.Direction);
+	BiTangent = LightParameters.Tangent;
+}
+
+// Parameters feed through FLightShaderParameters used directly as SHADER_PARAMETER_STRUCT() in a shader's root parameter structure.
+float3 Light_Position;
+float  Light_InvRadius;
+float3 Light_Color;
+float  Light_FalloffExponent;
+float3 Light_Direction;
+float3 Light_Tangent;
+float2 Light_SpotAngles;
+float  Light_SpecularScale;
+float  Light_SourceRadius;
+float  Light_SoftSourceRadius;
+float  Light_SourceLength;
+float  Light_RectLightBarnCosAngle;
+float  Light_RectLightBarnLength;
+Texture2D Light_SourceTexture;
+
+
+/** Returns the FLightShaderParameters from the root shader parameters. */
+FLightShaderParameters GetRootLightShaderParameters()
+{
+	// Hopefully one day the shader compiler will be so nice we would no longer have to do this.
+	FLightShaderParameters LightParameters;
+	LightParameters.Position = Light_Position;
+	LightParameters.InvRadius = Light_InvRadius;
+	LightParameters.Color = Light_Color;
+	LightParameters.FalloffExponent = Light_FalloffExponent;
+	LightParameters.Direction = Light_Direction;
+	LightParameters.Tangent = Light_Tangent;
+	LightParameters.SpotAngles = Light_SpotAngles;
+	LightParameters.SpecularScale = Light_SpecularScale;
+	LightParameters.SourceRadius = Light_SourceRadius;
+	LightParameters.SoftSourceRadius = Light_SoftSourceRadius;
+	LightParameters.SourceLength = Light_SourceLength;
+	LightParameters.RectLightBarnCosAngle = Light_RectLightBarnCosAngle;
+	LightParameters.RectLightBarnLength = Light_RectLightBarnLength;
+	LightParameters.SourceTexture = Light_SourceTexture;
+	return LightParameters;
+}

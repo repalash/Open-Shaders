@@ -1,0 +1,148 @@
+#include "../Common.ush"
+#include "RayTracingLightCullingCommon.ush"
+
+#define CACHED_LIGHT_COUNT  16
+
+// inputs
+float3                    WorldPos;
+uint                      NumLightsToUse;
+uint                      CellCount;
+float                     CellScale;
+
+
+StructuredBuffer<float4>  RankedLights;
+
+// outputs
+RWBuffer<uint>            LightIndices;
+RWStructuredBuffer<uint4> LightCullingVolume;
+
+
+
+groupshared uint LightCount;
+groupshared uint PackedLights[4];
+groupshared uint LightCache[CACHED_LIGHT_COUNT];
+
+
+void ComputeCoords(out float3 Min, out float3 Max, int3 Cell)
+{
+	const uint CellOffset = CellCount / 2;
+
+	float3 Center = Cell - float3(CellOffset, CellOffset, CellOffset) + 0.5f;
+
+	// determine which sector
+	float3 SignVal = sign(Center);
+
+	// compute bounds as logarithmically increasing from center (with minimum cell size of 2)
+	Min = abs(floor(Center));
+	Max = abs(ceil(Center));
+	Min = Min > 0.0 ? pow(2.0, Min + 1.0) : 0.0;
+	Max = Max > 0.0 ? pow(2.0, Max + 1.0) : 0.0;
+
+	// Extend range of last cell
+	Max = (Cell == 0 || Cell == CellCount - 1) ? 1.0e7 : Max;
+
+	// return to sector
+	Min *= SignVal * CellScale;
+	Max *= SignVal * CellScale;
+}
+
+
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void GenerateCulledLightListCS(
+	uint GroupIndex : SV_GroupIndex,
+	uint3 GroupId : SV_GroupID,
+	uint3 ThreadId : SV_GroupThreadID
+)
+{
+
+	if (ThreadId.x == 0)
+	{
+		LightCount = 0;
+		PackedLights[0] = 0;
+		PackedLights[1] = 0;
+		PackedLights[2] = 0;
+		PackedLights[3] = 0;
+	}
+
+	if (ThreadId.x < CACHED_LIGHT_COUNT)
+	{
+		LightCache[ThreadId.x] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	float3 Min, Max;
+	ComputeCoords(Min, Max, GroupId);
+	float3 CellCenter = (Min + Max) * 0.5 + WorldPos;
+	float3 CellExtents = (Max - Min) * 0.5;
+
+	uint LightIndexBufferOffset = (GroupId.x + CellCount * (GroupId.y + (GroupId.z * CellCount))) * NumLightsToUse;
+
+	for (uint LightIndex = ThreadId.x; LightIndex < NumLightsToUse; LightIndex += THREADGROUP_SIZE)
+	{
+		float4 Light = RankedLights[LightIndex];
+		float RadiusSquared = ComputeSquaredDistanceFromBoxToPoint(CellCenter, CellExtents, Light.xyz);
+		if (RadiusSquared < (Light.w*Light.w))
+		{
+			uint MyLightIndex;
+			InterlockedAdd(LightCount, 1, MyLightIndex);
+			if (MyLightIndex < CACHED_LIGHT_COUNT)
+			{
+				LightCache[MyLightIndex] = LightIndex;
+			}
+			else
+			{
+				LightIndices[MyLightIndex + LightIndexBufferOffset] = LightIndex;
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// use packed light cell if few lights
+	if (LightCount <= FCulledLightList::PackedLightsMax)
+	{
+		for (uint Index = ThreadId.x; Index < LightCount; Index += THREADGROUP_SIZE)
+		{
+			uint Shift = (Index%FCulledLightList::PackedLightsPerComponent)*FCulledLightList::PackedLightBits;
+			uint MaskedLightIndex = LightCache[Index] & FCulledLightList::PackedLightMask;
+			uint ElemIndex = Index / FCulledLightList::PackedLightsPerComponent;
+			InterlockedAdd(PackedLights[ElemIndex], MaskedLightIndex << Shift);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LightCount <= FCulledLightList::PackedLightsMax)
+	{
+		if (ThreadId.x == 0)
+		{
+			// set packed bit
+			PackedLights[0] |= 1 << 31;
+			// store count
+			PackedLights[3] |= (LightCount & 0x3FF) << (2 * FCulledLightList::PackedLightBits);
+
+			uint Address = (GroupId.x + CellCount * (GroupId.y + (GroupId.z * CellCount)));
+			LightCullingVolume[Address] = uint4(PackedLights[0], PackedLights[1], PackedLights[2], PackedLights[3]);
+		}
+	}
+	else
+	{
+		// write the cached lights
+		if (ThreadId.x < CACHED_LIGHT_COUNT && ThreadId.x < LightCount)
+		{
+			LightIndices[ThreadId.x + LightIndexBufferOffset] = LightCache[ThreadId.x];
+		}
+
+		if (ThreadId.x == 0)
+		{
+			// unset packed bit
+			LightCount &= ~(1<<31);
+
+			uint Address = (GroupId.x + CellCount * (GroupId.y + (GroupId.z * CellCount)));
+			LightCullingVolume[Address] = uint4(LightCount, LightIndexBufferOffset, 0, 0);
+		}
+	}
+}
+

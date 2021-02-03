@@ -1,0 +1,279 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "BRDF.ush"
+#include "MobileGGX.ush"
+#include "ShadingCommon.ush"
+#include "ShadowFilteringCommon.ush"
+#include "DeferredShadingCommon.ush"
+#include "HairBsdf.ush"
+
+#ifndef FEATURE_GATHER4
+#define FEATURE_GATHER4 1
+#endif
+
+#ifndef MAX_MOBILE_SHADOWCASCADES
+#define MAX_MOBILE_SHADOWCASCADES 0
+#endif 
+
+#ifndef MOBILE_SHADOW_QUALITY
+#define MOBILE_SHADOW_QUALITY 2
+#endif
+
+struct FMobileDirectLighting
+{
+	half3 Diffuse;
+	half3 Specular;
+};
+
+struct FMobileShadingModelContext
+{
+	half Opacity;
+	half3 DiffuseColor;
+#if NONMETAL
+	half SpecularColor;
+#else
+	half3 SpecularColor;
+#endif
+	
+#if MATERIAL_SHADINGMODEL_CLEAR_COAT
+	half ClearCoat;
+	half ClearCoatRoughness;
+	float NoV;
+	half3 SpecPreEnvBrdf;
+#elif MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	half BaseMaterialCoverageOverWater;
+	half WaterVisibility;
+	float3 WaterDiffuseIndirectLuminance;
+#endif
+};
+
+#if NONMETAL
+half GetEnvBRDF(half SpecularColor, half Roughness, half NoV)
+{
+#if FORWARDSHADING_USE_HQ_ENV_BRDF
+	return EnvBRDF(SpecularColor, Roughness, NoV).x;
+#else
+	// If nothing is hooked up to Metalic and Specular,
+	// then defaults are the same as a non-metal,
+	// so this define is safe.
+	return EnvBRDFApproxNonmetal(Roughness, NoV);
+#endif
+}
+#else
+half3 GetEnvBRDF(half3 SpecularColor, half Roughness, half NoV)
+{
+#if FORWARDSHADING_USE_HQ_ENV_BRDF
+	return EnvBRDF(SpecularColor, Roughness, NoV);
+#else
+	return EnvBRDFApprox(SpecularColor, Roughness, NoV);
+#endif
+}
+#endif
+
+void InitShadingModelContext(inout FMobileShadingModelContext ShadingModelContext, inout FGBufferData GBuffer, float4 SvPosition, half3 CameraVector, half CustomData0, half CustomData1)
+{
+#if !FULLY_ROUGH
+	half NoV = max(dot(GBuffer.WorldNormal, CameraVector), 0);
+#endif
+
+#if MATERIAL_SHADINGMODEL_CLEAR_COAT
+	ShadingModelContext.ClearCoat = saturate(CustomData0);
+	ShadingModelContext.ClearCoatRoughness = clamp(CustomData1, 0.015625, 1.0);
+
+	// Approximation of refraction's effect on EnvBRDF
+	half RefractionScale = ((NoV * 0.5 + 0.5) * NoV - 1) * saturate(1.25 - 1.25 * GBuffer.Roughness) + 1;
+
+	GBuffer.Specular *= lerp(1, RefractionScale, ShadingModelContext.ClearCoat);
+	half DielectricSpecular = 0.08 * GBuffer.Specular;
+	ShadingModelContext.SpecularColor = (DielectricSpecular - DielectricSpecular * GBuffer.Metallic) + GBuffer.BaseColor * GBuffer.Metallic;	// 2 mad
+	ShadingModelContext.SpecPreEnvBrdf = ShadingModelContext.SpecularColor;
+	ShadingModelContext.DiffuseColor = GBuffer.BaseColor - GBuffer.BaseColor * GBuffer.Metallic;
+
+	// This is to prevent Vis to get inf when both NoL and NoV are 0.
+	ShadingModelContext.NoV = saturate(abs(NoV) + 1e-5);
+
+#elif MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	ShadingModelContext.BaseMaterialCoverageOverWater = ShadingModelContext.Opacity;
+	ShadingModelContext.WaterVisibility = 1.0 - ShadingModelContext.BaseMaterialCoverageOverWater;
+
+	half DielectricSpecular = 0.08 * GBuffer.Specular;
+	ShadingModelContext.DiffuseColor = GBuffer.BaseColor - GBuffer.BaseColor * GBuffer.Metallic;	// 1 mad
+	ShadingModelContext.SpecularColor = (DielectricSpecular - DielectricSpecular * GBuffer.Metallic) + GBuffer.BaseColor * GBuffer.Metallic;	// 2 mad
+
+#else // MATERIAL_SHADINGMODEL_DEFAULTLIT
+	
+	#if NONMETAL
+		ShadingModelContext.DiffuseColor = GBuffer.BaseColor;
+		ShadingModelContext.SpecularColor = 0.04;
+	#else
+		half DielectricSpecular = 0.08 * GBuffer.Specular;
+		ShadingModelContext.DiffuseColor = GBuffer.BaseColor - GBuffer.BaseColor * GBuffer.Metallic;	// 1 mad
+		ShadingModelContext.SpecularColor = (DielectricSpecular - DielectricSpecular * GBuffer.Metallic) + GBuffer.BaseColor * GBuffer.Metallic;	// 2 mad
+	#endif
+
+#endif
+
+#if FULLY_ROUGH
+	EnvBRDFApproxFullyRough(ShadingModelContext.DiffuseColor, ShadingModelContext.SpecularColor);
+#else
+	ShadingModelContext.SpecularColor = GetEnvBRDF(ShadingModelContext.SpecularColor, GBuffer.Roughness, NoV);
+#endif
+
+#if MOBILE_EMULATION
+	{
+		// this feature is only needed for development/editor - we can compile it out for a shipping build (see r.CompileShadersForDevelopment cvar help)
+		ShadingModelContext.DiffuseColor = ShadingModelContext.DiffuseColor * ResolvedView.DiffuseOverrideParameter.w + ResolvedView.DiffuseOverrideParameter.xyz;
+#if NONMETAL
+		ShadingModelContext.SpecularColor = ShadingModelContext.SpecularColor * ResolvedView.SpecularOverrideParameter.w + ResolvedView.SpecularOverrideParameter.x;
+#else
+		ShadingModelContext.SpecularColor = ShadingModelContext.SpecularColor * ResolvedView.SpecularOverrideParameter.w + ResolvedView.SpecularOverrideParameter.xyz;
+#endif
+	}
+#endif
+
+#if MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+	// Fade out diffuse as this will be handled by the single scattering lighting. when over the water surface.
+	// We keep the SpecularColor for sun/water interactions
+	ShadingModelContext.WaterDiffuseIndirectLuminance = 0;
+	ShadingModelContext.DiffuseColor *= ShadingModelContext.BaseMaterialCoverageOverWater;
+#endif
+}
+
+half CalcSpecular(half Roughness, half NoH)
+{
+	return (Roughness*0.25 + 0.25) * GGX_Mobile(Roughness, NoH);
+}
+
+FMobileDirectLighting MobileIntegrateBxDF(FMobileShadingModelContext ShadingModelContext, FGBufferData GBuffer, half NoL, half3 V, half3 H, half NoH)
+{
+	FMobileDirectLighting Lighting;
+#if MATERIAL_SHADINGMODEL_CLEAR_COAT
+	half ClearCoatRoughness = ShadingModelContext.ClearCoatRoughness;
+	half VoH = max(0, dot(V, H));
+	half F0 = 0.04;
+	half Fc = Pow5(1 - VoH);
+	half F = Fc + (1 - Fc) * F0;
+	half LayerAttenuation = 1 - F;
+	LayerAttenuation *= LayerAttenuation;
+
+	// Vis_SmithJointApprox
+	half a = ClearCoatRoughness * ClearCoatRoughness;
+	half Vis_SmithV = NoL * (ShadingModelContext.NoV * (1 - a) + a);
+	half Vis_SmithL = ShadingModelContext.NoV * (NoL * (1 - a) + a);
+	float Vis = 0.5 * rcp(Vis_SmithV + Vis_SmithL);
+
+	Lighting.Specular = NoL * ShadingModelContext.ClearCoat * F * Vis * GGX_Mobile(ClearCoatRoughness, NoH);
+
+	half Eta = 0.66666667f;
+	half RefractionBlendFactor = (0.63 - 0.22 * VoH) * VoH - 0.745;
+	half RefractionProjectionTerm = RefractionBlendFactor * NoH;
+	half BottomNoV = saturate(Eta * ShadingModelContext.NoV - RefractionProjectionTerm);
+	half BottomNoL = saturate(Eta * NoL - RefractionProjectionTerm);
+
+	half3 Transmission = 0.0;
+	if (BottomNoL > 0.0 && BottomNoV > 0.0)
+	{
+		// Normalized layer thickness documented for clarity
+		half ThinDistance = (rcp(BottomNoV) + rcp(BottomNoL));
+		half AbsorptionMix = GBuffer.Metallic;
+
+		Transmission = 1.0;
+		if (AbsorptionMix > 0.0)
+		{
+			// Base color represents reflected color viewed at 0 incidence angle, after being absorbed through the substrate.
+			// Because of this, extinction is normalized by traveling through layer thickness twice
+			half3 TransmissionColor = GBuffer.BaseColor;
+			half3 ExtinctionCoefficient = -log(TransmissionColor) * 0.5f;
+			half3 OpticalDepth = ExtinctionCoefficient * max(ThinDistance - 2.0, 0.0);
+			Transmission = saturate(exp(-OpticalDepth));
+			Transmission = lerp(1.0, Transmission, AbsorptionMix);
+		}
+	}
+
+	half3 CommonDiffuse = ShadingModelContext.DiffuseColor;
+	half3 DefaultDiffuse = NoL;
+	half3 RefractedDiffuse = (LayerAttenuation * BottomNoL) * Transmission;
+	Lighting.Diffuse = CommonDiffuse * lerp(DefaultDiffuse, RefractedDiffuse, ShadingModelContext.ClearCoat);
+
+	half3 CommonSpecular = ShadingModelContext.SpecularColor * CalcSpecular(GBuffer.Roughness, NoH);
+	half3 DefaultSpecular = NoL;
+	half3 RefractedSpecular = LayerAttenuation * Transmission * BottomNoL;
+	Lighting.Specular += CommonSpecular * lerp(DefaultSpecular, RefractedSpecular, ShadingModelContext.ClearCoat);
+#elif MATERIAL_SHADINGMODEL_HAIR
+	 // TODO transmittance
+	Lighting.Specular = half3(0, 0, 0);
+	Lighting.Diffuse = half3(0, 0, 0);
+#else // MATERIAL_SHADINGMODEL_DEFAULT_LIT
+	Lighting.Specular = ShadingModelContext.SpecularColor * (NoL * CalcSpecular(GBuffer.Roughness, NoH));
+	Lighting.Diffuse = NoL * ShadingModelContext.DiffuseColor;
+#endif
+	return Lighting;
+}
+half MobileShadowPCF(float2 ShadowUVs, FPCFSamplerSettings Settings)
+{
+#if MOBILE_SHADOW_QUALITY == 0
+	half ShadowMap = ManualNoFiltering(ShadowUVs, Settings);
+#elif MOBILE_SHADOW_QUALITY == 1
+	half ShadowMap = Manual1x1PCF(ShadowUVs, Settings);
+#elif MOBILE_SHADOW_QUALITY == 2
+	half ShadowMap = Manual2x2PCF(ShadowUVs, Settings);
+#elif MOBILE_SHADOW_QUALITY == 3
+	half ShadowMap = Manual3x3PCF(ShadowUVs, Settings);
+#else
+	#error Unsupported MOBILE_SHADOW_QUALITY value.
+#endif
+
+return ShadowMap;
+}
+
+// Add fading CSM plane:
+#define FADE_CSM 1
+
+half MobileDirectionalLightCSM(float2 ScreenPosition, float SceneDepth)
+{
+	half ShadowMap = 1;
+	FPCFSamplerSettings Settings;
+	Settings.ShadowDepthTexture = MobileDirectionalLight.DirectionalLightShadowTexture;
+	Settings.ShadowDepthTextureSampler = MobileDirectionalLight.DirectionalLightShadowSampler;
+	Settings.TransitionScale = MobileDirectionalLight.DirectionalLightDirectionAndShadowTransition.w;
+	Settings.ShadowBufferSize = MobileDirectionalLight.DirectionalLightShadowSize;
+	Settings.bSubsurface = false;
+	Settings.bTreatMaxDepthUnshadowed = false;
+	Settings.DensityMulConstant = 0;
+	Settings.ProjectionDepthBiasParameters = 0;
+
+	float4 ShadowPosition = float4(0, 0, 0, 0);
+	for (int i = 0; i < MAX_MOBILE_SHADOWCASCADES; i++)
+	{
+		if (SceneDepth < MobileDirectionalLight.DirectionalLightShadowDistances[i])
+		{
+		#if MOBILE_MULTI_VIEW
+			ShadowPosition = mul(float4(ScreenPosition.x, ScreenPosition.y, SceneDepth, 1), ResolvedView.MobileMultiviewShadowTransform);
+			ShadowPosition = mul(ShadowPosition, MobileDirectionalLight.DirectionalLightScreenToShadow[i]);
+		#else
+			ShadowPosition = mul(float4(ScreenPosition.x, ScreenPosition.y, SceneDepth, 1), MobileDirectionalLight.DirectionalLightScreenToShadow[i]);
+		#endif
+			break; // position found.
+		}
+	}
+
+	// Process CSM only when ShadowPosition is valid.
+	if (ShadowPosition.z > 0)
+	{
+		// Clamp pixel depth in light space for shadowing opaque, because areas of the shadow depth buffer that weren't rendered to will have been cleared to 1
+		// We want to force the shadow comparison to result in 'unshadowed' in that case, regardless of whether the pixel being shaded is in front or behind that plane
+		float LightSpacePixelDepthForOpaque = min(ShadowPosition.z, 0.99999f);
+		Settings.SceneDepth = LightSpacePixelDepthForOpaque;
+
+		ShadowMap = MobileShadowPCF(ShadowPosition.xy, Settings);
+
+		#if FADE_CSM
+			float Fade = saturate(SceneDepth * MobileDirectionalLight.DirectionalLightDistanceFadeMADAndSpecularScale.x + MobileDirectionalLight.DirectionalLightDistanceFadeMADAndSpecularScale.y);
+			// lerp out shadow based on fade params.
+			ShadowMap = lerp(ShadowMap, 1.0, Fade * Fade);
+		#endif
+	}
+	return ShadowMap;
+}

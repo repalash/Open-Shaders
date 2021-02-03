@@ -1,0 +1,23 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Common.ush"
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+
+void ScreenPassVS(
+	in float4 InPosition : ATTRIBUTE0,
+	in float2 InTexCoord : ATTRIBUTE1,
+	out noperspective float4 OutUVAndScreenPos : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION)
+{
+	DrawRectangle(InPosition, InTexCoord, OutPosition, OutUVAndScreenPos);
+}
+
+float4 CopyRectPS(
+	noperspective float4 UVAndScreenPos : TEXCOORD0
+	) : SV_Target0
+{
+	float2 UV = UVAndScreenPos.xy;
+	return Texture2DSample(InputTexture, InputSampler, UV);
+}

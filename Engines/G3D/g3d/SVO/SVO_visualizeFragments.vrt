@@ -1,0 +1,22 @@
+#version 420
+/**
+  \file data-files/shader/SVO/SVO_visualizeFragments.vrt
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+uniform sampler2D SVO_POSITION_buffer;
+
+out vec3 color;
+
+void main() {
+	ivec2 coord = ivec2(gl_VertexID & (BUFFER_WIDTH-1), gl_VertexID/BUFFER_WIDTH );
+	
+	vec4 svoPos = vec4(texelFetch(SVO_POSITION_buffer, coord, 0).rgb, 1);
+	color = (svoPos.rgb)*1.0f;
+
+	gl_Position   = svoPos * g3d_ObjectToScreenMatrixTranspose;
+}

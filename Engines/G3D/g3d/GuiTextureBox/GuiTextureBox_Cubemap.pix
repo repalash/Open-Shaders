@@ -1,0 +1,74 @@
+#version 330
+/**
+  \file data-files/shader/GuiTextureBox/GuiTextureBox_Cubemap.pix
+
+  G3D Innovation Engine http://casual-effects.com/g3d
+  Copyright 2000-2019, Morgan McGuire
+  All rights reserved
+  Available under the BSD License
+*/
+
+#expect SAMPLER_TYPE "gsamplerXX"
+#include <GuiTextureBox/GuiTextureBox_Arrows.glsl>
+
+uniform SAMPLER_TYPE tex_buffer;
+uniform float     adjustGamma;
+uniform mat4      colorShift;
+uniform float     bias;
+uniform float     scale;
+uniform float     edgeThreshold;
+uniform bool      invertIntensity;
+uniform float     mipLevel;
+uniform bool      showMotionFlow;
+uniform float     motionVectorSpacing;
+uniform float     motionVectorScale;
+
+in vec2 g3d_TexCoord;
+
+#   if IS_ARRAY
+#       expect LAYER
+#   endif
+
+out vec4 result;
+
+void main(void) {
+    const float PI    = 3.14159265;
+    vec2 sphericalCoord = g3d_TexCoord.xy;
+    float theta = sphericalCoord.y * PI;
+    float phi   = sphericalCoord.x * 2 * PI;
+    float sinTheta = sin(theta);
+    vec3 cartesianCoord = vec3(cos(phi) * sinTheta, cos(theta), sin(phi) * sinTheta); 
+
+#   if IS_ARRAY
+        vec4 c = textureLod(tex_buffer, vec4(cartesianCoord, LAYER), mipLevel);
+#   else
+        vec4 c = textureLod(tex_buffer, cartesianCoord, mipLevel);
+#   endif
+    c = (c + bias) * scale;
+    c = invertIntensity ? vec4(1.0 - c) : c;
+    c = colorShift * c;
+    c = max(c, vec4(0.0));
+
+    /*
+    // TODO: motion vectors and mapping in polar form
+    if (showMotionFlow) {
+		vec2 fragCoord = sphericalCoord * g3d_FragCoordExtent;
+		vec2 arrowSphereCoord = arrowTileCenterCoord(fragCoord, arrowTileSize) / g3d_FragCoordExtent;
+        float arrowTheta = arrowSphereCoord.y * PI;
+        float arrowPhi = arrowSphereCoord.x * 2 * PI;
+        float sinArrowTheta = sin(arrowTheta);
+        vec3 arrowCoord = vec3(cos(arrowPhi) * sinArrowTheta, cos(arrowTheta), sin(arrowPhi)*sinArrowTheta);
+		vec2 dir = textureLod(tex_buffer, arrowCoord, mipLevel).xy * arrowTileSize;
+        drawArrow(fragCoord, dir, arrowTileSize, c);
+	}
+    */
+
+    vec3 cubeMapColor = pow(c.rgb, vec3(adjustGamma));
+    vec3 edgeColor = vec3( 0.196, 0.804, 0.196); // Lime Green
+    
+    vec3 v = abs(cartesianCoord);
+    v = v / max(v.x, max(v.y, v.z));
+    bool onEdge = (v.x + v.y + v.z - min(v.x,min(v.y,v.z))) > edgeThreshold;
+    result.rgb = onEdge ? edgeColor : cubeMapColor;
+    result.a = 1.0;
+}

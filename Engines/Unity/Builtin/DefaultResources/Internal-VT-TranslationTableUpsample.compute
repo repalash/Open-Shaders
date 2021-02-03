@@ -1,0 +1,237 @@
+// Unity built-in shader source. Copyright (c) 2016 Unity Technologies. MIT license (see license.txt)
+
+#pragma kernel Main NUM_LAYERS=1
+#pragma kernel Main NUM_LAYERS=1 WITH_REPLACEMENT
+#pragma kernel Main NUM_LAYERS=1 HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=1 WITH_REPLACEMENT HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=2
+#pragma kernel Main NUM_LAYERS=2 WITH_REPLACEMENT
+#pragma kernel Main NUM_LAYERS=2 HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=2 WITH_REPLACEMENT HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=3
+#pragma kernel Main NUM_LAYERS=3 WITH_REPLACEMENT
+#pragma kernel Main NUM_LAYERS=3 HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=3 WITH_REPLACEMENT HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=4
+#pragma kernel Main NUM_LAYERS=4 WITH_REPLACEMENT
+#pragma kernel Main NUM_LAYERS=4 HIGHEST_LEVEL
+#pragma kernel Main NUM_LAYERS=4 WITH_REPLACEMENT HIGHEST_LEVEL
+
+#pragma exclude_renderers gles3
+
+static const uint TGSize = 32;
+
+#define MAX_EVICTED_TILES   64
+#define MAX_ADDED_TILES     64
+
+#define INVALID_TILE        0x7FFFFFFF
+#define DIRTY_INVALID_TILE  0xFFFFFFFF
+
+#if (NUM_LAYERS == 1)
+#define DATA_TYPE_UINT uint
+#define DATA_TYPE_FLOAT float
+#elif (NUM_LAYERS == 2)
+#define DATA_TYPE_UINT uint2
+#define DATA_TYPE_FLOAT float2
+#elif (NUM_LAYERS == 3)
+#define DATA_TYPE_UINT uint4
+#define DATA_TYPE_FLOAT float4
+#elif (NUM_LAYERS == 4)
+#define DATA_TYPE_UINT uint4
+#define DATA_TYPE_FLOAT float4
+#endif
+
+#if (NUM_LAYERS == 1)
+#define SELECT_CHANNEL(x,c) x
+#else
+#define SELECT_CHANNEL(x,c) x[c]
+#endif
+
+RWByteAddressBuffer _output_buf : register(u0);
+RWTexture2D<DATA_TYPE_FLOAT> translationTable : register(u1);
+#if WITH_REPLACEMENT
+Texture2D<DATA_TYPE_UINT> lookupTexture : register(t0);
+#endif
+
+cbuffer cbTranslationTableData
+{
+    uint level;
+    uint invLevel;
+    uint width;
+    uint height;
+
+    uint bufferOffsetLevel;
+    uint bufferOffsetLevelAbove;
+    uint numEvictedTiles;
+    uint numAddedTiles;
+
+    uint4 addedTiles[(MAX_ADDED_TILES+1)/2];
+    uint4 evictedTiles[(MAX_EVICTED_TILES+3)/4];
+};
+
+// Returns true if the given FlatTileId should be evicted, else false
+bool IsEvicted(uint tile)
+{
+    // The tiles we have to evict are packed in a uint4, so a single uint4 can contain 4 tiles we need to evict.
+    // If the number of tiles we need to evict isn't a multiple of 4, the other channels can contain invalid values.
+    // We know how many tiles we need to evict so we can make sure we never read from those invalid channels.
+    // This way we don't depend on any magic value to skip those invalid channels.
+    for(uint i = 0; i < numEvictedTiles; i++)
+    {
+        uint tupleIdx = i/4;
+        uint channelIdx = i%4;
+        uint4 evictedTileTuple = evictedTiles[tupleIdx];
+        if(evictedTileTuple[channelIdx] == tile)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Returns the new translation table data if the given FlatTileId was added, else returns 0xFFFFFFFF
+uint IsAdded(uint tile)
+{
+    // The tiles we have to add are packed in a uint4, a single uint4 contains 2 tiles we need to add (for every add we need the FlatTileId and the new payload).
+    // If the number of tiles we need to add isn't a multiple of 2, the other channels can contain invalid values.
+    // We know how many tiles we need to add so we can make sure we never read from those invalid channels.
+    // This way we don't depend on any magic value to skip those invalid channels.
+    for(uint i = 0; i < numAddedTiles; i++)
+    {
+        uint tupleIdx = i/2;
+        uint channelIdx = (i%2)*2;
+        uint4 addedTileTuple = addedTiles[tupleIdx];
+        if(addedTileTuple[channelIdx+0] == tile)
+        {
+            return addedTileTuple[channelIdx+1];
+        }
+    }
+    return 0xFFFFFFFF;
+}
+
+[numthreads(TGSize, TGSize, 1)]
+void Main(in uint3 GroupID : SV_GroupID, in uint3 GroupThreadID : SV_GroupThreadID)
+{
+// The switch shader compiler has a feature that logs unnececarry warnings on the auto-translated hlsl.
+// As the built-in resource compiling fails when output is non-empty, this logged warning then also causes the built-in resource build to fail.
+// So, since we don't support switch for now we just ifdef it out for now.
+#if !SHADER_API_SWITCH
+    const int strideLevel = width*height;
+    const int strideLevelAbove = strideLevel >> 2;
+
+    const uint2 tilePos = GroupID.xy * TGSize + GroupThreadID.xy;
+    const uint2 tilePosAbove = tilePos >> 1;
+
+    //
+    //  Fetch data on level above
+    //
+#if HIGHEST_LEVEL
+    DATA_TYPE_UINT dataAbove = INVALID_TILE;
+#else
+    const int linearPosAbove = tilePosAbove.y * (width >> 1) + tilePosAbove.x;
+    const int linearPosLevelAbove = bufferOffsetLevelAbove + linearPosAbove;
+
+    // Coalesced reads
+    DATA_TYPE_UINT dataAbove;
+    [unroll]
+    for(int m = 0; m < NUM_LAYERS; m++)
+    {
+        SELECT_CHANNEL(dataAbove,m) = _output_buf.Load((strideLevelAbove*m + linearPosLevelAbove)*4);
+    }
+#endif // HIGHEST_LEVEL
+
+    if(tilePos.x >= width || tilePos.y >= height)
+    {
+        return;
+    }
+
+    //
+    //  Fetch data on current level
+    //
+    const int linearPos = tilePos.y * width + tilePos.x;
+    const int linearPosLevel = bufferOffsetLevel + linearPos;
+
+    // Coalesced reads
+    DATA_TYPE_UINT data = INVALID_TILE;
+    [unroll]
+    for(int j = 0; j < NUM_LAYERS; j++)
+    {
+        SELECT_CHANNEL(data,j) = _output_buf.Load((strideLevel*j + linearPosLevel)*4);
+    }
+
+    bool writeNeeded = false;
+#if WITH_REPLACEMENT
+    // Fetch FlatTileID for current tile
+    DATA_TYPE_UINT flatTileIDs = lookupTexture.mips[level][tilePos];
+    [unroll]
+    for(int l = 0; l < NUM_LAYERS; l++)
+    {
+        // Check dirty flag
+        if(SELECT_CHANNEL(data,l) & 0x80000000)
+        {
+            // Strip the dirty flag
+            SELECT_CHANNEL(data,l) = SELECT_CHANNEL(data,l) & 0x7FFFFFFF;
+            writeNeeded = true;
+        }
+
+        bool resident = ((SELECT_CHANNEL(data,l) & 0xF) == invLevel);
+        [branch]
+        if(resident)
+        {
+            if(IsEvicted(SELECT_CHANNEL(flatTileIDs,l)))
+            {
+                SELECT_CHANNEL(data,l) = SELECT_CHANNEL(dataAbove,l);
+                writeNeeded = true;
+            }
+        }
+        else
+        {
+            uint newData = IsAdded(SELECT_CHANNEL(flatTileIDs,l));
+            if(newData != 0xFFFFFFFF)
+            {
+                // Strip the level and update if for the current level
+                SELECT_CHANNEL(data,l) = (newData & (~0xF)) | invLevel;
+                writeNeeded = true;
+            }
+            else if(SELECT_CHANNEL(data,l) != SELECT_CHANNEL(dataAbove,l))
+            {
+                SELECT_CHANNEL(data,l) = SELECT_CHANNEL(dataAbove,l);
+                writeNeeded = true;
+            }
+        }
+    }
+#else
+    [unroll]
+    for(int l = 0; l < NUM_LAYERS; l++)
+    {
+        // Check dirty flag
+        if(SELECT_CHANNEL(data,l) & 0x80000000)
+        {
+            // Strip the dirty flag
+            SELECT_CHANNEL(data,l) = SELECT_CHANNEL(data,l) & 0x7FFFFFFF;
+            writeNeeded = true;
+        }
+
+        bool resident = ((SELECT_CHANNEL(data,l) & 0xF) == invLevel);
+        if ( !resident && SELECT_CHANNEL(data,l) != SELECT_CHANNEL(dataAbove,l))
+        {
+            SELECT_CHANNEL(data,l) = SELECT_CHANNEL(dataAbove,l);
+            writeNeeded = true;
+        }
+    }
+#endif // WITH_REPLACEMENT
+
+    if(writeNeeded)
+    {
+        // Coalesced writes
+        [unroll]
+        for(int k = 0; k < NUM_LAYERS; k++)
+        {
+            _output_buf.Store((strideLevel*k + linearPosLevel)*4,  SELECT_CHANNEL(data,k));
+        }
+
+        // Write to translation table texture
+        translationTable[tilePos] = asfloat(data);
+    }
+#endif
+}

@@ -1,0 +1,110 @@
+
+
+/*=============================================================================================
+	RayTracingLightCullingCommon.ush: Common functions for culling lights.
+===============================================================================================*/
+
+#pragma once
+
+#define CULL_VOLUME_STRUCTURED_BUFFER 1
+
+
+// *************** LIGHT CULLING *********************************
+// Use view-centered, world-aligned volume to store references to lights impacting cells
+// Volume cells store light indices directly if space permits, otherwise indirect into
+// buffer of light indices
+
+struct FCulledLightList
+{
+	uint4 LightCellData;
+
+	static const uint PackedLightBits = 10;
+	static const uint PackedLightsPerComponent = 3;
+	static const uint PackedLightMask = (1 << PackedLightBits) - 1;
+	static const uint PackedLightsMax = 11;
+
+	static FCulledLightList Create(float3 WorldPos)
+	{
+		FCulledLightList Result = (FCulledLightList)0;
+
+		// volume is centered on the viewer
+		float3 Position = WorldPos - View.WorldViewOrigin;
+
+		const float Scale = 100.0f;
+		const int Dim = RaytracingLightsDataPacked.CellCount;
+
+		Position /= RaytracingLightsDataPacked.CellScale;
+
+		// symmetric about the viewer
+		float3 Region = sign(Position);
+		Position = abs(Position);
+
+		// logarithmic steps with the closest cells being 2x2x2 m
+		Position = max(Position, 2.0f);
+		Position = min(log2(Position) - 1.0f, (Dim/2 - 1));
+
+		Position = floor(Position);
+
+		// move the the edge to the center
+		Position += 0.5f;
+
+		//  map it back to quadrants
+		Position *= Region;
+
+		// remap [-Dim/2, Dim/2] to [0, Dim]
+		Position += (Dim / 2.0f);
+
+		// keep it inside the volume since we're using Load rather than a sampler
+		Position = min(Position, (Dim - 0.5f));
+		Position = max(Position, 0.0f);
+
+		int3 Coord = Position;
+
+		uint Address = (Coord.z * RaytracingLightsDataPacked.CellCount + Coord.y) * RaytracingLightsDataPacked.CellCount + Coord.x;
+		Result.LightCellData = RaytracingLightsDataPacked.LightCullingVolume[Address];
+
+
+		return Result;
+	}
+
+	uint NumLights()
+	{
+		const bool bPacked = (LightCellData[0] & (1 << 31)) > 0;
+
+		return bPacked ? (LightCellData[3] >> (PackedLightBits * 2)) & PackedLightMask : LightCellData.x;
+	}
+
+	uint GetLightIndex(int LightNum, out uint Valid)
+	{
+		uint LightIndex = 0;
+		Valid = 0;
+
+		const uint LightCount = NumLights();
+
+		const bool bPacked = (LightCellData[0] & (1 << 31)) > 0;
+		if (bPacked)
+		{
+			// packed lights 
+			uint Shift = (LightNum % PackedLightsPerComponent) * PackedLightBits;
+			uint PackedLightIndices = LightCellData[LightNum / PackedLightsPerComponent];
+			uint UnpackedLightIndex = (PackedLightIndices >> Shift) & PackedLightMask;
+
+			if (LightNum < LightCount)
+			{
+				Valid = 1;
+				LightIndex = UnpackedLightIndex;
+			}
+		}
+		else
+		{
+			// non-packed lights
+			if (LightNum < LightCount)
+			{
+				Valid = 1;
+				LightIndex = RaytracingLightsDataPacked.LightIndices[LightCellData.y + LightNum];
+			}
+		}
+		return LightIndex;
+	}
+
+};
