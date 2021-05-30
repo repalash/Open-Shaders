@@ -25,6 +25,9 @@ Aim is to have a common index of shader snippets and algorithms for educational 
 * [filament](Engines/babylonjs) by google
   - Updated: Feb 2021
   - https://github.com/google/filament/tree/main/shaders/src
+* [playcanvas](Engines/playcanvas)
+  - Updated: May 2021
+  - https://github.com/playcanvas/engine/tree/v1.41.2/src/graphics/program-lib/chunks
 * [Blend4Web](Engines/Blend4Web) 
   - Updated: Feb 2021
   - https://github.com/TriumphLLC/Blend4Web/tree/master/shaders

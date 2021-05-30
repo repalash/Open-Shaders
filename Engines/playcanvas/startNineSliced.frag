@@ -1,0 +1,1 @@
+    nineSlicedUv = vUv0;

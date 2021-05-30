@@ -1,0 +1,1 @@
+    vDepth = getLinearDepth(localPos);
