@@ -18,7 +18,7 @@ Aim is to have a common index of shader snippets and algorithms for educational 
   - https://sourceforge.net/p/g3d/code/HEAD/tree/
 * [three.js](Engines/threejs)
   - Updated: Jan 2021
-  - https://github.com/mrdoob/threejs
+  - https://github.com/mrdoob/three.js
 * [Babylon.js](Engines/babylonjs)
   - Updated: Feb 2021
   - https://github.com/BabylonJS/Babylon.js/tree/master/src/Shaders
