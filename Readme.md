@@ -31,6 +31,15 @@ Aim is to have a common index of shader snippets and algorithms for educational 
 * [Blend4Web](Engines/Blend4Web) 
   - Updated: Feb 2021
   - https://github.com/TriumphLLC/Blend4Web/tree/master/shaders
+* [Cycles](Engines/cycles)
+  - OSL node shaders (Principled BSDF, textures, math/color nodes) from Blender's Cycles renderer
+  - Updated: Jul 2026
+  - https://github.com/blender/blender/tree/master/intern/cycles/kernel/osl/shaders
+  - Includes `stdosl.h` from the McNeel Cycles (Rhino 7) fork: https://github.com/mcneel/cycles
+* [EEVEE](Engines/eevee)
+  - Real-time PBR shaders from Blender's EEVEE draw engine
+  - Updated: Jul 2026
+  - https://github.com/blender/blender/tree/master/source/blender/draw/engines/eevee/shaders
 
 ### Others:
 * [inviwo](Others/inviwo): 
@@ -50,9 +59,36 @@ Aim is to have a common index of shader snippets and algorithms for educational 
   - https://github.com/bobcao3/Wisdom-Shaders/tree/master/shaders
 * [ssdo_webgl](Others/ssdo_webgl): https://github.com/quentinplessis/ssdo_webgl
 * [GDQuest godot shaders](Others/GDQuest_godot): (Feb 2021) https://github.com/GDQuest/godot-shaders/tree/master/godot/Shaders
+* [glfx.js](Others/glfx):
+  - WebGL image filters (blur, warp, adjust, fun) with embedded GLSL
+  - Updated: Jul 2026
+  - https://github.com/evanw/glfx.js/tree/master/src/filters
+* [glslSmartDeNoise](Others/glslSmartDeNoise):
+  - Fast GLSL bilateral/gaussian image denoise
+  - Updated: Jul 2026
+  - https://github.com/BrutPitt/glslSmartDeNoise
+* [etx-tracer](Others/etx-tracer):
+  - Spectral CPU/GPU path tracer — BSDFs, spectrum/material code and OptiX kernels
+  - Updated: Jul 2026
+  - https://github.com/sergeyreznik/etx-tracer
+* [Wagner](Others/Wagner):
+  - Post-processing effect shaders for three.js
+  - Updated: Jul 2026
+  - https://github.com/spite/Wagner/tree/master/fragment-shaders
+* [postprocessing](Others/postprocessing):
+  - Effect and blend-mode shaders for three.js
+  - Updated: Jul 2026
+  - https://github.com/vanruesc/postprocessing/tree/master/src/effects/glsl
+* [processing-postfx](Others/processing-postfx):
+  - PostFX post-effect shaders for Processing (no upstream license declared)
+  - Updated: Jul 2026
+  - https://github.com/cansik/processing-postfx/tree/master/shader
 
 ### Ad hoc scripts
 Sources at the top of the files.
+* [Noise functions](Adhoc/noise_functions.md): Inigo Quilez gradient/value noise and derivatives
+  - https://www.shadertoy.com/view/4tGGWW (latest)
+  - https://www.shadertoy.com/view/MtV3W1 (main)
 
 ### Awesome blogs and resources
 * Inigo Quilez articles: https://iquilezles.org/www/index.htm#

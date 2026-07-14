@@ -1,0 +1,284 @@
+/* SPDX-FileCopyrightText: 2023 Blender Authors
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later */
+
+#pragma once
+
+#include "draw_view.bsl.hh"
+#include "eevee_defines.hh"
+#include "eevee_gbuffer_read.bsl.hh"
+#include "eevee_reverse_z_lib.bsl.hh"
+#include "eevee_sampling_lib.bsl.hh"
+#include "eevee_subsurface_shared.hh"
+#include "gpu_shader_codegen_lib.glsl"
+#include "gpu_shader_math_angle_lib.glsl"
+#include "gpu_shader_math_matrix_construct_lib.glsl"
+#include "gpu_shader_math_vector_safe_lib.glsl"
+#include "gpu_shader_shared_exponent_lib.glsl"
+
+namespace eevee::subsurface {
+
+/* -------------------------------------------------------------------- */
+/** \name Setup
+ *
+ * Select tiles that have visible SSS effect and prepare the intermediate buffers for faster
+ * processing.
+ * \{ */
+
+struct Setup {
+  [[specialization_constant(false)]] const bool use_split_radiance;
+
+  [[shared]] uint &has_visible_sss;
+
+  [[sampler(2)]] sampler2DDepth depth_tx;
+
+  [[image(0, read, DEFERRED_RADIANCE_FORMAT)]] const uimage2D direct_light_img;
+  [[image(1, read, RAYTRACE_RADIANCE_FORMAT)]] const image2D indirect_light_img;
+  [[image(2, write, SUBSURFACE_OBJECT_ID_FORMAT)]] uimage2D object_id_img;
+  [[image(3, write, SUBSURFACE_RADIANCE_FORMAT)]] image2DArray radiance_img;
+
+  [[storage(0, write)]] uint (&convolve_tile_buf)[];
+  [[storage(1, read_write)]] DispatchCommand &convolve_dispatch_buf;
+};
+
+[[compute, local_size(SUBSURFACE_GROUP_SIZE, SUBSURFACE_GROUP_SIZE)]]
+void setup_main([[resource_table]] Setup &srt,
+                [[resource_table]] const draw::View &views,
+                [[resource_table]] const gbuffer::Reader &reader,
+                [[work_group_id]] const uint3 group_id,
+                [[global_invocation_id]] const uint3 global_thread_id,
+                [[local_invocation_index]] const uint local_thread_index)
+{
+  int2 texel = int2(global_thread_id.xy);
+
+  if (local_thread_index == 0u) {
+    srt.has_visible_sss = 0u;
+  }
+
+  barrier();
+
+  const ViewMatrices view = views.get(0);
+  const gbuffer::Layers gbuf = reader.read_layers(texel);
+
+  ClosureUndetermined cl = gbuf.layer[0];
+
+  if (cl.type == CLOSURE_BSSRDF_BURLEY_ID) {
+    float3 direct = rgb9e5_decode(imageLoadFast(srt.direct_light_img, texel).r);
+    float3 indirect = imageLoadFast(srt.indirect_light_img, texel).rgb;
+
+    ClosureSubsurface closure = to_closure_subsurface(cl);
+    float max_radius = reduce_max(closure.sss_radius);
+
+    uint object_id = reader.read_object_id(texel);
+
+    if (srt.use_split_radiance) {
+      imageStoreFast(srt.radiance_img, int3(texel, 0), float4(direct, 0.0f));
+      imageStoreFast(srt.radiance_img, int3(texel, 1), float4(indirect, 0.0f));
+    }
+    else {
+      imageStoreFast(srt.radiance_img, int3(texel, 0), float4(direct + indirect, 0.0f));
+    }
+    imageStoreFast(srt.object_id_img, texel, uint4(object_id));
+
+    float depth = reverse_z::read(texelFetch(srt.depth_tx, texel, 0).r);
+    /* TODO(fclem): Check if this simplifies. */
+    float vPz = view.depth_screen_to_view(depth);
+    float homogenous_coord = view.winmat[2][3] * vPz + view.winmat[3][3];
+    float sample_scale = view.winmat[0][0] * (0.5f * max_radius / homogenous_coord);
+    float pixel_footprint = sample_scale * float(textureSize(reader.gbuf_header_tx, 0).x);
+    if (pixel_footprint > 1.0f) {
+      /* Race condition doesn't matter here. */
+      srt.has_visible_sss = 1u;
+    }
+  }
+  else {
+    /* No need to write radiance_img since the radiance won't be used at all. */
+    imageStore(srt.object_id_img, texel, uint4(0));
+  }
+
+  barrier();
+
+  if (local_thread_index == 0u) {
+    if (srt.has_visible_sss > 0u) {
+      uint tile_id = atomicAdd(srt.convolve_dispatch_buf.num_groups_x, 1u);
+      srt.convolve_tile_buf[tile_id] = packUvec2x16(group_id.xy);
+      /* Race condition doesn't matter here. */
+      srt.convolve_dispatch_buf.num_groups_y = 1;
+      srt.convolve_dispatch_buf.num_groups_z = 1;
+    }
+  }
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Convolve
+ *
+ * Process in screen space the diffuse radiance input to mimic subsurface transmission.
+ *
+ * This implementation follows the technique described in the SIGGRAPH presentation:
+ * "Efficient screen space subsurface scattering SIGGRAPH 2018"
+ * by Evgenii Golubev
+ *
+ * But, instead of having all the precomputed weights for all three color primaries,
+ * we precompute a weight profile texture to be able to support per pixel AND per channel radius.
+ * \{ */
+
+struct SubSurfaceSample {
+  float3 radiance;
+  float depth;
+  uint sss_id;
+};
+
+struct Convolve {
+  [[specialization_constant(false)]] const bool use_split_radiance;
+
+  [[sampler(2)]] sampler2DArray radiance_tx;
+  [[sampler(3)]] sampler2DDepth depth_tx;
+  [[sampler(4)]] usampler2D object_id_tx;
+
+  [[image(0, write, DEFERRED_RADIANCE_FORMAT)]] uimage2D out_direct_light_img;
+  [[image(1, write, RAYTRACE_RADIANCE_FORMAT)]] image2D out_indirect_light_img;
+
+  [[uniform(SUBSURFACE_BUF_SLOT)]] const SubsurfaceData &subsurface_buf;
+
+  [[storage(0, read)]] const uint (&tiles_coord_buf)[];
+
+  [[shared]] float3 cached_radiance[SUBSURFACE_GROUP_SIZE][SUBSURFACE_GROUP_SIZE];
+  [[shared]] uint cached_sss_id[SUBSURFACE_GROUP_SIZE][SUBSURFACE_GROUP_SIZE];
+  [[shared]] float cached_depth[SUBSURFACE_GROUP_SIZE][SUBSURFACE_GROUP_SIZE];
+
+  void cache_populate(float2 local_uv, uint2 texel)
+  {
+    cached_radiance[texel.y][texel.x] = textureLod(radiance_tx, float3(local_uv, 0.0f), 0.0f).rgb;
+    cached_sss_id[texel.y][texel.x] = texture(object_id_tx, local_uv).r;
+    cached_depth[texel.y][texel.x] = reverse_z::read(texture(depth_tx, local_uv).r);
+  }
+
+  bool cache_sample(uint2 texel, uint3 group_id, SubSurfaceSample &samp) const
+  {
+    uint2 tile_coord = unpackUvec2x16(tiles_coord_buf[group_id.x]);
+    /* This can underflow and allow us to only do one upper bound check. */
+    texel -= tile_coord * SUBSURFACE_GROUP_SIZE;
+    if (any(greaterThanEqual(texel, uint2(SUBSURFACE_GROUP_SIZE)))) {
+      return false;
+    }
+    samp.radiance = cached_radiance[texel.y][texel.x];
+    samp.sss_id = cached_sss_id[texel.y][texel.x];
+    samp.depth = cached_depth[texel.y][texel.x];
+    return true;
+  }
+
+  SubSurfaceSample sample_neighborhood(float2 sample_uv, uint3 group_id) const
+  {
+    SubSurfaceSample samp;
+    uint2 sample_texel = uint2(sample_uv * float2(textureSize(depth_tx, 0)));
+    if (cache_sample(sample_texel, group_id, samp)) {
+      return samp;
+    }
+    samp.depth = reverse_z::read(texture(depth_tx, sample_uv).r);
+    samp.sss_id = texture(object_id_tx, sample_uv).r;
+    samp.radiance = textureLod(radiance_tx, float3(sample_uv, 0.0f), 0.0f).rgb;
+    return samp;
+  }
+};
+
+[[compute, local_size(SUBSURFACE_GROUP_SIZE, SUBSURFACE_GROUP_SIZE)]]
+void convolve_main([[resource_table]] Convolve &srt,
+                   [[resource_table]] const draw::View &views,
+                   [[resource_table]] const gbuffer::Reader &reader,
+                   [[work_group_id]] const uint3 group_id,
+                   [[local_invocation_id]] const uint3 local_thread_id)
+{
+  constexpr uint tile_size = SUBSURFACE_GROUP_SIZE;
+  uint2 tile_coord = unpackUvec2x16(srt.tiles_coord_buf[group_id.x]);
+  int2 texel = int2(local_thread_id.xy + tile_coord * tile_size);
+
+  float2 center_uv = (float2(texel) + 0.5f) / float2(textureSize(reader.gbuf_header_tx, 0).xy);
+
+  srt.cache_populate(center_uv, local_thread_id.xy);
+  barrier();
+
+  const ViewMatrices view = views.get(0);
+
+  float depth = reverse_z::read(texelFetch(srt.depth_tx, texel, 0).r);
+  float3 vP = view.point_screen_to_view(float3(center_uv, depth));
+
+  const gbuffer::Layers gbuf = reader.read_layers(texel);
+  if (gbuf.layer[0].type != CLOSURE_BSSRDF_BURLEY_ID) {
+    return;
+  }
+
+  const uint object_id = reader.read_object_id(texel);
+
+  const ClosureSubsurface closure = to_closure_subsurface(gbuf.layer[0]);
+  float max_radius = reduce_max(closure.sss_radius);
+
+  float homogenous_coord = view.winmat[2][3] * vP.z + view.winmat[3][3];
+  float2 sample_scale = float2(view.winmat[0][0], view.winmat[1][1]) *
+                        (0.5f * max_radius / homogenous_coord);
+
+  float pixel_footprint = sample_scale.x * textureSize(srt.depth_tx, 0).x;
+  if (pixel_footprint <= 1.0f) {
+    /* Early out, avoid divisions by zero. */
+    return;
+  }
+
+  /* Avoid too small radii that have float imprecision. */
+  float3 clamped_sss_radius = max(float3(srt.subsurface_buf.min_radius),
+                                  closure.sss_radius / max_radius) *
+                              max_radius;
+  /* Scale albedo because we can have HDR value caused by BSDF sampling. */
+  float3 albedo = closure.color / max(1e-6f, reduce_max(closure.color));
+  float3 d = burley_setup(clamped_sss_radius, albedo);
+
+  /* Do not rotate too much to avoid too much cache misses. */
+  float golden_angle = M_PI * (3.0f - sqrt(5.0f));
+  float theta = interleaved_gradient_noise(float2(texel), 0, 0.0f) * golden_angle;
+
+  float2x2 sample_space = from_scale(sample_scale) * from_rotation(AngleRadian{theta});
+
+  float3 accum_weight = float3(0.0f);
+  float3 accum_radiance = float3(0.0f);
+  float3 accum_radiance_indirect = float3(0.0f);
+
+  for (int i = 0; i < srt.subsurface_buf.sample_len; i++) {
+    float2 sample_uv = center_uv + sample_space * srt.subsurface_buf.samples[i].xy;
+    float pdf_inv = srt.subsurface_buf.samples[i].z;
+
+    SubSurfaceSample samp = srt.sample_neighborhood(sample_uv, group_id);
+    /* Reject radiance from other surfaces. Avoids light leak between objects. */
+    if (samp.sss_id != object_id) {
+      continue;
+    }
+    /* Slide 34. */
+    float3 sample_vP = view.point_screen_to_view(float3(sample_uv, samp.depth));
+    float r = distance(sample_vP, vP);
+    float3 weight = burley_eval(d, r) * pdf_inv;
+
+    accum_radiance += samp.radiance * weight;
+    accum_weight += weight;
+
+    if (srt.use_split_radiance) {
+      accum_radiance_indirect += textureLod(srt.radiance_tx, float3(sample_uv, 1.0f), 0.0f).rgb *
+                                 weight;
+    }
+  }
+  /* Normalize the sum (slide 34). */
+  float3 accum_weight_inv = safe_rcp(accum_weight);
+  accum_radiance *= accum_weight_inv;
+  accum_radiance_indirect *= accum_weight_inv;
+
+  /* Put result in direct diffuse. */
+  imageStoreFast(srt.out_direct_light_img, texel, uint4(rgb9e5_encode(accum_radiance)));
+  /* Note that if we don't use split radiance, this clears the indirect pass since its content has
+   * been merged and convolved with direct light.*/
+  imageStoreFast(srt.out_indirect_light_img, texel, float4(accum_radiance_indirect, 0.0f));
+}
+
+/** \} */
+
+PipelineCompute setup(setup_main);
+PipelineCompute convolve(convolve_main);
+
+}  // namespace eevee::subsurface
