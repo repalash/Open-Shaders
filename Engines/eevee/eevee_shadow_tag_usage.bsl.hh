@@ -1,0 +1,392 @@
+/* SPDX-FileCopyrightText: 2023 Blender Authors
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later */
+
+/**
+ * Virtual shadow-mapping: Usage tagging
+ *
+ * Shadow pages are only allocated if they are visible.
+ */
+
+#pragma once
+
+#include "eevee_defines.hh"
+#include "eevee_hiz.bsl.hh"
+#include "eevee_light_iter.bsl.hh"
+#include "eevee_light_lib.bsl.hh"
+#include "eevee_lightprobe_shared.hh"
+#include "eevee_sampling_lib.bsl.hh"
+#include "eevee_shadow_page_ops.bsl.hh"
+#include "eevee_shadow_shared.hh"
+#include "eevee_shadow_tilemap_lib.bsl.hh"
+#include "eevee_volume_lib.bsl.hh"
+#include "gpu_shader_math_vector_compare_lib.glsl"
+
+namespace eevee::shadow::usage {
+
+struct TagUsage {
+  [[resource_table]] srt_t<LightRenderData> light_data;
+  [[resource_table]] srt_t<TileMaps> tilemaps;
+  [[resource_table]] srt_t<Tiles> tiles;
+  [[resource_table]] srt_t<Uniform> uniforms;
+  [[resource_table]] srt_t<draw::View> views_;
+
+ public:
+  void tag_usage_tile(LightData light, uint2 tile_co, int lod, int tilemap_index)
+  {
+    if (tilemap_index > light.tilemap_max_get()) {
+      return;
+    }
+
+    tile_co >>= uint(lod);
+    [[resource_table]] Tiles &tiles_ref = tiles;
+    [[resource_table]] TileMaps &maps = tilemaps;
+    int index = shadow_tile_offset(tile_co, maps.tilemaps_buf[tilemap_index].tiles_index, lod);
+    atomicOr(tiles_ref.tiles_buf[index], uint(SHADOW_IS_USED));
+  }
+
+  void tag_usage_tilemap_directional_at_level(uint l_idx, float3 P, int level)
+  {
+    [[resource_table]] LightRenderData &lrd = light_data;
+    LightData light = lrd.light_buf[l_idx];
+
+    if (light.tilemap_index == LIGHT_NO_SHADOW) {
+      return;
+    }
+
+    float3 lP = light_world_to_local_direction(light, P);
+
+    level = clamp(level, light.sun().clipmap_lod_min, light.sun().clipmap_lod_max);
+
+    ShadowCoordinates coord = shadow_directional_coordinates_at_level(light, lP, level);
+    tag_usage_tile(light, coord.tilemap_tile, 0, coord.tilemap_index);
+  }
+
+  void shadow_tag_usage_tilemap_directional(
+      uint l_idx, float3 P, float3 V, float radius, int lod_bias)
+  {
+    [[resource_table]] LightRenderData &lrd = light_data;
+    LightData light = lrd.light_buf[l_idx];
+
+    if (light.tilemap_index == LIGHT_NO_SHADOW) {
+      return;
+    }
+
+    float3 lP = light_world_to_local_direction(light, P);
+
+    LightSunData sun = light.sun();
+
+    if (radius == 0.0f) {
+      int level = shadow_directional_level(light, lP - light.position());
+      level = clamp(level + lod_bias, sun.clipmap_lod_min, sun.clipmap_lod_max);
+      ShadowCoordinates coord = shadow_directional_coordinates_at_level(light, lP, level);
+      tag_usage_tile(light, coord.tilemap_tile, 0, coord.tilemap_index);
+    }
+    else {
+      float3 start_lP = light_world_to_local_direction(light, P - V * radius);
+      float3 end_lP = light_world_to_local_direction(light, P + V * radius);
+      int min_level = shadow_directional_level(light, start_lP - light.position());
+      int max_level = shadow_directional_level(light, end_lP - light.position());
+      min_level = clamp(min_level + lod_bias, sun.clipmap_lod_min, sun.clipmap_lod_max);
+      max_level = clamp(max_level + lod_bias, sun.clipmap_lod_min, sun.clipmap_lod_max);
+
+      for (int level = min_level; level <= max_level; level++) {
+        ShadowCoordinates coord_min = shadow_directional_coordinates_at_level(
+            light, lP - float3(radius, radius, 0.0f), level);
+        ShadowCoordinates coord_max = shadow_directional_coordinates_at_level(
+            light, lP + float3(radius, radius, 0.0f), level);
+
+        for (uint x = coord_min.tilemap_tile.x; x <= coord_max.tilemap_tile.x; x++) {
+          for (uint y = coord_min.tilemap_tile.y; y <= coord_max.tilemap_tile.y; y++) {
+            tag_usage_tile(light, uint2(x, y), 0, coord_min.tilemap_index);
+          }
+        }
+      }
+    }
+  }
+
+  void tag_usage_tilemap_punctual(uint l_idx, float3 P, float radius, int lod_bias)
+  {
+    [[resource_table]] LightRenderData &lrd = light_data;
+    [[resource_table]] const Uniform &uni = uniforms;
+    [[resource_table]] const draw::View &views = views_;
+
+    LightData light = lrd.light_buf[l_idx];
+
+    if (light.tilemap_index == LIGHT_NO_SHADOW) {
+      return;
+    }
+
+    float3 lP = light_world_to_local_point(light, P);
+    float dist_to_light = max(length(lP) - radius, 1e-5f);
+    if (dist_to_light > light.local().local.influence_radius_max) {
+      return;
+    }
+    if (is_spot_light(light.type)) {
+      /* Early out if out of cone. */
+      float angle_tan = length(lP.xy / dist_to_light);
+      if (angle_tan > light.spot().spot_tan) {
+        return;
+      }
+    }
+    else if (is_area_light(light.type)) {
+      /* Early out if on the wrong side. */
+      if (lP.z - radius > 0.0f) {
+        return;
+      }
+    }
+
+    /* Transform to shadow local space. */
+    lP -= light.local().local.shadow_position;
+
+    const ViewMatrices view = views.get(0);
+
+    int lod = shadow_punctual_level(light,
+                                    lP,
+                                    view.is_perspective(),
+                                    view.z_distance(P),
+                                    uni.uniform_buf.shadow.film_pixel_radius);
+    lod = clamp(lod + lod_bias, 0, SHADOW_TILEMAP_LOD);
+
+    if (radius == 0) {
+      int face_id = shadow_punctual_face_index_get(lP);
+      lP = shadow_punctual_local_position_to_face_local(face_id, lP);
+      ShadowCoordinates coord = shadow_punctual_coordinates(light, lP, face_id);
+      tag_usage_tile(light, coord.tilemap_tile, lod, coord.tilemap_index);
+    }
+    else {
+      uint faces = 0u;
+      for (int x = -1; x <= 1; x += 2) {
+        for (int y = -1; y <= 1; y += 2) {
+          for (int z = -1; z <= 1; z += 2) {
+            float3 _lP = lP + float3(x, y, z) * radius;
+            faces |= 1u << shadow_punctual_face_index_get(_lP);
+          }
+        }
+      }
+
+      for (int face_id = 0; face_id < 6; face_id++) {
+        if ((faces & (1u << uint(face_id))) == 0u) {
+          continue;
+        }
+
+        int tilemap_index = light.tilemap_index + face_id;
+        float3 _lP = shadow_punctual_local_position_to_face_local(face_id, lP);
+
+        float3 offset = float3(radius, radius, 0);
+        ShadowCoordinates coord_min = shadow_punctual_coordinates(light, _lP - offset, face_id);
+        ShadowCoordinates coord_max = shadow_punctual_coordinates(light, _lP + offset, face_id);
+
+        for (uint x = coord_min.tilemap_tile.x; x <= coord_max.tilemap_tile.x; x++) {
+          for (uint y = coord_min.tilemap_tile.y; y <= coord_max.tilemap_tile.y; y++) {
+            tag_usage_tile(light, uint2(x, y), lod, tilemap_index);
+          }
+        }
+      }
+    }
+  }
+};
+
+/**
+ * \a radius Radius of the tagging area in world space.
+ * Used for downsampled/ray-marched tagging, so all the shadow-map texels covered get correctly
+ * tagged.
+ */
+struct TagPixelCtx {
+  float3 P;
+  float3 V;
+  float radius;
+  int lod_bias;
+
+  void eval_directional([[resource_table]] TagUsage &srt, uint index, LightData /*light*/)
+  {
+    srt.shadow_tag_usage_tilemap_directional(index, P, V, radius, lod_bias);
+  }
+
+  void eval_local([[resource_table]] TagUsage &srt, uint index, LightData /*light*/)
+  {
+    srt.tag_usage_tilemap_punctual(index, P, radius, lod_bias);
+  }
+};
+
+struct TagSurfelCtx {
+  float3 P;
+  int directional_lvl;
+
+  void eval_directional([[resource_table]] TagUsage &srt, uint index, LightData /*light*/)
+  {
+    srt.tag_usage_tilemap_directional_at_level(index, P, directional_lvl);
+  }
+
+  void eval_local([[resource_table]] TagUsage &srt, uint index, LightData /*light*/)
+  {
+    srt.tag_usage_tilemap_punctual(index, P, 0, 0);
+  }
+};
+
+}  // namespace eevee::shadow::usage
+
+namespace eevee::light {
+
+template void light::foreach_visible<shadow::usage::TagPixelCtx, shadow::usage::TagUsage>(
+    const LightRenderData &,
+    float2,
+    float,
+    shadow::usage::TagPixelCtx &,
+    shadow::usage::TagUsage &);
+
+template void light::foreach<shadow::usage::TagSurfelCtx, shadow::usage::TagUsage>(
+    const LightRenderData &, shadow::usage::TagSurfelCtx &, shadow::usage::TagUsage &);
+
+}  // namespace eevee::light
+
+namespace eevee::shadow::usage {
+
+struct TagUsageOpaque {
+  [[push_constant]] int2 input_depth_extent;
+};
+
+/**
+ * This pass scan the depth buffer and tag all tiles that are needed for light shadowing as
+ * needed.
+ */
+[[compute, local_size(SHADOW_DEPTH_SCAN_GROUP_SIZE, SHADOW_DEPTH_SCAN_GROUP_SIZE)]]
+void tag_usage_opaque([[resource_table]] TagUsageOpaque &srt,
+                      [[resource_table]] const HiZ &hiz,
+                      [[resource_table]] const draw::View &views,
+                      [[resource_table]] TagUsage &tag,
+                      [[global_invocation_id]] const uint3 global_id)
+{
+  [[resource_table]] LightRenderData &lrd = tag.light_data;
+
+  int2 texel = int2(global_id.xy);
+  int2 tex_size = srt.input_depth_extent;
+
+  if (!in_range_inclusive(texel, int2(0), int2(tex_size - 1))) {
+    return;
+  }
+
+  float depth = texelFetch(hiz.hiz_tx, texel, 0).r;
+  if (depth == 1.0f) {
+    return;
+  }
+
+  const ViewMatrices view = views.get(0);
+
+  float2 uv = (float2(texel) + 0.5f) / float2(tex_size);
+  float3 vP = view.point_screen_to_view(float3(uv, depth));
+
+  TagPixelCtx ctx = {
+      .P = view.point_view_to_world(vP),
+      .V = float3(0.0f),
+      .radius = 0.0f,
+      .lod_bias = 0,
+  };
+
+  light::foreach_visible(lrd, float2(global_id.xy), vP.z, ctx, tag);
+}
+
+struct TagUsageSurfel {
+  [[push_constant]] int directional_level;
+};
+
+struct SurfelCapture {
+  [[storage(SURFEL_BUF_SLOT, read_write)]] Surfel (&surfel_buf)[];
+  [[storage(CAPTURE_BUF_SLOT, read)]] CaptureInfoData &capture_info_buf;
+};
+
+/**
+ * This pass iterates the surfels buffer and tag all tiles that are needed for light shadowing as
+ * needed.
+ */
+[[compute, local_size(SURFEL_GROUP_SIZE)]]
+void tag_usage_surfel([[resource_table]] TagUsageSurfel &srt,
+                      [[resource_table]] TagUsage &tag,
+                      [[resource_table]] SurfelCapture &capture,
+                      [[global_invocation_id]] const uint3 global_id)
+{
+  [[resource_table]] LightRenderData &lrd = tag.light_data;
+
+  uint index = global_id.x;
+  if (index >= capture.capture_info_buf.surfel_len) {
+    return;
+  }
+
+  Surfel surfel = capture.surfel_buf[index];
+
+  TagSurfelCtx ctx = {
+      .P = surfel.position,
+      .directional_lvl = srt.directional_level,
+  };
+
+  light::foreach(lrd, ctx, tag);
+}
+
+/**
+ * This pass scans all volume froxels and tags tiles needed for shadowing.
+ */
+[[compute, local_size(VOLUME_GROUP_SIZE, VOLUME_GROUP_SIZE, VOLUME_GROUP_SIZE)]]
+void tag_usage_volume([[resource_table]] UnifiedVolumeProperties &volume,
+                      [[resource_table]] TagUsage &tag,
+                      [[resource_table]] SurfelCapture & /*capture*/,
+                      [[resource_table]] const Uniform &uni,
+                      [[resource_table]] const draw::View &views,
+                      [[resource_table]] const Sampling &sampling,
+                      [[resource_table]] const HiZ &hiz,
+                      [[global_invocation_id]] const uint3 global_id)
+{
+  [[resource_table]] LightRenderData &lrd = tag.light_data;
+
+  int3 froxel = int3(global_id);
+
+  if (any(greaterThanEqual(froxel, uni.uniform_buf.volumes.tex_size))) {
+    return;
+  }
+
+  float3 extinction = imageLoadFast(volume.in_extinction_img, froxel).rgb;
+  float3 scattering = imageLoadFast(volume.in_scattering_img, froxel).rgb;
+
+  if (is_zero(extinction) || is_zero(scattering)) {
+    return;
+  }
+
+  const ViewMatrices view = views.get(0);
+
+  float offset = sampling.rng_1D_get(SAMPLING_VOLUME_W);
+  float jitter = interleaved_gradient_noise(float2(froxel.xy), 0.0f, offset);
+
+  float3 uvw = (float3(froxel) + float3(0.5f, 0.5f, jitter)) *
+               uni.uniform_buf.volumes.inv_tex_size;
+  float3 ss_P = volume_resolve_to_screen(uni, view, uvw);
+  float3 vP = view.point_screen_to_view(float3(ss_P.xy, ss_P.z));
+  float3 P = view.point_view_to_world(vP);
+
+  float depth = texelFetch(hiz.hiz_tx, froxel.xy, uni.uniform_buf.volumes.tile_size_lod).r;
+  if (depth < ss_P.z) {
+    return;
+  }
+
+  float2 pixel = ((float2(froxel.xy) + 0.5f) * uni.uniform_buf.volumes.inv_tex_size.xy) *
+                 uni.uniform_buf.volumes.main_view_extent;
+
+  int bias = uni.uniform_buf.volumes.tile_size_lod;
+
+  TagPixelCtx ctx = {
+      .P = P,
+      .V = view.world_incident_vector(P),
+      .radius = 0.01f,
+      .lod_bias = bias,
+  };
+
+  light::foreach_visible(lrd, pixel, vP.z, ctx, tag);
+}
+
+}  // namespace eevee::shadow::usage
+
+namespace eevee::shadow {
+
+PipelineCompute tag_usage_opaque(usage::tag_usage_opaque);
+PipelineCompute tag_usage_surfels(usage::tag_usage_surfel);
+PipelineCompute tag_usage_volume(usage::tag_usage_volume);
+
+}  // namespace eevee::shadow
